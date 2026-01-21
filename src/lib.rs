@@ -1,5 +1,6 @@
 pub mod device;
 pub mod ops;
+pub mod optim;
 pub mod precision;
 pub mod tensor;
 
@@ -14,5 +15,6 @@ pub use ops::{
     rmsnorm_backward, rope_backward, scale_backward, silu_backward, softmax_backward,
     swiglu_backward,
 };
+pub use optim::{clip_grad_norm, grad_norm, zero_gradients, Lion, LionConfig, ParamState};
 pub use precision::Precision;
 pub use tensor::Tensor;

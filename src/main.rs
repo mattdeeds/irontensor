@@ -6,6 +6,8 @@ use irontensor::{
     cross_entropy_fused, embedding_backward, gelu_backward, matmul_backward, mul_backward,
     relu_backward, rmsnorm_backward, rope_backward, scale_backward, silu_backward,
     softmax_backward, swiglu_backward,
+    // Optimizer
+    clip_grad_norm, grad_norm, zero_gradients, Lion, LionConfig, ParamState,
     // Core types
     MetalContext, Tensor,
 };
@@ -236,11 +238,87 @@ fn main() {
     println!("   grad_logits[1]: {:?}\n", &grad_logits.as_f32_slice()[vocab_size..2 * vocab_size]);
 
     // =====================================================================
+    // PHASE 3: Optimizer
+    // =====================================================================
+    println!("=== Phase 3: Optimizer ===\n");
+
+    // --- Lion Optimizer ---
+    println!("1. Lion Optimizer (Sign-based Updates)");
+    println!("   Training a simple quadratic: f(x) = sum(x^2)");
+
+    // Initialize weights
+    let weights = Tensor::from_f32_slice(&[5.0, -3.0, 2.0, -1.0], &[4]);
+    let mut state = ParamState::new(&[4]);
+
+    let optimizer = Lion::new(LionConfig {
+        lr: 0.1,
+        beta1: 0.9,
+        beta2: 0.99,
+        weight_decay: 0.0,
+    });
+
+    println!("   Initial weights: {:?}", weights.as_f32_slice());
+
+    // Training loop
+    for step in 0..10 {
+        // Gradient of x^2 is 2x
+        let w = weights.as_f32_slice();
+        let grads_data: Vec<f32> = w.iter().map(|&x| 2.0 * x).collect();
+        let gradients = Tensor::from_f32_slice(&grads_data, &[4]);
+
+        optimizer.step(&weights, &gradients, &mut state);
+
+        if step == 0 || step == 4 || step == 9 {
+            println!("   Step {}: weights = {:?}", step + 1, weights.as_f32_slice());
+        }
+    }
+
+    // --- Gradient Utilities ---
+    println!("\n2. Gradient Utilities");
+
+    let gradients = Tensor::from_f32_slice(&[3.0, 4.0, 0.0, 0.0], &[4]);
+    let norm = grad_norm(&gradients);
+    println!("   grad_norm([3, 4, 0, 0]) = {:.4}", norm);
+
+    let gradients = Tensor::from_f32_slice(&[6.0, 8.0, 0.0, 0.0], &[4]);
+    let original_norm = clip_grad_norm(&gradients, 5.0);
+    println!("   clip_grad_norm([6, 8, 0, 0], max=5.0):");
+    println!("     Original norm: {:.4}", original_norm);
+    println!("     Clipped grads: {:?}", gradients.as_f32_slice());
+    println!("     New norm: {:.4}", grad_norm(&gradients));
+
+    let gradients = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+    zero_gradients(&gradients);
+    println!("   zero_gradients: {:?}", gradients.as_f32_slice());
+
+    // --- Lion with Weight Decay ---
+    println!("\n3. Lion with Weight Decay");
+    let weights = Tensor::from_f32_slice(&[10.0, -10.0], &[2]);
+    let mut state = ParamState::new(&[2]);
+
+    let optimizer = Lion::new(LionConfig {
+        lr: 0.01,
+        beta1: 0.9,
+        beta2: 0.99,
+        weight_decay: 0.1, // 10% weight decay
+    });
+
+    println!("   Initial: {:?}", weights.as_f32_slice());
+
+    // Zero gradients - only weight decay affects weights
+    let zero_grads = Tensor::from_f32_slice(&[0.0, 0.0], &[2]);
+    for _ in 0..5 {
+        optimizer.step(&weights, &zero_grads, &mut state);
+    }
+    println!("   After 5 steps (zero grad, 10% decay): {:?}\n", weights.as_f32_slice());
+
+    // =====================================================================
     // Summary
     // =====================================================================
     println!("=== Summary ===");
     println!("IronTensor provides GPU-accelerated tensor operations for LLM training:");
     println!("- Phase 1: Forward ops (matmul, activations, normalization, attention, etc.)");
     println!("- Phase 2: Backward ops for automatic differentiation");
+    println!("- Phase 3: Lion optimizer with gradient clipping and weight decay");
     println!("\nAll operations run on Metal GPU with unified memory (zero-copy on Apple Silicon).");
 }
