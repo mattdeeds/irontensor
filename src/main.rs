@@ -8,6 +8,10 @@ use irontensor::{
     softmax_backward, swiglu_backward,
     // Optimizer
     clip_grad_norm, grad_norm, zero_gradients, Lion, LionConfig, ParamState,
+    // Neural network modules
+    GPTModel, ModelConfig, TransformerBlock,
+    // Data loading
+    TokenDataset,
     // Core types
     MetalContext, Tensor,
 };
@@ -313,6 +317,89 @@ fn main() {
     println!("   After 5 steps (zero grad, 10% decay): {:?}\n", weights.as_f32_slice());
 
     // =====================================================================
+    // PHASE 4: Model & Data
+    // =====================================================================
+    println!("=== Phase 4: Model & Data ===\n");
+
+    // --- Model Configuration ---
+    println!("1. Model Configuration");
+    let tiny_config = ModelConfig::tiny();
+    println!("   Tiny model: {} layers, {} hidden, {:.2}M params",
+        tiny_config.num_layers,
+        tiny_config.hidden_dim,
+        tiny_config.num_params() as f64 / 1e6
+    );
+
+    let small_config = ModelConfig::small();
+    println!("   Small model: {} layers, {} hidden, {:.2}M params",
+        small_config.num_layers,
+        small_config.hidden_dim,
+        small_config.num_params() as f64 / 1e6
+    );
+
+    let medium_config = ModelConfig::medium();
+    println!("   Medium model: {} layers, {} hidden, {:.2}M params\n",
+        medium_config.num_layers,
+        medium_config.hidden_dim,
+        medium_config.num_params() as f64 / 1e6
+    );
+
+    // --- GPT Model Forward Pass ---
+    println!("2. GPT Model Forward Pass");
+    let config = ModelConfig::tiny();
+    let model = GPTModel::new(config.clone());
+    println!("{}", model.summary());
+
+    let batch = 1;
+    let seq_len = 16;
+    let input_ids: Vec<u32> = (0..batch * seq_len).map(|i| (i % 100) as u32).collect();
+
+    println!("   Input: {} tokens", input_ids.len());
+    let logits = model.forward(&input_ids, batch, seq_len, 0);
+    println!("   Output logits shape: {:?}", logits.shape());
+
+    // Show top prediction for first position
+    let first_logits = &logits.as_f32_slice()[0..config.vocab_size];
+    let (max_idx, max_val) = first_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .unwrap();
+    println!("   First token prediction: token {} (logit {:.4})\n", max_idx, max_val);
+
+    // --- Transformer Block ---
+    println!("3. Transformer Block");
+    let block = TransformerBlock::new(64, 4, 4, 128, 10000.0, 1e-5);
+    println!("   Block params: {}", block.num_params());
+
+    let block_input_data: Vec<f32> = (0..2 * 8 * 64).map(|i| (i as f32 * 0.01).sin()).collect();
+    let block_input = Tensor::from_f32_slice(&block_input_data, &[2, 8, 64]);
+    let block_output = block.forward(&block_input, 0, true);
+    println!("   Input: [2, 8, 64] -> Output: {:?}\n", block_output.shape());
+
+    // --- Memory-Mapped Dataset ---
+    println!("4. Memory-Mapped Dataset");
+    let dataset_path = std::env::temp_dir().join("irontensor_demo.bin");
+
+    // Create a small demo dataset
+    let demo_tokens: Vec<u32> = (0..1000).collect();
+    TokenDataset::create(&dataset_path, &demo_tokens).unwrap();
+    println!("   Created dataset with {} tokens", demo_tokens.len());
+
+    let dataset = TokenDataset::open(&dataset_path, 32).unwrap();
+    println!("   Sequence length: {}", dataset.seq_len());
+    println!("   Number of sequences: {}", dataset.num_sequences());
+
+    // Get a training batch
+    let (input_batch, target_batch) = dataset.get_batch(0);
+    println!("   Batch 0 input:  {:?}...", &input_batch[0..5]);
+    println!("   Batch 0 target: {:?}...", &target_batch[0..5]);
+
+    // Cleanup
+    std::fs::remove_file(dataset_path).ok();
+    println!();
+
+    // =====================================================================
     // Summary
     // =====================================================================
     println!("=== Summary ===");
@@ -320,5 +407,6 @@ fn main() {
     println!("- Phase 1: Forward ops (matmul, activations, normalization, attention, etc.)");
     println!("- Phase 2: Backward ops for automatic differentiation");
     println!("- Phase 3: Lion optimizer with gradient clipping and weight decay");
+    println!("- Phase 4: GPT model architecture and memory-mapped data loading");
     println!("\nAll operations run on Metal GPU with unified memory (zero-copy on Apple Silicon).");
 }

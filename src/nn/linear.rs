@@ -1,0 +1,215 @@
+use crate::ops::matmul;
+use crate::optim::ParamState;
+use crate::precision::Precision;
+use crate::tensor::Tensor;
+
+/// Linear layer: y = xW^T + b
+///
+/// For input of shape [..., in_features], produces output of shape [..., out_features]
+pub struct Linear {
+    /// Weight matrix [out_features, in_features]
+    pub weight: Tensor,
+    /// Optional bias [out_features]
+    pub bias: Option<Tensor>,
+    /// Input features
+    pub in_features: usize,
+    /// Output features
+    pub out_features: usize,
+}
+
+impl Linear {
+    /// Create a new linear layer with Xavier/Glorot initialization
+    pub fn new(in_features: usize, out_features: usize, bias: bool) -> Self {
+        // Xavier uniform initialization: U(-sqrt(6/(fan_in+fan_out)), sqrt(6/(fan_in+fan_out)))
+        let limit = (6.0 / (in_features + out_features) as f32).sqrt();
+        let weight_data: Vec<f32> = (0..out_features * in_features)
+            .map(|i| {
+                // Simple deterministic pseudo-random based on index
+                let x = ((i as f32 * 0.618033988749895) % 1.0) * 2.0 - 1.0;
+                x * limit
+            })
+            .collect();
+        let weight = Tensor::from_f32_slice(&weight_data, &[out_features, in_features]);
+
+        let bias = if bias {
+            Some(Tensor::zeros(&[out_features], Precision::FP32))
+        } else {
+            None
+        };
+
+        Self {
+            weight,
+            bias,
+            in_features,
+            out_features,
+        }
+    }
+
+    /// Create a linear layer with given weights (for weight tying)
+    pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Self {
+        assert_eq!(weight.shape().len(), 2);
+        let out_features = weight.shape()[0];
+        let in_features = weight.shape()[1];
+
+        if let Some(ref b) = bias {
+            assert_eq!(b.shape(), &[out_features]);
+        }
+
+        Self {
+            weight,
+            bias,
+            in_features,
+            out_features,
+        }
+    }
+
+    /// Forward pass: y = xW^T + b
+    ///
+    /// Input shape: [..., in_features]
+    /// Output shape: [..., out_features]
+    pub fn forward(&self, input: &Tensor) -> Tensor {
+        let input_shape = input.shape();
+        assert!(
+            !input_shape.is_empty(),
+            "Input must have at least one dimension"
+        );
+        assert_eq!(
+            input_shape[input_shape.len() - 1],
+            self.in_features,
+            "Input last dimension {} doesn't match in_features {}",
+            input_shape[input_shape.len() - 1],
+            self.in_features
+        );
+
+        // Reshape input to 2D: [batch, in_features]
+        let batch_size: usize = input_shape[..input_shape.len() - 1].iter().product();
+        let batch_size = batch_size.max(1);
+
+        // Always reshape to ensure consistent 2D format
+        let data = input.as_f32_slice().to_vec();
+        let input_2d = Tensor::from_f32_slice(&data, &[batch_size, self.in_features]);
+
+        // Compute xW^T: [batch, in] @ [in, out] = [batch, out]
+        // We need to transpose W, but we can compute x @ W^T as (W @ x^T)^T
+        // Or more simply: create W transposed
+        let weight_t = self.transpose_weight();
+        let mut output = matmul(&input_2d, &weight_t);
+
+        // Add bias if present
+        if let Some(ref bias) = self.bias {
+            // Broadcast bias across batch dimension
+            let bias_data = bias.as_f32_slice();
+            let output_data = output.as_f32_slice();
+            let mut result = vec![0.0f32; batch_size * self.out_features];
+            for b in 0..batch_size {
+                for o in 0..self.out_features {
+                    result[b * self.out_features + o] =
+                        output_data[b * self.out_features + o] + bias_data[o];
+                }
+            }
+            output = Tensor::from_f32_slice(&result, &[batch_size, self.out_features]);
+        }
+
+        // Reshape back to original batch dimensions
+        if input_shape.len() > 2 {
+            let mut output_shape = input_shape[..input_shape.len() - 1].to_vec();
+            output_shape.push(self.out_features);
+            let data = output.as_f32_slice().to_vec();
+            Tensor::from_f32_slice(&data, &output_shape)
+        } else {
+            output
+        }
+    }
+
+    /// Transpose weight matrix for efficient matmul
+    fn transpose_weight(&self) -> Tensor {
+        let w = self.weight.as_f32_slice();
+        let mut wt = vec![0.0f32; self.in_features * self.out_features];
+        for i in 0..self.out_features {
+            for j in 0..self.in_features {
+                wt[j * self.out_features + i] = w[i * self.in_features + j];
+            }
+        }
+        Tensor::from_f32_slice(&wt, &[self.in_features, self.out_features])
+    }
+
+    /// Get parameter count
+    pub fn num_params(&self) -> usize {
+        let weight_params = self.in_features * self.out_features;
+        let bias_params = if self.bias.is_some() {
+            self.out_features
+        } else {
+            0
+        };
+        weight_params + bias_params
+    }
+}
+
+/// Optimizer state for a Linear layer
+pub struct LinearState {
+    pub weight_state: ParamState,
+    pub bias_state: Option<ParamState>,
+}
+
+impl LinearState {
+    pub fn new(layer: &Linear) -> Self {
+        Self {
+            weight_state: ParamState::new(layer.weight.shape()),
+            bias_state: layer.bias.as_ref().map(|b| ParamState::new(b.shape())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_linear_forward_2d() {
+        let layer = Linear::new(4, 3, false);
+
+        let input = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+
+        let output = layer.forward(&input);
+
+        assert_eq!(output.shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_linear_forward_3d() {
+        let layer = Linear::new(4, 3, false);
+
+        // [batch=2, seq=3, features=4]
+        let input_data: Vec<f32> = (0..24).map(|i| i as f32 * 0.1).collect();
+        let input = Tensor::from_f32_slice(&input_data, &[2, 3, 4]);
+
+        let output = layer.forward(&input);
+
+        assert_eq!(output.shape(), &[2, 3, 3]);
+    }
+
+    #[test]
+    fn test_linear_with_bias() {
+        // Create layer with known weights for verification
+        let weight = Tensor::from_f32_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+        let bias = Some(Tensor::from_f32_slice(&[1.0, 2.0], &[2]));
+        let layer = Linear::from_weight(weight, bias);
+
+        let input = Tensor::from_f32_slice(&[1.0, 2.0], &[1, 2]);
+        let output = layer.forward(&input);
+
+        // y = [1,2] @ [[1,0],[0,1]] + [1,2] = [1,2] + [1,2] = [2,4]
+        let result = output.as_f32_slice();
+        assert!((result[0] - 2.0).abs() < 1e-5);
+        assert!((result[1] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_linear_num_params() {
+        let layer = Linear::new(512, 256, true);
+        assert_eq!(layer.num_params(), 512 * 256 + 256);
+
+        let layer_no_bias = Linear::new(512, 256, false);
+        assert_eq!(layer_no_bias.num_params(), 512 * 256);
+    }
+}

@@ -1,10 +1,17 @@
+pub mod data;
 pub mod device;
+pub mod nn;
 pub mod ops;
 pub mod optim;
 pub mod precision;
 pub mod tensor;
 
+pub use data::{DatasetIterator, TokenDataset};
 pub use device::MetalContext;
+pub use nn::{
+    FeedForward, FeedForwardState, GPTModel, GPTModelState, Linear, LinearState, ModelConfig,
+    MultiHeadAttention, MultiHeadAttentionState, TransformerBlock, TransformerBlockState,
+};
 pub use ops::{
     // Forward ops
     add, add_scalar, attention, embedding, gelu, matmul, mul, relu, rmsnorm, rope, rope_default,
