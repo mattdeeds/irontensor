@@ -2,6 +2,8 @@ mod attention;
 pub mod backward;
 mod elementwise;
 mod embedding;
+mod flash_attention;
+mod fused_linear_cross_entropy;
 mod gemm;
 mod norm;
 mod rope;
@@ -16,6 +18,8 @@ pub use backward::{
 };
 pub use elementwise::{add, add_scalar, gelu, mul, relu, scale, silu, swiglu};
 pub use embedding::embedding;
+pub use flash_attention::flash_attention;
+pub use fused_linear_cross_entropy::{fused_linear_cross_entropy, fused_linear_cross_entropy_forward_only};
 pub use gemm::matmul;
 pub use norm::rmsnorm;
 pub use rope::{rope, rope_default};

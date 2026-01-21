@@ -2,6 +2,8 @@ use irontensor::{
     // Forward ops
     add, attention, embedding, gelu, matmul, mul, relu, rmsnorm, rope, scale, silu, softmax,
     swiglu,
+    // Optimized ops (Phase 5)
+    flash_attention, fused_linear_cross_entropy,
     // Backward ops
     cross_entropy_fused, embedding_backward, gelu_backward, matmul_backward, mul_backward,
     relu_backward, rmsnorm_backward, rope_backward, scale_backward, silu_backward,
@@ -400,6 +402,92 @@ fn main() {
     println!();
 
     // =====================================================================
+    // PHASE 5: Performance Optimizations
+    // =====================================================================
+    println!("=== Phase 5: Performance Optimizations ===\n");
+
+    // --- FlashAttention ---
+    println!("1. FlashAttention (Memory-Efficient Attention)");
+    let batch = 2;
+    let heads = 4;
+    let seq_len = 64;
+    let head_dim = 32;
+
+    let qkv_data: Vec<f32> = (0..batch * heads * seq_len * head_dim)
+        .map(|i| (i as f32 * 0.01).sin() * 0.5)
+        .collect();
+
+    let q = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq_len, head_dim]);
+    let k = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq_len, head_dim]);
+    let v = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq_len, head_dim]);
+
+    println!("   Input shape: [batch={}, heads={}, seq={}, head_dim={}]", batch, heads, seq_len, head_dim);
+
+    // Compare memory usage
+    let standard_mem = batch * heads * seq_len * seq_len * 4; // O(N^2) for attention matrix
+    let flash_mem = batch * heads * seq_len * head_dim * 4;   // O(N) for output only
+    println!("   Standard attention memory: {} bytes (O(N²))", standard_mem);
+    println!("   FlashAttention memory: {} bytes (O(N))", flash_mem);
+    println!("   Memory savings: {:.1}x", standard_mem as f64 / flash_mem as f64);
+
+    let flash_out = flash_attention(&q, &k, &v, true); // causal=true
+    println!("   Output shape: {:?}", flash_out.shape());
+    println!("   First values: {:?}\n", &flash_out.as_f32_slice()[0..5]);
+
+    // --- FusedLinearCrossEntropy ---
+    println!("2. FusedLinearCrossEntropy (Memory-Efficient Output Layer)");
+    let batch_seq = 16;
+    let hidden_dim = 64;
+    let vocab_size = 1000;
+
+    // Hidden states from the model's last layer
+    let hidden_data: Vec<f32> = (0..batch_seq * hidden_dim)
+        .map(|i| (i as f32 * 0.01).sin() * 0.5)
+        .collect();
+    let hidden = Tensor::from_f32_slice(&hidden_data, &[batch_seq, hidden_dim]);
+
+    // Vocabulary projection weights
+    let weight_data: Vec<f32> = (0..vocab_size * hidden_dim)
+        .map(|i| (i as f32 * 0.001).cos() * 0.3)
+        .collect();
+    let weight = Tensor::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
+
+    // Target tokens
+    let targets: Vec<i32> = (0..batch_seq).map(|i| (i * 37 % vocab_size) as i32).collect();
+
+    println!("   Hidden shape: [batch_seq={}, hidden_dim={}]", batch_seq, hidden_dim);
+    println!("   Weight shape: [vocab_size={}, hidden_dim={}]", vocab_size, hidden_dim);
+
+    // Compare memory usage
+    let standard_logits_mem = batch_seq * vocab_size * 4; // Full logits tensor
+    let fused_mem = batch_seq * hidden_dim * 4;           // Only hidden gradients
+    println!("   Standard method memory: {} KB (full logits)", standard_logits_mem / 1024);
+    println!("   Fused method memory: {} KB (no logits)", fused_mem / 1024);
+    println!("   Memory savings: {:.1}x", standard_logits_mem as f64 / fused_mem as f64);
+
+    let (loss, grad_hidden, _grad_weight) = fused_linear_cross_entropy(&hidden, &weight, &targets);
+    println!("   Loss: {:.4}", loss);
+    println!("   grad_hidden shape: {:?}", grad_hidden.shape());
+    println!("   grad_hidden first 5 values: {:?}\n", &grad_hidden.as_f32_slice()[0..5]);
+
+    // --- Comparison with separate operations ---
+    println!("3. Comparing Fused vs Separate Operations");
+
+    // Separate: compute logits, then cross-entropy
+    // Note: We'd need to materialize the full [batch_seq, vocab_size] logits tensor
+    // which for vocab_size=50000 and batch_seq=1024 would be 200MB!
+
+    // With 50K vocabulary (typical for LLMs):
+    let large_vocab = 50000;
+    let large_batch_seq = 1024;
+    let separate_mem = large_batch_seq * large_vocab * 4;
+    let fused_mem_large = large_batch_seq * hidden_dim * 4;
+    println!("   For typical LLM (vocab=50K, batch_seq=1024):");
+    println!("   Separate: {:.1} MB (need to store full logits)", separate_mem as f64 / 1e6);
+    println!("   Fused: {:.1} MB (only store hidden gradients)", fused_mem_large as f64 / 1e6);
+    println!("   Memory savings: {:.0}x\n", separate_mem as f64 / fused_mem_large as f64);
+
+    // =====================================================================
     // Summary
     // =====================================================================
     println!("=== Summary ===");
@@ -408,5 +496,6 @@ fn main() {
     println!("- Phase 2: Backward ops for automatic differentiation");
     println!("- Phase 3: Lion optimizer with gradient clipping and weight decay");
     println!("- Phase 4: GPT model architecture and memory-mapped data loading");
+    println!("- Phase 5: FlashAttention and FusedLinearCrossEntropy for memory efficiency");
     println!("\nAll operations run on Metal GPU with unified memory (zero-copy on Apple Silicon).");
 }
