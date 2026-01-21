@@ -1,40 +1,246 @@
-use irontensor::{MetalContext, Precision, Tensor};
+use irontensor::{
+    // Forward ops
+    add, attention, embedding, gelu, matmul, mul, relu, rmsnorm, rope, scale, silu, softmax,
+    swiglu,
+    // Backward ops
+    cross_entropy_fused, embedding_backward, gelu_backward, matmul_backward, mul_backward,
+    relu_backward, rmsnorm_backward, rope_backward, scale_backward, silu_backward,
+    softmax_backward, swiglu_backward,
+    // Core types
+    MetalContext, Tensor,
+};
 use objc2_metal::MTLDevice;
 
 fn main() {
     // Initialize the Metal context
     let ctx = MetalContext::global();
-    println!("Metal device: {}", ctx.device().name());
+    println!("IronTensor - Metal GPU Tensor Library");
+    println!("======================================");
+    println!("Device: {}\n", ctx.device().name());
 
-    // Create a tensor from f32 data
-    let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let shape = [2, 3];
-    let tensor = Tensor::from_f32_slice(&data, &shape);
+    // =====================================================================
+    // PHASE 1: Forward Operations
+    // =====================================================================
+    println!("=== Phase 1: Forward Operations ===\n");
 
-    println!(
-        "Created tensor with shape {:?}, {} elements",
-        tensor.shape(),
-        tensor.numel()
+    // --- Matrix Multiplication (GEMM) ---
+    println!("1. Matrix Multiplication (matmul)");
+    let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let b = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+    let c = matmul(&a, &b);
+    println!("   A[2x3] @ B[3x2] = C[2x2]");
+    println!("   Result: {:?}\n", c.as_f32_slice());
+
+    // --- Element-wise Operations ---
+    println!("2. Element-wise Operations");
+    let x = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+    let y = Tensor::from_f32_slice(&[0.5, 1.0, 1.5, 2.0], &[4]);
+
+    let sum = add(&x, &y);
+    println!("   add([1,2,3,4], [0.5,1,1.5,2]) = {:?}", sum.as_f32_slice());
+
+    let prod = mul(&x, &y);
+    println!("   mul([1,2,3,4], [0.5,1,1.5,2]) = {:?}", prod.as_f32_slice());
+
+    let scaled = scale(&x, 2.0);
+    println!("   scale([1,2,3,4], 2.0) = {:?}\n", scaled.as_f32_slice());
+
+    // --- Activation Functions ---
+    println!("3. Activation Functions");
+    let act_input = Tensor::from_f32_slice(&[-1.0, 0.0, 1.0, 2.0], &[4]);
+
+    let silu_out = silu(&act_input);
+    println!("   SiLU([-1,0,1,2]) = {:?}", silu_out.as_f32_slice());
+
+    let gelu_out = gelu(&act_input);
+    println!("   GELU([-1,0,1,2]) = {:?}", gelu_out.as_f32_slice());
+
+    let relu_out = relu(&act_input);
+    println!("   ReLU([-1,0,1,2]) = {:?}", relu_out.as_f32_slice());
+
+    // SwiGLU (used in Llama-style FFN)
+    let gate = Tensor::from_f32_slice(&[1.0, 2.0, -1.0, 0.5], &[4]);
+    let up = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+    let swiglu_out = swiglu(&gate, &up);
+    println!("   SwiGLU(gate, up) = {:?}\n", swiglu_out.as_f32_slice());
+
+    // --- RMSNorm ---
+    println!("4. RMSNorm (Layer Normalization)");
+    let norm_input = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+    let gamma = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+    let normed = rmsnorm(&norm_input, &gamma, 1e-5);
+    println!("   Input shape: [2, 4], hidden_dim=4");
+    println!("   Output: {:?}\n", normed.as_f32_slice());
+
+    // --- Softmax ---
+    println!("5. Softmax");
+    let logits = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 1.0], &[2, 4]);
+    let probs = softmax(&logits);
+    println!("   Input: [1,2,3,4] and [1,1,1,1]");
+    println!("   Probs: {:?}\n", probs.as_f32_slice());
+
+    // --- Embedding Lookup ---
+    println!("6. Embedding Lookup");
+    let vocab_size = 5;
+    let embed_dim = 4;
+    let weights: Vec<f32> = (0..(vocab_size * embed_dim)).map(|i| i as f32 * 0.1).collect();
+    let embed_weights = Tensor::from_f32_slice(&weights, &[vocab_size, embed_dim]);
+    let indices = vec![0u32, 2, 4];
+    let embedded = embedding(&embed_weights, &indices);
+    println!("   Vocab size: {}, Embed dim: {}", vocab_size, embed_dim);
+    println!("   Indices: {:?}", indices);
+    println!("   Embedded[0]: {:?}", &embedded.as_f32_slice()[0..4]);
+    println!("   Embedded[2]: {:?}", &embedded.as_f32_slice()[4..8]);
+    println!("   Embedded[4]: {:?}\n", &embedded.as_f32_slice()[8..12]);
+
+    // --- RoPE (Rotary Position Embedding) ---
+    println!("7. RoPE (Rotary Position Embedding)");
+    let batch = 1;
+    let seq_len = 2;
+    let num_heads = 2;
+    let head_dim = 4;
+    let rope_data = vec![1.0f32; batch * seq_len * num_heads * head_dim];
+    let rope_input = Tensor::from_f32_slice(&rope_data, &[batch, seq_len, num_heads, head_dim]);
+    let rope_out = rope(&rope_input, 10000.0, 0);
+    println!("   Input shape: [batch={}, seq={}, heads={}, head_dim={}]", batch, seq_len, num_heads, head_dim);
+    println!("   Position 0: {:?}", &rope_out.as_f32_slice()[0..head_dim]);
+    println!("   Position 1: {:?}\n", &rope_out.as_f32_slice()[num_heads * head_dim..num_heads * head_dim + head_dim]);
+
+    // --- Attention ---
+    println!("8. Attention");
+    let batch = 1;
+    let heads = 2;
+    let seq = 4;
+    let head_d = 8;
+    let qkv_data: Vec<f32> = (0..(batch * heads * seq * head_d))
+        .map(|i| (i as f32 * 0.01).sin())
+        .collect();
+    let q = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq, head_d]);
+    let k = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq, head_d]);
+    let v = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq, head_d]);
+    let attn_out = attention(&q, &k, &v, true); // causal=true
+    println!("   Q/K/V shape: [batch={}, heads={}, seq={}, head_dim={}]", batch, heads, seq, head_d);
+    println!("   Causal masking: enabled");
+    println!("   Output shape: {:?}\n", attn_out.shape());
+
+    // =====================================================================
+    // PHASE 2: Backward Operations (Autodiff)
+    // =====================================================================
+    println!("=== Phase 2: Backward Operations ===\n");
+
+    // --- Matmul Backward ---
+    println!("1. Matmul Backward");
+    let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let b = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+    let grad_c = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[2, 2]);
+    let (grad_a, grad_b) = matmul_backward(&grad_c, &a, &b);
+    println!("   grad_C[2x2] -> grad_A[2x3], grad_B[3x2]");
+    println!("   grad_A: {:?}", grad_a.as_f32_slice());
+    println!("   grad_B: {:?}\n", grad_b.as_f32_slice());
+
+    // --- Element-wise Backward ---
+    println!("2. Element-wise Backward");
+    let x = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+    let y = Tensor::from_f32_slice(&[0.5, 1.0, 1.5, 2.0], &[4]);
+    let grad_out = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+
+    let (grad_x, grad_y) = mul_backward(&grad_out, &x, &y);
+    println!("   mul_backward: grad_x={:?}, grad_y={:?}", grad_x.as_f32_slice(), grad_y.as_f32_slice());
+
+    let grad_scaled = scale_backward(&grad_out, 2.0);
+    println!("   scale_backward(scalar=2.0): {:?}\n", grad_scaled.as_f32_slice());
+
+    // --- Activation Backward ---
+    println!("3. Activation Backward");
+    let act_input = Tensor::from_f32_slice(&[-1.0, 0.0, 1.0, 2.0], &[4]);
+    let grad_out = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+
+    let grad_silu = silu_backward(&grad_out, &act_input);
+    println!("   silu_backward: {:?}", grad_silu.as_f32_slice());
+
+    let grad_gelu = gelu_backward(&grad_out, &act_input);
+    println!("   gelu_backward: {:?}", grad_gelu.as_f32_slice());
+
+    let grad_relu = relu_backward(&grad_out, &act_input);
+    println!("   relu_backward: {:?}", grad_relu.as_f32_slice());
+
+    let gate = Tensor::from_f32_slice(&[1.0, 2.0, -1.0, 0.5], &[4]);
+    let up = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+    let (grad_gate, grad_up) = swiglu_backward(&grad_out, &gate, &up);
+    println!("   swiglu_backward: grad_gate={:?}", grad_gate.as_f32_slice());
+    println!("                    grad_up={:?}\n", grad_up.as_f32_slice());
+
+    // --- RMSNorm Backward ---
+    println!("4. RMSNorm Backward");
+    let norm_input = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let gamma = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+    let grad_out = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[1, 4]);
+    let (grad_input, grad_gamma) = rmsnorm_backward(&grad_out, &norm_input, &gamma, 1e-5);
+    println!("   grad_input: {:?}", grad_input.as_f32_slice());
+    println!("   grad_gamma: {:?}\n", grad_gamma.as_f32_slice());
+
+    // --- Softmax Backward ---
+    println!("5. Softmax Backward");
+    let logits = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let probs = softmax(&logits);
+    let grad_out = Tensor::from_f32_slice(&[0.1, 0.2, 0.3, 0.4], &[1, 4]);
+    let grad_logits = softmax_backward(&grad_out, &probs);
+    println!("   Probs: {:?}", probs.as_f32_slice());
+    println!("   grad_logits: {:?}\n", grad_logits.as_f32_slice());
+
+    // --- Embedding Backward ---
+    println!("6. Embedding Backward");
+    let vocab_size = 5;
+    let embed_dim = 4;
+    let indices = vec![0u32, 2, 0]; // Note: index 0 appears twice
+    let grad_out = Tensor::from_f32_slice(
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        &[3, embed_dim],
     );
+    let grad_weights = embedding_backward(&grad_out, &indices, vocab_size);
+    println!("   Indices: {:?} (0 appears twice)", indices);
+    println!("   grad_weights[0] (accumulated): {:?}", &grad_weights.as_f32_slice()[0..4]);
+    println!("   grad_weights[2]: {:?}\n", &grad_weights.as_f32_slice()[8..12]);
 
-    // Read back the data (unified memory - no copy needed)
-    let readback = tensor.as_f32_slice();
-    println!("Data: {:?}", readback);
+    // --- RoPE Backward ---
+    println!("7. RoPE Backward");
+    {
+        let batch = 1;
+        let seq_len = 2;
+        let num_heads = 1;
+        let head_dim = 4;
+        let grad_data = vec![1.0f32; batch * seq_len * num_heads * head_dim];
+        let grad_out = Tensor::from_f32_slice(&grad_data, &[batch, seq_len, num_heads, head_dim]);
+        let grad_input = rope_backward(&grad_out, 10000.0, 0);
+        println!("   RoPE backward applies inverse rotation");
+        println!("   grad_input[0]: {:?}\n", &grad_input.as_f32_slice()[0..head_dim]);
+    }
 
-    // Verify
-    assert_eq!(readback, &data[..]);
-    println!("Data matches!");
-
-    // Create a zeroed tensor
-    let zeros = Tensor::zeros(&[4, 4], Precision::FP32);
-    println!(
-        "Created zeros tensor with shape {:?}, byte_size={}",
-        zeros.shape(),
-        zeros.byte_size()
+    // --- Cross-Entropy Loss (Fused) ---
+    println!("8. Cross-Entropy Loss (Fused Softmax + Loss + Backward)");
+    let batch_size = 2;
+    let vocab_size = 5;
+    let logits = Tensor::from_f32_slice(
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, // batch 0: highest logit at index 4
+            5.0, 4.0, 3.0, 2.0, 1.0, // batch 1: highest logit at index 0
+        ],
+        &[batch_size, vocab_size],
     );
+    let targets = vec![4u32, 0]; // correct predictions
+    let (loss, _probs, grad_logits) = cross_entropy_fused(&logits, &targets);
+    println!("   Logits shape: [batch={}, vocab={}]", batch_size, vocab_size);
+    println!("   Targets: {:?} (correct predictions)", targets);
+    println!("   Loss: {:.4}", loss);
+    println!("   grad_logits[0]: {:?}", &grad_logits.as_f32_slice()[0..vocab_size]);
+    println!("   grad_logits[1]: {:?}\n", &grad_logits.as_f32_slice()[vocab_size..2 * vocab_size]);
 
-    // Verify zeros
-    let zeros_data = zeros.as_f32_slice();
-    assert!(zeros_data.iter().all(|&x| x == 0.0));
-    println!("Zeros verified!");
+    // =====================================================================
+    // Summary
+    // =====================================================================
+    println!("=== Summary ===");
+    println!("IronTensor provides GPU-accelerated tensor operations for LLM training:");
+    println!("- Phase 1: Forward ops (matmul, activations, normalization, attention, etc.)");
+    println!("- Phase 2: Backward ops for automatic differentiation");
+    println!("\nAll operations run on Metal GPU with unified memory (zero-copy on Apple Silicon).");
 }
