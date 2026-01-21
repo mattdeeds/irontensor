@@ -14,6 +14,9 @@ use irontensor::{
     GPTModel, ModelConfig, TransformerBlock,
     // Data loading
     TokenDataset,
+    // Training (Phase 6)
+    Checkpoint, CosineAnnealingLR, LRScheduler, Trainer, TrainingConfig,
+    save_model_weights, load_model_weights,
     // Core types
     MetalContext, Tensor,
 };
@@ -488,6 +491,94 @@ fn main() {
     println!("   Memory savings: {:.0}x\n", separate_mem as f64 / fused_mem_large as f64);
 
     // =====================================================================
+    // PHASE 6: Training Infrastructure
+    // =====================================================================
+    println!("=== Phase 6: Training Infrastructure ===\n");
+
+    // --- Learning Rate Schedulers ---
+    println!("1. Learning Rate Schedulers");
+
+    let cosine_scheduler = CosineAnnealingLR::with_warmup(1e-3, 100, 1000);
+    println!("   CosineAnnealingLR (warmup=100, total=1000):");
+    println!("     Step 0: {:.6}", cosine_scheduler.get_lr(0));
+    println!("     Step 50 (warmup): {:.6}", cosine_scheduler.get_lr(50));
+    println!("     Step 100 (peak): {:.6}", cosine_scheduler.get_lr(100));
+    println!("     Step 500: {:.6}", cosine_scheduler.get_lr(500));
+    println!("     Step 999: {:.6}\n", cosine_scheduler.get_lr(999));
+
+    // --- Training Configuration ---
+    println!("2. Training Configuration");
+    let train_config = TrainingConfig {
+        learning_rate: 3e-4,
+        weight_decay: 0.1,
+        beta1: 0.9,
+        beta2: 0.99,
+        max_grad_norm: 1.0,
+        warmup_steps: 100,
+        total_steps: 10000,
+        log_interval: 100,
+        save_interval: 1000,
+        eval_interval: 500,
+        checkpoint_dir: "checkpoints".to_string(),
+    };
+    println!("   LR: {}, weight_decay: {}", train_config.learning_rate, train_config.weight_decay);
+    println!("   Warmup: {} steps, Total: {} steps", train_config.warmup_steps, train_config.total_steps);
+    println!("   Gradient clipping: max_norm={}\n", train_config.max_grad_norm);
+
+    // --- Model Checkpointing ---
+    println!("3. Model Checkpointing");
+    let checkpoint_path = std::env::temp_dir().join("irontensor_checkpoint_demo.bin");
+
+    // Create a model and checkpoint
+    let model_config = ModelConfig::tiny();
+    let model = GPTModel::new(model_config.clone());
+    let checkpoint = Checkpoint::new(model_config.clone());
+
+    // Save the checkpoint
+    save_model_weights(&checkpoint_path, &model, &checkpoint).unwrap();
+    println!("   Saved checkpoint to: {:?}", checkpoint_path);
+
+    // Load it back
+    let (loaded_model, loaded_checkpoint) = load_model_weights(&checkpoint_path).unwrap();
+    println!("   Loaded model with {} layers, {} hidden dim",
+        loaded_checkpoint.config.num_layers,
+        loaded_checkpoint.config.hidden_dim);
+    println!("   Checkpoint: step={}, epoch={}, best_val_loss={:.4}",
+        loaded_checkpoint.step,
+        loaded_checkpoint.epoch,
+        loaded_checkpoint.best_val_loss);
+
+    // Verify weights match
+    let orig_embed = model.embed_tokens.as_f32_slice();
+    let loaded_embed = loaded_model.embed_tokens.as_f32_slice();
+    let weights_match = orig_embed.iter()
+        .zip(loaded_embed.iter())
+        .all(|(a, b)| (a - b).abs() < 1e-6);
+    println!("   Weights match: {}\n", weights_match);
+
+    // Cleanup
+    std::fs::remove_file(&checkpoint_path).ok();
+
+    // --- Trainer (Overview) ---
+    println!("4. Trainer Overview");
+    let model_config = ModelConfig::tiny();
+    let train_config = TrainingConfig::default();
+    let trainer = Trainer::new(model_config, train_config);
+
+    println!("   Trainer initialized with:");
+    println!("     Model params: {:.2}M", trainer.model.config.num_params() as f64 / 1e6);
+    println!("     Optimizer: Lion");
+    println!("     Scheduler: CosineAnnealingLR");
+    println!("     Current step: {}, epoch: {}", trainer.step, trainer.epoch);
+    println!();
+
+    // Compute loss on a sample batch
+    let input_ids: Vec<u32> = (0..32).collect();
+    let target_ids: Vec<u32> = (1..33).collect();
+    let loss = trainer.compute_loss(&input_ids, &target_ids, 2, 16);
+    println!("   Sample loss (random init): {:.4}\n", loss);
+
+    // =====================================================================
     // Summary
     // =====================================================================
     println!("=== Summary ===");
@@ -497,5 +588,6 @@ fn main() {
     println!("- Phase 3: Lion optimizer with gradient clipping and weight decay");
     println!("- Phase 4: GPT model architecture and memory-mapped data loading");
     println!("- Phase 5: FlashAttention and FusedLinearCrossEntropy for memory efficiency");
+    println!("- Phase 6: Training infrastructure (LR schedulers, checkpointing, Trainer)");
     println!("\nAll operations run on Metal GPU with unified memory (zero-copy on Apple Silicon).");
 }

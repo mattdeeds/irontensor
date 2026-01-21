@@ -5,6 +5,7 @@ pub mod ops;
 pub mod optim;
 pub mod precision;
 pub mod tensor;
+pub mod train;
 
 pub use data::{DatasetIterator, TokenDataset};
 pub use device::MetalContext;
@@ -27,3 +28,8 @@ pub use ops::{
 pub use optim::{clip_grad_norm, grad_norm, zero_gradients, Lion, LionConfig, ParamState};
 pub use precision::Precision;
 pub use tensor::Tensor;
+pub use train::{
+    load_model_weights, save_model_weights, Checkpoint, ConstantLR, CosineAnnealingLR,
+    InverseSqrtLR, LRScheduler, LinearDecayLR, PrintCallback, TrainCallback, TrainMetrics,
+    Trainer, TrainingConfig, WarmupConstantLR,
+};
