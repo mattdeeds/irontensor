@@ -239,6 +239,22 @@ impl MultiHeadAttention {
     pub fn num_params(&self) -> usize {
         self.wq.num_params() + self.wk.num_params() + self.wv.num_params() + self.wo.num_params()
     }
+
+    /// Convert all weights to BF16
+    pub fn to_bf16(&mut self) {
+        self.wq.to_bf16();
+        self.wk.to_bf16();
+        self.wv.to_bf16();
+        self.wo.to_bf16();
+    }
+
+    /// Convert all weights to FP32
+    pub fn to_f32(&mut self) {
+        self.wq.to_f32();
+        self.wk.to_f32();
+        self.wv.to_f32();
+        self.wo.to_f32();
+    }
 }
 
 /// Optimizer state for MultiHeadAttention

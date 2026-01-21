@@ -1,5 +1,6 @@
 use crate::ops::{embedding, matmul, rmsnorm};
 use crate::optim::ParamState;
+use crate::precision::Precision;
 use crate::tensor::Tensor;
 
 use super::transformer::{TransformerBlock, TransformerBlockState};
@@ -27,6 +28,8 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     /// Whether to tie embedding and output weights
     pub tie_weights: bool,
+    /// Weight precision (FP32 or BF16)
+    pub precision: Precision,
 }
 
 impl ModelConfig {
@@ -43,6 +46,7 @@ impl ModelConfig {
             rope_base: 10000.0,
             norm_eps: 1e-5,
             tie_weights: true,
+            precision: Precision::FP32,
         }
     }
 
@@ -59,6 +63,7 @@ impl ModelConfig {
             rope_base: 10000.0,
             norm_eps: 1e-5,
             tie_weights: true,
+            precision: Precision::FP32,
         }
     }
 
@@ -75,7 +80,14 @@ impl ModelConfig {
             rope_base: 10000.0,
             norm_eps: 1e-5,
             tie_weights: true,
+            precision: Precision::FP32,
         }
+    }
+
+    /// Return a new config with BF16 precision
+    pub fn with_bf16(mut self) -> Self {
+        self.precision = Precision::BF16;
+        self
     }
 
     /// Compute the number of parameters for this config
@@ -244,14 +256,83 @@ impl GPTModel {
         let params = self.num_params();
         let params_m = params as f64 / 1_000_000.0;
         format!(
-            "GPTModel(\n  vocab_size={},\n  hidden_dim={},\n  num_layers={},\n  num_heads={},\n  intermediate_dim={},\n  params={:.2}M\n)",
+            "GPTModel(\n  vocab_size={},\n  hidden_dim={},\n  num_layers={},\n  num_heads={},\n  intermediate_dim={},\n  precision={:?},\n  params={:.2}M\n)",
             self.config.vocab_size,
             self.config.hidden_dim,
             self.config.num_layers,
             self.config.num_heads,
             self.config.intermediate_dim,
+            self.config.precision,
             params_m
         )
+    }
+
+    /// Get the model's precision
+    pub fn precision(&self) -> Precision {
+        self.config.precision
+    }
+
+    /// Check if the model uses BF16 precision
+    pub fn is_bf16(&self) -> bool {
+        self.config.precision == Precision::BF16
+    }
+
+    /// Convert model weights to BF16
+    ///
+    /// Returns the memory savings ratio (BF16 size / FP32 size)
+    pub fn to_bf16(&mut self) {
+        if self.config.precision == Precision::BF16 {
+            return; // Already BF16
+        }
+
+        // Convert embedding weights
+        self.embed_tokens = self.embed_tokens.to_bf16();
+
+        // Convert transformer layer weights
+        for layer in &mut self.layers {
+            layer.to_bf16();
+        }
+
+        // Convert final norm
+        self.final_norm = self.final_norm.to_bf16();
+
+        // Convert output weights if not tied
+        if let Some(ref mut w) = self.output_weight {
+            *w = w.to_bf16();
+        }
+
+        self.config.precision = Precision::BF16;
+    }
+
+    /// Convert model weights to FP32
+    pub fn to_f32(&mut self) {
+        if self.config.precision == Precision::FP32 {
+            return; // Already FP32
+        }
+
+        // Convert embedding weights
+        self.embed_tokens = self.embed_tokens.to_f32();
+
+        // Convert transformer layer weights
+        for layer in &mut self.layers {
+            layer.to_f32();
+        }
+
+        // Convert final norm
+        self.final_norm = self.final_norm.to_f32();
+
+        // Convert output weights if not tied
+        if let Some(ref mut w) = self.output_weight {
+            *w = w.to_f32();
+        }
+
+        self.config.precision = Precision::FP32;
+    }
+
+    /// Get memory usage in bytes
+    pub fn memory_bytes(&self) -> usize {
+        let bytes_per_param = self.config.precision.byte_size();
+        self.num_params() * bytes_per_param
     }
 }
 
@@ -324,5 +405,36 @@ mod tests {
         let state = GPTModelState::new(&model);
 
         assert_eq!(state.layer_states.len(), model.layers.len());
+    }
+
+    #[test]
+    fn test_model_bf16_conversion() {
+        let config = ModelConfig::tiny();
+        let mut model = GPTModel::new(config);
+
+        // Start as FP32
+        assert!(!model.is_bf16());
+        assert_eq!(model.precision(), Precision::FP32);
+        let fp32_memory = model.memory_bytes();
+
+        // Convert to BF16
+        model.to_bf16();
+        assert!(model.is_bf16());
+        assert_eq!(model.precision(), Precision::BF16);
+        let bf16_memory = model.memory_bytes();
+
+        // BF16 should use half the memory
+        assert_eq!(bf16_memory, fp32_memory / 2);
+
+        // Convert back to FP32
+        model.to_f32();
+        assert!(!model.is_bf16());
+        assert_eq!(model.precision(), Precision::FP32);
+    }
+
+    #[test]
+    fn test_model_config_with_bf16() {
+        let config = ModelConfig::tiny().with_bf16();
+        assert_eq!(config.precision, Precision::BF16);
     }
 }

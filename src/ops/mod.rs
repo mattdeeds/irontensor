@@ -1,5 +1,6 @@
 mod attention;
 pub mod backward;
+pub mod bf16_ops;
 mod elementwise;
 mod embedding;
 mod flash_attention;
@@ -15,6 +16,10 @@ pub use backward::{
     matmul_backward, matmul_backward_a, matmul_backward_b, mul_backward, relu_backward,
     rmsnorm_backward, rope_backward, scale_backward, silu_backward, softmax_backward,
     swiglu_backward,
+};
+pub use bf16_ops::{
+    add_bf16, matmul_bf16, matmul_bf16_batched, mul_bf16, rmsnorm_bf16, scale_bf16, silu_bf16,
+    softmax_bf16, swiglu_bf16, to_bf16_gpu, to_f32_gpu,
 };
 pub use elementwise::{add, add_scalar, gelu, mul, relu, scale, silu, swiglu};
 pub use embedding::embedding;

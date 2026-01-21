@@ -80,6 +80,22 @@ impl TransformerBlock {
     pub fn num_params(&self) -> usize {
         self.attention.num_params() + self.ffn.num_params() + 2 * self.hidden_dim // norm weights
     }
+
+    /// Convert all weights to BF16
+    pub fn to_bf16(&mut self) {
+        self.attention.to_bf16();
+        self.ffn.to_bf16();
+        self.attn_norm = self.attn_norm.to_bf16();
+        self.ffn_norm = self.ffn_norm.to_bf16();
+    }
+
+    /// Convert all weights to FP32
+    pub fn to_f32(&mut self) {
+        self.attention.to_f32();
+        self.ffn.to_f32();
+        self.attn_norm = self.attn_norm.to_f32();
+        self.ffn_norm = self.ffn_norm.to_f32();
+    }
 }
 
 /// Optimizer state for TransformerBlock

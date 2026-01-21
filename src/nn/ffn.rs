@@ -75,6 +75,20 @@ impl FeedForward {
     pub fn num_params(&self) -> usize {
         self.w_gate.num_params() + self.w_up.num_params() + self.w_down.num_params()
     }
+
+    /// Convert all weights to BF16
+    pub fn to_bf16(&mut self) {
+        self.w_gate.to_bf16();
+        self.w_up.to_bf16();
+        self.w_down.to_bf16();
+    }
+
+    /// Convert all weights to FP32
+    pub fn to_f32(&mut self) {
+        self.w_gate.to_f32();
+        self.w_up.to_f32();
+        self.w_down.to_f32();
+    }
 }
 
 /// Optimizer state for FeedForward

@@ -467,6 +467,7 @@ impl Trainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::precision::Precision;
     use std::env::temp_dir;
 
     #[test]
@@ -482,6 +483,7 @@ mod tests {
             rope_base: 10000.0,
             max_seq_len: 128,
             tie_weights: true,
+            precision: Precision::FP32,
         };
 
         let train_config = TrainingConfig::default();
@@ -504,6 +506,7 @@ mod tests {
             rope_base: 10000.0,
             max_seq_len: 128,
             tie_weights: true,
+            precision: Precision::FP32,
         };
 
         let train_config = TrainingConfig::default();
@@ -535,6 +538,7 @@ mod tests {
             rope_base: 10000.0,
             max_seq_len: 128,
             tie_weights: true,
+            precision: Precision::FP32,
         };
 
         let train_config = TrainingConfig::default();
@@ -573,6 +577,7 @@ mod tests {
             rope_base: 10000.0,
             max_seq_len: 128,
             tie_weights: true,
+            precision: Precision::FP32,
         };
 
         let train_config = TrainingConfig::default();

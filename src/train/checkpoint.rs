@@ -3,6 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::nn::{GPTModel, ModelConfig};
+use crate::precision::Precision;
 use crate::tensor::Tensor;
 
 /// Magic number for checkpoint file format
@@ -232,6 +233,13 @@ fn write_model_config<W: Write>(writer: &mut W, config: &ModelConfig) -> std::io
     writer.write_all(&config.rope_base.to_le_bytes())?;
     writer.write_all(&(config.max_seq_len as u64).to_le_bytes())?;
     writer.write_all(&(if config.tie_weights { 1u8 } else { 0u8 }).to_le_bytes())?;
+    // Precision: 0 = FP32, 1 = FP16, 2 = BF16
+    let precision_byte = match config.precision {
+        Precision::FP32 => 0u8,
+        Precision::FP16 => 1u8,
+        Precision::BF16 => 2u8,
+    };
+    writer.write_all(&[precision_byte])?;
     Ok(())
 }
 
@@ -270,6 +278,16 @@ fn read_model_config<R: Read>(reader: &mut R) -> std::io::Result<ModelConfig> {
     reader.read_exact(&mut buf1)?;
     let tie_weights = buf1[0] == 1;
 
+    // Read precision (default to FP32 for backward compatibility)
+    let precision = match reader.read_exact(&mut buf1) {
+        Ok(()) => match buf1[0] {
+            1 => Precision::FP16,
+            2 => Precision::BF16,
+            _ => Precision::FP32,
+        },
+        Err(_) => Precision::FP32, // Old format without precision
+    };
+
     Ok(ModelConfig {
         vocab_size,
         hidden_dim,
@@ -281,6 +299,7 @@ fn read_model_config<R: Read>(reader: &mut R) -> std::io::Result<ModelConfig> {
         rope_base,
         max_seq_len,
         tie_weights,
+        precision,
     })
 }
 
@@ -316,6 +335,7 @@ mod tests {
             rope_base: 10000.0,
             max_seq_len: 128,
             tie_weights: true,
+            precision: Precision::FP32,
         };
 
         let model = GPTModel::new(config.clone());

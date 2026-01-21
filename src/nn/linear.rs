@@ -143,6 +143,28 @@ impl Linear {
         };
         weight_params + bias_params
     }
+
+    /// Convert weights to BF16
+    pub fn to_bf16(&mut self) {
+        if self.weight.is_bf16() {
+            return;
+        }
+        self.weight = self.weight.to_bf16();
+        if let Some(ref b) = self.bias {
+            self.bias = Some(b.to_bf16());
+        }
+    }
+
+    /// Convert weights to FP32
+    pub fn to_f32(&mut self) {
+        if self.weight.is_f32() {
+            return;
+        }
+        self.weight = self.weight.to_f32();
+        if let Some(ref b) = self.bias {
+            self.bias = Some(b.to_f32());
+        }
+    }
 }
 
 /// Optimizer state for a Linear layer
