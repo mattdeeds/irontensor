@@ -18,15 +18,20 @@ impl Tensor {
         let numel: usize = shape.iter().product();
         let byte_size = numel * precision.byte_size();
 
+        // Metal doesn't allow zero-size buffers, so allocate at least 1 byte
+        let alloc_size = byte_size.max(1);
+
         let ctx = MetalContext::global();
         let buffer = ctx
             .device()
-            .newBufferWithLength_options(byte_size, MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(alloc_size, MTLResourceOptions::StorageModeShared)
             .expect("Failed to allocate Metal buffer");
 
         // Zero the buffer (unified memory allows direct CPU access)
-        unsafe {
-            std::ptr::write_bytes(buffer.contents().as_ptr(), 0, byte_size);
+        if byte_size > 0 {
+            unsafe {
+                std::ptr::write_bytes(buffer.contents().as_ptr(), 0, byte_size);
+            }
         }
 
         Self {
@@ -109,5 +114,19 @@ impl Tensor {
 
     pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
+    }
+
+    /// Reshape tensor in-place (only changes shape metadata, not data)
+    pub fn reshape(&mut self, new_shape: &[usize]) {
+        let new_numel: usize = new_shape.iter().product();
+        assert_eq!(
+            self.numel(),
+            new_numel,
+            "Cannot reshape tensor of {} elements to shape {:?} ({} elements)",
+            self.numel(),
+            new_shape,
+            new_numel
+        );
+        self.shape = new_shape.to_vec();
     }
 }
