@@ -727,4 +727,99 @@ mod tests {
         assert!((result[2] - 3.0).abs() < 0.01);
         assert!((result[3] - 4.0).abs() < 0.01);
     }
+
+    /// Benchmark comparing custom BF16 GEMM shader vs MPS FP32 (with conversion)
+    /// Run with: cargo test benchmark_bf16_gemm --release -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn benchmark_bf16_gemm_vs_mps() {
+        use std::time::Instant;
+        use crate::command_batch::CommandBatch;
+        use crate::ops::matmul_mps_nt;
+
+        CommandBatch::sync();
+
+        let test_sizes = [
+            (256, 512, 512),
+            (512, 512, 512),
+            (1024, 512, 512),
+            (256, 512, 2048),
+            (4096, 512, 512),
+        ];
+
+        println!("\n{}", "=".repeat(90));
+        println!("BF16 GEMM Benchmark: Custom BF16 Shader vs MPS FP32 (with BF16→FP32 conversion)");
+        println!("{}", "=".repeat(90));
+        println!("{:>10} {:>10} {:>10} | {:>14} {:>14} | {:>10}",
+                 "M", "K", "N", "BF16 Custom", "MPS+Convert", "Winner");
+        println!("{}", "-".repeat(90));
+
+        let warmup_iters = 5;
+        let bench_iters = 20;
+
+        for (m, k, n) in test_sizes {
+            let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32) * 0.1 - 0.8).collect();
+            let b_data: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+
+            // BF16 tensors for custom shader (weight shape for NT matmul: [N, K])
+            let a_bf16 = Tensor::from_f32_as_bf16(&a_data, &[m, k]);
+            let b_bf16 = Tensor::from_f32_as_bf16(&b_data, &[n, k]);
+
+            // FP32 input, BF16 weight for MPS approach
+            let a_fp32 = Tensor::from_f32_slice(&a_data, &[m, k]);
+
+            // Warmup custom BF16 GEMM (need to transpose B for fair comparison)
+            // Our custom matmul_bf16 does A @ B, but linear_forward does A @ B^T
+            // Let's compare just the conversion + MPS overhead
+            let b_bf16_transposed = Tensor::from_f32_as_bf16(
+                &(0..k * n).map(|i| {
+                    let row = i / n;
+                    let col = i % n;
+                    b_data[col * k + row]
+                }).collect::<Vec<_>>(),
+                &[k, n]
+            );
+
+            for _ in 0..warmup_iters {
+                let _ = matmul_bf16(&a_bf16, &b_bf16_transposed);
+            }
+            CommandBatch::sync();
+
+            // Benchmark custom BF16 GEMM
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                let _ = matmul_bf16(&a_bf16, &b_bf16_transposed);
+            }
+            CommandBatch::sync();
+            let bf16_time = start.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
+
+            // Warmup MPS (with BF16→FP32 conversion)
+            for _ in 0..warmup_iters {
+                let b_fp32 = to_f32_gpu(&b_bf16);
+                let _ = matmul_mps_nt(&a_fp32, &b_fp32);
+            }
+            CommandBatch::sync();
+
+            // Benchmark MPS with conversion
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                let b_fp32 = to_f32_gpu(&b_bf16);
+                let _ = matmul_mps_nt(&a_fp32, &b_fp32);
+            }
+            CommandBatch::sync();
+            let mps_time = start.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
+
+            let winner = if bf16_time < mps_time { "BF16" } else { "MPS" };
+            let ratio = if bf16_time < mps_time {
+                format!("{:.1}x faster", mps_time / bf16_time)
+            } else {
+                format!("{:.1}x faster", bf16_time / mps_time)
+            };
+
+            println!("{:>10} {:>10} {:>10} | {:>12.3}ms {:>12.3}ms | {:>10} ({})",
+                     m, k, n, bf16_time, mps_time, winner, ratio);
+        }
+
+        println!("{}", "=".repeat(90));
+    }
 }

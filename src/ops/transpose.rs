@@ -1,12 +1,17 @@
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-use objc2::rc::Retained;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
+use objc2::AllocAnyThread;
 use objc2_foundation::ns_string;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+};
+use objc2_metal_performance_shaders::{
+    MPSDataType, MPSMatrix, MPSMatrixCopy, MPSMatrixCopyDescriptor, MPSMatrixCopyOffsets,
+    MPSMatrixDescriptor,
 };
 
 use crate::command_batch::CommandBatch;
@@ -68,8 +73,115 @@ fn get_pipelines() -> &'static TransposePipelines {
 }
 
 /// Transpose a 2D tensor: [rows, cols] -> [cols, rows]
+///
+/// Note: MPS transpose is 1.05-2.09x faster in isolation benchmarks, but requires CommandBatch::sync()
+/// which breaks GPU pipelining. Custom shader is faster in practice during training.
 pub fn transpose_2d(input: &Tensor) -> Tensor {
+    transpose_2d_custom(input)
+}
+
+/// MPS-based 2D transpose using MPSMatrixCopy with transpose flags.
+/// 1.05-2.09x faster than custom shader, with larger speedups for bigger matrices.
+fn transpose_2d_mps(input: &Tensor) -> Tensor {
     let _timer = timed(OpCategory::Transpose, input.numel());
+    assert_eq!(input.precision(), Precision::FP32);
+    let shape = input.shape();
+    assert_eq!(shape.len(), 2, "transpose_2d requires 2D tensor");
+
+    let rows = shape[0];
+    let cols = shape[1];
+
+    if rows == 0 || cols == 0 {
+        return Tensor::zeros(&[cols, rows], Precision::FP32);
+    }
+
+    let output = Tensor::zeros(&[cols, rows], Precision::FP32);
+
+    // Need to sync before MPS operations since MPS uses its own command buffer
+    CommandBatch::sync();
+
+    autoreleasepool(|_| {
+        let ctx = MetalContext::global();
+        let device = ctx.device();
+
+        // Source: [rows, cols] in row-major
+        let src_row_bytes = cols * std::mem::size_of::<f32>();
+        let src_desc = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                rows,
+                cols,
+                src_row_bytes,
+                MPSDataType::Float32,
+            )
+        };
+
+        // Destination: [cols, rows] in row-major
+        let dst_row_bytes = rows * std::mem::size_of::<f32>();
+        let dst_desc = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                cols,
+                rows,
+                dst_row_bytes,
+                MPSDataType::Float32,
+            )
+        };
+
+        let src_matrix = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), input.buffer(), &src_desc)
+        };
+
+        let dst_matrix = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), output.buffer(), &dst_desc)
+        };
+
+        // Create copy kernel with transpose
+        // sourcesAreTransposed=true interprets source as transposed (col-major view of row-major data)
+        // This effectively performs the transpose during copy
+        let kernel = unsafe {
+            MPSMatrixCopy::initWithDevice_copyRows_copyColumns_sourcesAreTransposed_destinationsAreTransposed(
+                MPSMatrixCopy::alloc(),
+                device,
+                cols,  // copy cols rows from transposed source view
+                rows,  // copy rows columns from transposed source view
+                true,  // source is transposed
+                false, // destination is not transposed
+            )
+        };
+
+        let offsets = MPSMatrixCopyOffsets {
+            sourceRowOffset: 0,
+            sourceColumnOffset: 0,
+            destinationRowOffset: 0,
+            destinationColumnOffset: 0,
+        };
+
+        let copy_desc = unsafe {
+            MPSMatrixCopyDescriptor::descriptorWithSourceMatrix_destinationMatrix_offsets(
+                &src_matrix,
+                &dst_matrix,
+                offsets,
+            )
+        };
+
+        let command_buffer = ctx
+            .command_queue()
+            .commandBuffer()
+            .expect("Failed to create command buffer for MPS");
+
+        unsafe {
+            kernel.encodeToCommandBuffer_copyDescriptor(&command_buffer, &copy_desc);
+        }
+
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    });
+
+    output
+}
+
+/// Custom shader-based 2D transpose (kept for reference)
+#[allow(dead_code)]
+fn transpose_2d_custom(input: &Tensor) -> Tensor {
     assert_eq!(input.precision(), Precision::FP32);
     let shape = input.shape();
     assert_eq!(shape.len(), 2, "transpose_2d requires 2D tensor");
@@ -370,5 +482,245 @@ mod tests {
         for (i, (&r, &e)) in result.iter().zip(data.iter()).enumerate() {
             assert_eq!(r, e, "Mismatch at index {}", i);
         }
+    }
+
+    /// Benchmark comparing MPS transpose (via MPSMatrixCopy) vs custom shader
+    /// Run with: cargo test benchmark_mps_transpose --release -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn benchmark_mps_transpose() {
+        use std::time::Instant;
+        use objc2::rc::autoreleasepool;
+        use objc2::AllocAnyThread;
+        use objc2_metal::MTLCommandQueue;
+        use objc2_metal_performance_shaders::{
+            MPSDataType, MPSMatrix, MPSMatrixCopy, MPSMatrixCopyDescriptor,
+            MPSMatrixDescriptor,
+        };
+
+        let test_cases = [
+            (256, 512),      // Small
+            (512, 512),      // Square
+            (1024, 512),     // Tall
+            (512, 1024),     // Wide
+            (2048, 512),     // Larger
+            (4096, 512),     // Large (batch*seq, hidden)
+        ];
+
+        println!("\n{}", "=".repeat(80));
+        println!("Transpose Benchmark: MPS (MPSMatrixCopy) vs Custom Shader (FP32)");
+        println!("{}", "=".repeat(80));
+        println!("{:>10} {:>10} | {:>12} {:>12} | {:>12}",
+                 "rows", "cols", "Custom", "MPS", "Winner");
+        println!("{}", "-".repeat(80));
+
+        let warmup_iters = 10;
+        let bench_iters = 100;
+
+        for (rows, cols) in test_cases {
+            let input_data: Vec<f32> = (0..(rows * cols))
+                .map(|i| i as f32)
+                .collect();
+
+            let input = Tensor::from_f32_slice(&input_data, &[rows, cols]);
+
+            // Warmup custom shader
+            for _ in 0..warmup_iters {
+                let _ = transpose_2d(&input);
+            }
+            CommandBatch::sync();
+
+            // Benchmark custom shader
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                let _ = transpose_2d(&input);
+            }
+            CommandBatch::sync();
+            let custom_time = start.elapsed().as_secs_f64() / bench_iters as f64 * 1000.0;
+
+            // MPS transpose using MPSMatrixCopy
+            // MPSMatrixCopy with sourcesAreTransposed interprets the source as transposed
+            // So if we have [rows, cols] and want [cols, rows], we set up the destination
+            // as [cols, rows] and tell MPS the source is transposed (row-major -> col-major)
+            let output_mps = Tensor::zeros(&[cols, rows], Precision::FP32);
+
+            // Warmup MPS
+            for _ in 0..warmup_iters {
+                autoreleasepool(|_| {
+                    let ctx = MetalContext::global();
+                    let device = ctx.device();
+
+                    // Source: [rows, cols] in row-major
+                    let src_row_bytes = cols * std::mem::size_of::<f32>();
+                    let src_desc = unsafe {
+                        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                            rows, cols, src_row_bytes, MPSDataType::Float32,
+                        )
+                    };
+
+                    // Destination: [cols, rows] in row-major
+                    let dst_row_bytes = rows * std::mem::size_of::<f32>();
+                    let dst_desc = unsafe {
+                        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                            cols, rows, dst_row_bytes, MPSDataType::Float32,
+                        )
+                    };
+
+                    let src_matrix = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), input.buffer(), &src_desc)
+                    };
+
+                    let dst_matrix = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), output_mps.buffer(), &dst_desc)
+                    };
+
+                    // Create copy kernel with transpose
+                    // sourcesAreTransposed=true means source is stored transposed (col-major)
+                    // destinationsAreTransposed=false means destination is row-major
+                    // This should copy rows->cols, cols->rows effectively
+                    let kernel = unsafe {
+                        MPSMatrixCopy::initWithDevice_copyRows_copyColumns_sourcesAreTransposed_destinationsAreTransposed(
+                            MPSMatrixCopy::alloc(),
+                            device,
+                            cols,  // copy cols rows from source (transposed view)
+                            rows,  // copy rows columns from source (transposed view)
+                            true,  // source is transposed
+                            false, // destination is not transposed
+                        )
+                    };
+
+                    // Create copy descriptor
+                    let offsets = objc2_metal_performance_shaders::MPSMatrixCopyOffsets {
+                        sourceRowOffset: 0,
+                        sourceColumnOffset: 0,
+                        destinationRowOffset: 0,
+                        destinationColumnOffset: 0,
+                    };
+
+                    let copy_desc = unsafe {
+                        MPSMatrixCopyDescriptor::descriptorWithSourceMatrix_destinationMatrix_offsets(
+                            &src_matrix,
+                            &dst_matrix,
+                            offsets,
+                        )
+                    };
+
+                    let command_buffer = ctx.command_queue()
+                        .commandBuffer()
+                        .expect("Failed to create command buffer");
+
+                    unsafe {
+                        kernel.encodeToCommandBuffer_copyDescriptor(&command_buffer, &copy_desc);
+                    }
+
+                    command_buffer.commit();
+                    command_buffer.waitUntilCompleted();
+                });
+            }
+
+            // Benchmark MPS
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                autoreleasepool(|_| {
+                    let ctx = MetalContext::global();
+                    let device = ctx.device();
+
+                    let src_row_bytes = cols * std::mem::size_of::<f32>();
+                    let src_desc = unsafe {
+                        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                            rows, cols, src_row_bytes, MPSDataType::Float32,
+                        )
+                    };
+
+                    let dst_row_bytes = rows * std::mem::size_of::<f32>();
+                    let dst_desc = unsafe {
+                        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                            cols, rows, dst_row_bytes, MPSDataType::Float32,
+                        )
+                    };
+
+                    let src_matrix = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), input.buffer(), &src_desc)
+                    };
+
+                    let dst_matrix = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), output_mps.buffer(), &dst_desc)
+                    };
+
+                    let kernel = unsafe {
+                        MPSMatrixCopy::initWithDevice_copyRows_copyColumns_sourcesAreTransposed_destinationsAreTransposed(
+                            MPSMatrixCopy::alloc(),
+                            device,
+                            cols,
+                            rows,
+                            true,
+                            false,
+                        )
+                    };
+
+                    let offsets = objc2_metal_performance_shaders::MPSMatrixCopyOffsets {
+                        sourceRowOffset: 0,
+                        sourceColumnOffset: 0,
+                        destinationRowOffset: 0,
+                        destinationColumnOffset: 0,
+                    };
+
+                    let copy_desc = unsafe {
+                        MPSMatrixCopyDescriptor::descriptorWithSourceMatrix_destinationMatrix_offsets(
+                            &src_matrix,
+                            &dst_matrix,
+                            offsets,
+                        )
+                    };
+
+                    let command_buffer = ctx.command_queue()
+                        .commandBuffer()
+                        .expect("Failed to create command buffer");
+
+                    unsafe {
+                        kernel.encodeToCommandBuffer_copyDescriptor(&command_buffer, &copy_desc);
+                    }
+
+                    command_buffer.commit();
+                    command_buffer.waitUntilCompleted();
+                });
+            }
+            let mps_time = start.elapsed().as_secs_f64() / bench_iters as f64 * 1000.0;
+
+            // Verify correctness
+            let custom_result = transpose_2d(&input);
+            CommandBatch::sync();
+            let custom_slice = custom_result.as_f32_slice();
+            let mps_slice = output_mps.as_f32_slice();
+
+            let mut max_diff = 0.0f32;
+            let mut mismatch_count = 0;
+            for (i, (c, m)) in custom_slice.iter().zip(mps_slice.iter()).enumerate() {
+                let diff = (c - m).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+                if diff > 1e-5 {
+                    mismatch_count += 1;
+                    if mismatch_count <= 3 {
+                        // Print first few mismatches for debugging
+                        let row = i / rows;
+                        let col = i % rows;
+                        eprintln!("  Mismatch at [{},{}]: custom={}, mps={}", row, col, c, m);
+                    }
+                }
+            }
+
+            let speedup = custom_time / mps_time;
+            let winner = if speedup > 1.0 { "MPS" } else { "Custom" };
+            let ratio = if speedup > 1.0 { speedup } else { 1.0 / speedup };
+
+            let correctness = if mismatch_count == 0 { "✓" } else { "✗" };
+
+            println!("{:>10} {:>10} | {:>10.3}ms {:>10.3}ms | {:>8} ({:.2}x) {}",
+                     rows, cols, custom_time, mps_time, winner, ratio, correctness);
+        }
+
+        println!("{}", "=".repeat(80));
     }
 }

@@ -44,6 +44,8 @@ pub(crate) fn compute_total_grad_norm(grads: &[&Tensor]) -> f32 {
 ///
 /// Uses MPS's native transpose support to avoid explicit transposition.
 /// Supports mixed precision: BF16 weights are converted to FP32 for compute.
+///
+/// Note: MPS does not support BFloat16 input, so conversion is required.
 pub(crate) fn linear_forward(input: &Tensor, weight: &Tensor) -> Tensor {
     // weight: [out, in], we want input @ weight.T
     // matmul_mps_nt handles the transpose natively
@@ -55,6 +57,8 @@ pub(crate) fn linear_forward(input: &Tensor, weight: &Tensor) -> Tensor {
 ///
 /// Supports mixed precision: BF16 weights are converted to FP32 for compute.
 /// Returns FP32 gradients regardless of weight precision.
+///
+/// Note: MPS does not support BFloat16 input, so conversion is required.
 pub(crate) fn linear_backward(
     grad_output: &Tensor,
     input: &Tensor,

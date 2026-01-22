@@ -485,6 +485,11 @@ fn matmul_mps_batched(a: &Tensor, b: &Tensor) -> Tensor {
     c
 }
 
+// Note: MPS MPSMatrixMultiplication does NOT support BFloat16 as input.
+// Supported input types are: FP32, FP16, Int8, Int16.
+// For BF16 training, use the custom GEMM shader in bf16_ops.rs which
+// reads BF16, computes in FP32, and writes BF16.
+
 #[cfg(test)]
 mod tests {
     use super::*;

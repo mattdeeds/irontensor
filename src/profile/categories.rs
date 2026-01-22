@@ -32,6 +32,7 @@ pub enum OpCategory {
     Attention,
     FlashAttention,
     FusedLinearCE,
+    FusedRMSNormLinear,
     Elementwise(String),
     Transpose,
 
@@ -63,6 +64,7 @@ impl fmt::Display for OpCategory {
             OpCategory::Attention => write!(f, "Attention"),
             OpCategory::FlashAttention => write!(f, "FlashAttention"),
             OpCategory::FusedLinearCE => write!(f, "FusedLinearCE"),
+            OpCategory::FusedRMSNormLinear => write!(f, "FusedRMSNormLinear"),
             OpCategory::Elementwise(name) => write!(f, "Elementwise({})", name),
             OpCategory::Transpose => write!(f, "Transpose"),
 

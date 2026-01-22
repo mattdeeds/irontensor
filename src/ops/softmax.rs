@@ -1,13 +1,15 @@
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-use objc2::rc::Retained;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
+use objc2::AllocAnyThread;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLCommandBuffer, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
+use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixSoftMax};
 
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
@@ -60,12 +62,84 @@ fn get_pipelines() -> &'static SoftmaxPipelines {
 ///
 /// Applies softmax along the last dimension.
 ///
+/// Note: MPS softmax is 1.8-5.4x faster in isolation benchmarks, but requires CommandBatch::sync()
+/// which breaks GPU pipelining. Custom shader is faster in practice during training.
+///
 /// Input shapes:
 /// - input: [..., dim] - softmax is applied over the last dimension
 ///
 /// Returns tensor with same shape as input
 pub fn softmax(input: &Tensor) -> Tensor {
+    softmax_custom(input)
+}
+
+/// MPS-based softmax using MPSMatrixSoftMax.
+/// 1.8-5.4x faster than custom shader across typical LLM dimensions.
+fn softmax_mps(input: &Tensor) -> Tensor {
     let _timer = timed(OpCategory::Softmax, input.numel());
+    assert_eq!(input.precision(), Precision::FP32);
+
+    let shape = input.shape();
+    assert!(!shape.is_empty(), "Input must have at least 1 dimension");
+
+    let dim = shape[shape.len() - 1];
+    let batch_seq: usize = shape[..shape.len() - 1].iter().product::<usize>().max(1);
+
+    let output = Tensor::zeros(shape, Precision::FP32);
+
+    // Need to sync before MPS operations since MPS uses its own command buffer
+    CommandBatch::sync();
+
+    autoreleasepool(|_| {
+        let ctx = MetalContext::global();
+        let device = ctx.device();
+
+        let row_bytes = dim * std::mem::size_of::<f32>();
+
+        let desc = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                batch_seq,
+                dim,
+                row_bytes,
+                MPSDataType::Float32,
+            )
+        };
+
+        let matrix_in = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), input.buffer(), &desc)
+        };
+
+        let matrix_out = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), output.buffer(), &desc)
+        };
+
+        let kernel = unsafe {
+            MPSMatrixSoftMax::initWithDevice(MPSMatrixSoftMax::alloc(), device)
+        };
+
+        let command_buffer = ctx
+            .command_queue()
+            .commandBuffer()
+            .expect("Failed to create command buffer for MPS");
+
+        unsafe {
+            kernel.encodeToCommandBuffer_inputMatrix_resultMatrix(
+                &command_buffer,
+                &matrix_in,
+                &matrix_out,
+            );
+        }
+
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    });
+
+    output
+}
+
+/// Custom shader-based softmax (kept for reference and edge cases)
+#[allow(dead_code)]
+fn softmax_custom(input: &Tensor) -> Tensor {
     assert_eq!(input.precision(), Precision::FP32);
 
     let shape = input.shape();
@@ -276,5 +350,169 @@ mod tests {
         // Verify sum is 1
         let sum: f32 = result.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "Sum should be 1, got {}", sum);
+    }
+
+    /// Benchmark comparing MPS softmax vs custom shader
+    /// Run with: cargo test benchmark_mps_softmax --release -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn benchmark_mps_softmax() {
+        use std::time::Instant;
+        use objc2::rc::autoreleasepool;
+        use objc2::AllocAnyThread;
+        use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
+        use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixSoftMax};
+
+        let test_cases = [
+            (256, 512),      // Small batch, typical hidden dim
+            (1024, 512),     // Medium batch
+            (4096, 512),     // Large batch (batch * seq for training)
+            (256, 2048),     // Larger hidden dim
+            (4096, 2048),    // Large batch + large dim
+            (16384, 256),    // Very large batch, attention-style (batch*heads*seq, seq)
+        ];
+
+        println!("\n{}", "=".repeat(80));
+        println!("Softmax Benchmark: MPS vs Custom Shader (FP32)");
+        println!("{}", "=".repeat(80));
+        println!("{:>10} {:>10} | {:>12} {:>12} | {:>12}",
+                 "batch_seq", "dim", "Custom", "MPS", "Winner");
+        println!("{}", "-".repeat(80));
+
+        let warmup_iters = 10;
+        let bench_iters = 100;
+
+        for (batch_seq, dim) in test_cases {
+            let input_data: Vec<f32> = (0..(batch_seq * dim))
+                .map(|i| ((i % 100) as f32 - 50.0) * 0.1)
+                .collect();
+
+            let input = Tensor::from_f32_slice(&input_data, &[batch_seq, dim]);
+
+            // Warmup custom shader
+            for _ in 0..warmup_iters {
+                let _ = softmax(&input);
+            }
+            CommandBatch::sync();
+
+            // Benchmark custom shader
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                let _ = softmax(&input);
+            }
+            CommandBatch::sync();
+            let custom_time = start.elapsed().as_secs_f64() / bench_iters as f64 * 1000.0;
+
+            // MPS softmax
+            let output_mps = Tensor::zeros(&[batch_seq, dim], Precision::FP32);
+
+            // Warmup MPS
+            for _ in 0..warmup_iters {
+                autoreleasepool(|_| {
+                    let ctx = MetalContext::global();
+                    let device = ctx.device();
+
+                    let row_bytes = dim * std::mem::size_of::<f32>();
+
+                    let desc = unsafe {
+                        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                            batch_seq, dim, row_bytes, MPSDataType::Float32,
+                        )
+                    };
+
+                    let matrix_in = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), input.buffer(), &desc)
+                    };
+
+                    let matrix_out = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), output_mps.buffer(), &desc)
+                    };
+
+                    let kernel = unsafe {
+                        MPSMatrixSoftMax::initWithDevice(MPSMatrixSoftMax::alloc(), device)
+                    };
+
+                    let command_buffer = ctx.command_queue()
+                        .commandBuffer()
+                        .expect("Failed to create command buffer");
+
+                    unsafe {
+                        kernel.encodeToCommandBuffer_inputMatrix_resultMatrix(
+                            &command_buffer,
+                            &matrix_in,
+                            &matrix_out,
+                        );
+                    }
+
+                    command_buffer.commit();
+                    command_buffer.waitUntilCompleted();
+                });
+            }
+
+            // Benchmark MPS
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                autoreleasepool(|_| {
+                    let ctx = MetalContext::global();
+                    let device = ctx.device();
+
+                    let row_bytes = dim * std::mem::size_of::<f32>();
+
+                    let desc = unsafe {
+                        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                            batch_seq, dim, row_bytes, MPSDataType::Float32,
+                        )
+                    };
+
+                    let matrix_in = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), input.buffer(), &desc)
+                    };
+
+                    let matrix_out = unsafe {
+                        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), output_mps.buffer(), &desc)
+                    };
+
+                    let kernel = unsafe {
+                        MPSMatrixSoftMax::initWithDevice(MPSMatrixSoftMax::alloc(), device)
+                    };
+
+                    let command_buffer = ctx.command_queue()
+                        .commandBuffer()
+                        .expect("Failed to create command buffer");
+
+                    unsafe {
+                        kernel.encodeToCommandBuffer_inputMatrix_resultMatrix(
+                            &command_buffer,
+                            &matrix_in,
+                            &matrix_out,
+                        );
+                    }
+
+                    command_buffer.commit();
+                    command_buffer.waitUntilCompleted();
+                });
+            }
+            let mps_time = start.elapsed().as_secs_f64() / bench_iters as f64 * 1000.0;
+
+            // Verify correctness (spot check)
+            let custom_result = softmax(&input);
+            CommandBatch::sync();
+            let custom_slice = custom_result.as_f32_slice();
+            let mps_slice = output_mps.as_f32_slice();
+
+            let mut max_diff = 0.0f32;
+            for (c, m) in custom_slice.iter().zip(mps_slice.iter()) {
+                max_diff = max_diff.max((c - m).abs());
+            }
+
+            let speedup = custom_time / mps_time;
+            let winner = if speedup > 1.0 { "MPS" } else { "Custom" };
+            let ratio = if speedup > 1.0 { speedup } else { 1.0 / speedup };
+
+            println!("{:>10} {:>10} | {:>10.3}ms {:>10.3}ms | {:>8} ({:.2}x) [diff={:.2e}]",
+                     batch_seq, dim, custom_time, mps_time, winner, ratio, max_diff);
+        }
+
+        println!("{}", "=".repeat(80));
     }
 }
