@@ -13,6 +13,36 @@ pub struct Tensor {
     precision: Precision,
 }
 
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        let byte_size = self.byte_size();
+        let alloc_size = byte_size.max(1);
+
+        let ctx = MetalContext::global();
+        let new_buffer = ctx
+            .device()
+            .newBufferWithLength_options(alloc_size, MTLResourceOptions::StorageModeShared)
+            .expect("Failed to allocate Metal buffer for clone");
+
+        // Copy data from old buffer to new buffer
+        if byte_size > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.buffer.contents().as_ptr() as *const u8,
+                    new_buffer.contents().as_ptr() as *mut u8,
+                    byte_size,
+                );
+            }
+        }
+
+        Self {
+            buffer: new_buffer,
+            shape: self.shape.clone(),
+            precision: self.precision,
+        }
+    }
+}
+
 impl Tensor {
     pub fn zeros(shape: &[usize], precision: Precision) -> Self {
         let numel: usize = shape.iter().product();

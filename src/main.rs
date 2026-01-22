@@ -1,593 +1,471 @@
 use irontensor::{
-    // Forward ops
-    add, attention, embedding, gelu, matmul, mul, relu, rmsnorm, rope, scale, silu, softmax,
-    swiglu,
-    // Optimized ops (Phase 5)
-    flash_attention, fused_linear_cross_entropy,
-    // Backward ops
-    cross_entropy_fused, embedding_backward, gelu_backward, matmul_backward, mul_backward,
-    relu_backward, rmsnorm_backward, rope_backward, scale_backward, silu_backward,
-    softmax_backward, swiglu_backward,
-    // Optimizer
-    clip_grad_norm, grad_norm, zero_gradients, Lion, LionConfig, ParamState,
-    // Neural network modules
-    GPTModel, ModelConfig, TransformerBlock,
-    // Data loading
-    TokenDataset,
-    // Training (Phase 6)
-    Checkpoint, CosineAnnealingLR, LRScheduler, Trainer, TrainingConfig,
-    save_model_weights, load_model_weights,
-    // Core types
-    MetalContext, Tensor,
+    GPTModel, ModelConfig, TokenDataset,
+    CosineAnnealingLR, LRScheduler, Trainer, TrainingConfig,
+    save_model_weights, Checkpoint,
+    MetalContext,
 };
 use objc2_metal::MTLDevice;
+use std::fs;
+use std::path::Path;
+use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::{DecoderWrapper, PreTokenizerWrapper, Tokenizer};
+
+const TINY_SHAKESPEARE_URL: &str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
 fn main() {
     // Initialize the Metal context
     let ctx = MetalContext::global();
-    println!("IronTensor - Metal GPU Tensor Library");
-    println!("======================================");
+    println!("IronTensor - GPT Training on Tiny Shakespeare");
+    println!("==============================================");
     println!("Device: {}\n", ctx.device().name());
 
-    // =====================================================================
-    // PHASE 1: Forward Operations
-    // =====================================================================
-    println!("=== Phase 1: Forward Operations ===\n");
-
-    // --- Matrix Multiplication (GEMM) ---
-    println!("1. Matrix Multiplication (matmul)");
-    let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
-    let b = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
-    let c = matmul(&a, &b);
-    println!("   A[2x3] @ B[3x2] = C[2x2]");
-    println!("   Result: {:?}\n", c.as_f32_slice());
-
-    // --- Element-wise Operations ---
-    println!("2. Element-wise Operations");
-    let x = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-    let y = Tensor::from_f32_slice(&[0.5, 1.0, 1.5, 2.0], &[4]);
-
-    let sum = add(&x, &y);
-    println!("   add([1,2,3,4], [0.5,1,1.5,2]) = {:?}", sum.as_f32_slice());
-
-    let prod = mul(&x, &y);
-    println!("   mul([1,2,3,4], [0.5,1,1.5,2]) = {:?}", prod.as_f32_slice());
-
-    let scaled = scale(&x, 2.0);
-    println!("   scale([1,2,3,4], 2.0) = {:?}\n", scaled.as_f32_slice());
-
-    // --- Activation Functions ---
-    println!("3. Activation Functions");
-    let act_input = Tensor::from_f32_slice(&[-1.0, 0.0, 1.0, 2.0], &[4]);
-
-    let silu_out = silu(&act_input);
-    println!("   SiLU([-1,0,1,2]) = {:?}", silu_out.as_f32_slice());
-
-    let gelu_out = gelu(&act_input);
-    println!("   GELU([-1,0,1,2]) = {:?}", gelu_out.as_f32_slice());
-
-    let relu_out = relu(&act_input);
-    println!("   ReLU([-1,0,1,2]) = {:?}", relu_out.as_f32_slice());
-
-    // SwiGLU (used in Llama-style FFN)
-    let gate = Tensor::from_f32_slice(&[1.0, 2.0, -1.0, 0.5], &[4]);
-    let up = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
-    let swiglu_out = swiglu(&gate, &up);
-    println!("   SwiGLU(gate, up) = {:?}\n", swiglu_out.as_f32_slice());
-
-    // --- RMSNorm ---
-    println!("4. RMSNorm (Layer Normalization)");
-    let norm_input = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
-    let gamma = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
-    let normed = rmsnorm(&norm_input, &gamma, 1e-5);
-    println!("   Input shape: [2, 4], hidden_dim=4");
-    println!("   Output: {:?}\n", normed.as_f32_slice());
-
-    // --- Softmax ---
-    println!("5. Softmax");
-    let logits = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 1.0], &[2, 4]);
-    let probs = softmax(&logits);
-    println!("   Input: [1,2,3,4] and [1,1,1,1]");
-    println!("   Probs: {:?}\n", probs.as_f32_slice());
-
-    // --- Embedding Lookup ---
-    println!("6. Embedding Lookup");
-    let vocab_size = 5;
-    let embed_dim = 4;
-    let weights: Vec<f32> = (0..(vocab_size * embed_dim)).map(|i| i as f32 * 0.1).collect();
-    let embed_weights = Tensor::from_f32_slice(&weights, &[vocab_size, embed_dim]);
-    let indices = vec![0u32, 2, 4];
-    let embedded = embedding(&embed_weights, &indices);
-    println!("   Vocab size: {}, Embed dim: {}", vocab_size, embed_dim);
-    println!("   Indices: {:?}", indices);
-    println!("   Embedded[0]: {:?}", &embedded.as_f32_slice()[0..4]);
-    println!("   Embedded[2]: {:?}", &embedded.as_f32_slice()[4..8]);
-    println!("   Embedded[4]: {:?}\n", &embedded.as_f32_slice()[8..12]);
-
-    // --- RoPE (Rotary Position Embedding) ---
-    println!("7. RoPE (Rotary Position Embedding)");
-    let batch = 1;
-    let seq_len = 2;
-    let num_heads = 2;
-    let head_dim = 4;
-    let rope_data = vec![1.0f32; batch * seq_len * num_heads * head_dim];
-    let rope_input = Tensor::from_f32_slice(&rope_data, &[batch, seq_len, num_heads, head_dim]);
-    let rope_out = rope(&rope_input, 10000.0, 0);
-    println!("   Input shape: [batch={}, seq={}, heads={}, head_dim={}]", batch, seq_len, num_heads, head_dim);
-    println!("   Position 0: {:?}", &rope_out.as_f32_slice()[0..head_dim]);
-    println!("   Position 1: {:?}\n", &rope_out.as_f32_slice()[num_heads * head_dim..num_heads * head_dim + head_dim]);
-
-    // --- Attention ---
-    println!("8. Attention");
-    let batch = 1;
-    let heads = 2;
-    let seq = 4;
-    let head_d = 8;
-    let qkv_data: Vec<f32> = (0..(batch * heads * seq * head_d))
-        .map(|i| (i as f32 * 0.01).sin())
-        .collect();
-    let q = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq, head_d]);
-    let k = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq, head_d]);
-    let v = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq, head_d]);
-    let attn_out = attention(&q, &k, &v, true); // causal=true
-    println!("   Q/K/V shape: [batch={}, heads={}, seq={}, head_dim={}]", batch, heads, seq, head_d);
-    println!("   Causal masking: enabled");
-    println!("   Output shape: {:?}\n", attn_out.shape());
+    // Create data directory if it doesn't exist
+    fs::create_dir_all("data").expect("Failed to create data directory");
+    fs::create_dir_all("checkpoints").expect("Failed to create checkpoints directory");
 
     // =====================================================================
-    // PHASE 2: Backward Operations (Autodiff)
+    // Step 1: Download or load Tiny Shakespeare
     // =====================================================================
-    println!("=== Phase 2: Backward Operations ===\n");
+    println!("=== Step 1: Loading Tiny Shakespeare ===\n");
 
-    // --- Matmul Backward ---
-    println!("1. Matmul Backward");
-    let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
-    let b = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
-    let grad_c = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[2, 2]);
-    let (grad_a, grad_b) = matmul_backward(&grad_c, &a, &b);
-    println!("   grad_C[2x2] -> grad_A[2x3], grad_B[3x2]");
-    println!("   grad_A: {:?}", grad_a.as_f32_slice());
-    println!("   grad_B: {:?}\n", grad_b.as_f32_slice());
+    let text_path = Path::new("data/tinyshakespeare.txt");
+    let text = if text_path.exists() {
+        println!("Loading from cached file: {:?}", text_path);
+        fs::read_to_string(text_path).expect("Failed to read cached file")
+    } else {
+        println!("Downloading Tiny Shakespeare from GitHub...");
+        let text = download_text(TINY_SHAKESPEARE_URL);
+        fs::write(text_path, &text).expect("Failed to cache text");
+        println!("Saved to: {:?}", text_path);
+        text
+    };
 
-    // --- Element-wise Backward ---
-    println!("2. Element-wise Backward");
-    let x = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-    let y = Tensor::from_f32_slice(&[0.5, 1.0, 1.5, 2.0], &[4]);
-    let grad_out = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+    println!("Text length: {} characters", text.len());
+    println!("First 200 chars:\n{}\n", &text[..200.min(text.len())]);
 
-    let (grad_x, grad_y) = mul_backward(&grad_out, &x, &y);
-    println!("   mul_backward: grad_x={:?}, grad_y={:?}", grad_x.as_f32_slice(), grad_y.as_f32_slice());
+    // =====================================================================
+    // Step 2: Train BPE Tokenizer
+    // =====================================================================
+    println!("=== Step 2: Training BPE Tokenizer ===\n");
 
-    let grad_scaled = scale_backward(&grad_out, 2.0);
-    println!("   scale_backward(scalar=2.0): {:?}\n", grad_scaled.as_f32_slice());
+    let tokenizer_path = Path::new("data/shakespeare_tokenizer.json");
+    let tokenizer = if tokenizer_path.exists() {
+        println!("Loading cached tokenizer from: {:?}", tokenizer_path);
+        Tokenizer::from_file(tokenizer_path).expect("Failed to load tokenizer")
+    } else {
+        println!("Training new BPE tokenizer (vocab_size=2048)...");
+        let tokenizer = train_bpe_tokenizer(&text, 2048);
+        tokenizer.save(tokenizer_path, false).expect("Failed to save tokenizer");
+        println!("Saved tokenizer to: {:?}", tokenizer_path);
+        tokenizer
+    };
 
-    // --- Activation Backward ---
-    println!("3. Activation Backward");
-    let act_input = Tensor::from_f32_slice(&[-1.0, 0.0, 1.0, 2.0], &[4]);
-    let grad_out = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
+    let vocab_size = tokenizer.get_vocab_size(true);
+    println!("Vocabulary size: {}", vocab_size);
 
-    let grad_silu = silu_backward(&grad_out, &act_input);
-    println!("   silu_backward: {:?}", grad_silu.as_f32_slice());
+    // Test tokenization
+    let sample = "ROMEO:\nWherefore art thou Romeo?";
+    let encoding = tokenizer.encode(sample, false).expect("Failed to encode");
+    let tokens = encoding.get_ids();
+    println!("Sample: \"{}\"", sample);
+    println!("Tokens: {:?}", tokens);
+    let decoded = tokenizer.decode(tokens, true).expect("Failed to decode");
+    println!("Decoded: \"{}\"\n", decoded);
 
-    let grad_gelu = gelu_backward(&grad_out, &act_input);
-    println!("   gelu_backward: {:?}", grad_gelu.as_f32_slice());
+    // =====================================================================
+    // Step 3: Prepare Datasets
+    // =====================================================================
+    println!("=== Step 3: Preparing Datasets ===\n");
 
-    let grad_relu = relu_backward(&grad_out, &act_input);
-    println!("   relu_backward: {:?}", grad_relu.as_f32_slice());
+    let train_path = Path::new("data/shakespeare_train.bin");
+    let val_path = Path::new("data/shakespeare_val.bin");
 
-    let gate = Tensor::from_f32_slice(&[1.0, 2.0, -1.0, 0.5], &[4]);
-    let up = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
-    let (grad_gate, grad_up) = swiglu_backward(&grad_out, &gate, &up);
-    println!("   swiglu_backward: grad_gate={:?}", grad_gate.as_f32_slice());
-    println!("                    grad_up={:?}\n", grad_up.as_f32_slice());
+    // Check if datasets already exist
+    let datasets_exist = train_path.exists() && val_path.exists();
 
-    // --- RMSNorm Backward ---
-    println!("4. RMSNorm Backward");
-    let norm_input = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
-    let gamma = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[4]);
-    let grad_out = Tensor::from_f32_slice(&[1.0, 1.0, 1.0, 1.0], &[1, 4]);
-    let (grad_input, grad_gamma) = rmsnorm_backward(&grad_out, &norm_input, &gamma, 1e-5);
-    println!("   grad_input: {:?}", grad_input.as_f32_slice());
-    println!("   grad_gamma: {:?}\n", grad_gamma.as_f32_slice());
+    if !datasets_exist {
+        // Tokenize entire text
+        println!("Tokenizing entire corpus...");
+        let encoding = tokenizer.encode(text.as_str(), false).expect("Failed to encode");
+        let all_tokens: Vec<u32> = encoding.get_ids().to_vec();
+        println!("Total tokens: {}", all_tokens.len());
 
-    // --- Softmax Backward ---
-    println!("5. Softmax Backward");
-    let logits = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
-    let probs = softmax(&logits);
-    let grad_out = Tensor::from_f32_slice(&[0.1, 0.2, 0.3, 0.4], &[1, 4]);
-    let grad_logits = softmax_backward(&grad_out, &probs);
-    println!("   Probs: {:?}", probs.as_f32_slice());
-    println!("   grad_logits: {:?}\n", grad_logits.as_f32_slice());
+        // Split 90/10 for train/val
+        let split_idx = (all_tokens.len() as f64 * 0.9) as usize;
+        let train_tokens = &all_tokens[..split_idx];
+        let val_tokens = &all_tokens[split_idx..];
 
-    // --- Embedding Backward ---
-    println!("6. Embedding Backward");
-    let vocab_size = 5;
-    let embed_dim = 4;
-    let indices = vec![0u32, 2, 0]; // Note: index 0 appears twice
-    let grad_out = Tensor::from_f32_slice(
-        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-        &[3, embed_dim],
-    );
-    let grad_weights = embedding_backward(&grad_out, &indices, vocab_size);
-    println!("   Indices: {:?} (0 appears twice)", indices);
-    println!("   grad_weights[0] (accumulated): {:?}", &grad_weights.as_f32_slice()[0..4]);
-    println!("   grad_weights[2]: {:?}\n", &grad_weights.as_f32_slice()[8..12]);
+        println!("Train tokens: {}", train_tokens.len());
+        println!("Val tokens: {}", val_tokens.len());
 
-    // --- RoPE Backward ---
-    println!("7. RoPE Backward");
-    {
-        let batch = 1;
-        let seq_len = 2;
-        let num_heads = 1;
-        let head_dim = 4;
-        let grad_data = vec![1.0f32; batch * seq_len * num_heads * head_dim];
-        let grad_out = Tensor::from_f32_slice(&grad_data, &[batch, seq_len, num_heads, head_dim]);
-        let grad_input = rope_backward(&grad_out, 10000.0, 0);
-        println!("   RoPE backward applies inverse rotation");
-        println!("   grad_input[0]: {:?}\n", &grad_input.as_f32_slice()[0..head_dim]);
+        // Create binary datasets
+        TokenDataset::create(train_path, train_tokens).expect("Failed to create train dataset");
+        TokenDataset::create(val_path, val_tokens).expect("Failed to create val dataset");
+        println!("Created train dataset: {:?}", train_path);
+        println!("Created val dataset: {:?}", val_path);
+    } else {
+        println!("Using cached datasets:");
+        println!("  Train: {:?}", train_path);
+        println!("  Val: {:?}", val_path);
     }
-
-    // --- Cross-Entropy Loss (Fused) ---
-    println!("8. Cross-Entropy Loss (Fused Softmax + Loss + Backward)");
-    let batch_size = 2;
-    let vocab_size = 5;
-    let logits = Tensor::from_f32_slice(
-        &[
-            1.0, 2.0, 3.0, 4.0, 5.0, // batch 0: highest logit at index 4
-            5.0, 4.0, 3.0, 2.0, 1.0, // batch 1: highest logit at index 0
-        ],
-        &[batch_size, vocab_size],
-    );
-    let targets = vec![4u32, 0]; // correct predictions
-    let (loss, _probs, grad_logits) = cross_entropy_fused(&logits, &targets);
-    println!("   Logits shape: [batch={}, vocab={}]", batch_size, vocab_size);
-    println!("   Targets: {:?} (correct predictions)", targets);
-    println!("   Loss: {:.4}", loss);
-    println!("   grad_logits[0]: {:?}", &grad_logits.as_f32_slice()[0..vocab_size]);
-    println!("   grad_logits[1]: {:?}\n", &grad_logits.as_f32_slice()[vocab_size..2 * vocab_size]);
-
-    // =====================================================================
-    // PHASE 3: Optimizer
-    // =====================================================================
-    println!("=== Phase 3: Optimizer ===\n");
-
-    // --- Lion Optimizer ---
-    println!("1. Lion Optimizer (Sign-based Updates)");
-    println!("   Training a simple quadratic: f(x) = sum(x^2)");
-
-    // Initialize weights
-    let weights = Tensor::from_f32_slice(&[5.0, -3.0, 2.0, -1.0], &[4]);
-    let mut state = ParamState::new(&[4]);
-
-    let optimizer = Lion::new(LionConfig {
-        lr: 0.1,
-        beta1: 0.9,
-        beta2: 0.99,
-        weight_decay: 0.0,
-    });
-
-    println!("   Initial weights: {:?}", weights.as_f32_slice());
-
-    // Training loop
-    for step in 0..10 {
-        // Gradient of x^2 is 2x
-        let w = weights.as_f32_slice();
-        let grads_data: Vec<f32> = w.iter().map(|&x| 2.0 * x).collect();
-        let gradients = Tensor::from_f32_slice(&grads_data, &[4]);
-
-        optimizer.step(&weights, &gradients, &mut state);
-
-        if step == 0 || step == 4 || step == 9 {
-            println!("   Step {}: weights = {:?}", step + 1, weights.as_f32_slice());
-        }
-    }
-
-    // --- Gradient Utilities ---
-    println!("\n2. Gradient Utilities");
-
-    let gradients = Tensor::from_f32_slice(&[3.0, 4.0, 0.0, 0.0], &[4]);
-    let norm = grad_norm(&gradients);
-    println!("   grad_norm([3, 4, 0, 0]) = {:.4}", norm);
-
-    let gradients = Tensor::from_f32_slice(&[6.0, 8.0, 0.0, 0.0], &[4]);
-    let original_norm = clip_grad_norm(&gradients, 5.0);
-    println!("   clip_grad_norm([6, 8, 0, 0], max=5.0):");
-    println!("     Original norm: {:.4}", original_norm);
-    println!("     Clipped grads: {:?}", gradients.as_f32_slice());
-    println!("     New norm: {:.4}", grad_norm(&gradients));
-
-    let gradients = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-    zero_gradients(&gradients);
-    println!("   zero_gradients: {:?}", gradients.as_f32_slice());
-
-    // --- Lion with Weight Decay ---
-    println!("\n3. Lion with Weight Decay");
-    let weights = Tensor::from_f32_slice(&[10.0, -10.0], &[2]);
-    let mut state = ParamState::new(&[2]);
-
-    let optimizer = Lion::new(LionConfig {
-        lr: 0.01,
-        beta1: 0.9,
-        beta2: 0.99,
-        weight_decay: 0.1, // 10% weight decay
-    });
-
-    println!("   Initial: {:?}", weights.as_f32_slice());
-
-    // Zero gradients - only weight decay affects weights
-    let zero_grads = Tensor::from_f32_slice(&[0.0, 0.0], &[2]);
-    for _ in 0..5 {
-        optimizer.step(&weights, &zero_grads, &mut state);
-    }
-    println!("   After 5 steps (zero grad, 10% decay): {:?}\n", weights.as_f32_slice());
-
-    // =====================================================================
-    // PHASE 4: Model & Data
-    // =====================================================================
-    println!("=== Phase 4: Model & Data ===\n");
-
-    // --- Model Configuration ---
-    println!("1. Model Configuration");
-    let tiny_config = ModelConfig::tiny();
-    println!("   Tiny model: {} layers, {} hidden, {:.2}M params",
-        tiny_config.num_layers,
-        tiny_config.hidden_dim,
-        tiny_config.num_params() as f64 / 1e6
-    );
-
-    let small_config = ModelConfig::small();
-    println!("   Small model: {} layers, {} hidden, {:.2}M params",
-        small_config.num_layers,
-        small_config.hidden_dim,
-        small_config.num_params() as f64 / 1e6
-    );
-
-    let medium_config = ModelConfig::medium();
-    println!("   Medium model: {} layers, {} hidden, {:.2}M params\n",
-        medium_config.num_layers,
-        medium_config.hidden_dim,
-        medium_config.num_params() as f64 / 1e6
-    );
-
-    // --- GPT Model Forward Pass ---
-    println!("2. GPT Model Forward Pass");
-    let config = ModelConfig::tiny();
-    let model = GPTModel::new(config.clone());
-    println!("{}", model.summary());
-
-    let batch = 1;
-    let seq_len = 16;
-    let input_ids: Vec<u32> = (0..batch * seq_len).map(|i| (i % 100) as u32).collect();
-
-    println!("   Input: {} tokens", input_ids.len());
-    let logits = model.forward(&input_ids, batch, seq_len, 0);
-    println!("   Output logits shape: {:?}", logits.shape());
-
-    // Show top prediction for first position
-    let first_logits = &logits.as_f32_slice()[0..config.vocab_size];
-    let (max_idx, max_val) = first_logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap();
-    println!("   First token prediction: token {} (logit {:.4})\n", max_idx, max_val);
-
-    // --- Transformer Block ---
-    println!("3. Transformer Block");
-    let block = TransformerBlock::new(64, 4, 4, 128, 10000.0, 1e-5);
-    println!("   Block params: {}", block.num_params());
-
-    let block_input_data: Vec<f32> = (0..2 * 8 * 64).map(|i| (i as f32 * 0.01).sin()).collect();
-    let block_input = Tensor::from_f32_slice(&block_input_data, &[2, 8, 64]);
-    let block_output = block.forward(&block_input, 0, true);
-    println!("   Input: [2, 8, 64] -> Output: {:?}\n", block_output.shape());
-
-    // --- Memory-Mapped Dataset ---
-    println!("4. Memory-Mapped Dataset");
-    let dataset_path = std::env::temp_dir().join("irontensor_demo.bin");
-
-    // Create a small demo dataset
-    let demo_tokens: Vec<u32> = (0..1000).collect();
-    TokenDataset::create(&dataset_path, &demo_tokens).unwrap();
-    println!("   Created dataset with {} tokens", demo_tokens.len());
-
-    let dataset = TokenDataset::open(&dataset_path, 32).unwrap();
-    println!("   Sequence length: {}", dataset.seq_len());
-    println!("   Number of sequences: {}", dataset.num_sequences());
-
-    // Get a training batch
-    let (input_batch, target_batch) = dataset.get_batch(0);
-    println!("   Batch 0 input:  {:?}...", &input_batch[0..5]);
-    println!("   Batch 0 target: {:?}...", &target_batch[0..5]);
-
-    // Cleanup
-    std::fs::remove_file(dataset_path).ok();
     println!();
 
     // =====================================================================
-    // PHASE 5: Performance Optimizations
+    // Step 4: Initialize Model
     // =====================================================================
-    println!("=== Phase 5: Performance Optimizations ===\n");
+    println!("=== Step 4: Initializing Model ===\n");
 
-    // --- FlashAttention ---
-    println!("1. FlashAttention (Memory-Efficient Attention)");
-    let batch = 2;
-    let heads = 4;
-    let seq_len = 64;
-    let head_dim = 32;
+    // Create model config matching tokenizer vocab size
+    let mut config = ModelConfig::shakespeare();
+    config.vocab_size = vocab_size; // Match actual tokenizer vocab
 
-    let qkv_data: Vec<f32> = (0..batch * heads * seq_len * head_dim)
-        .map(|i| (i as f32 * 0.01).sin() * 0.5)
-        .collect();
+    println!("Model Configuration:");
+    println!("  vocab_size: {}", config.vocab_size);
+    println!("  hidden_dim: {}", config.hidden_dim);
+    println!("  num_layers: {}", config.num_layers);
+    println!("  num_heads: {}", config.num_heads);
+    println!("  intermediate_dim: {}", config.intermediate_dim);
+    println!("  max_seq_len: {}", config.max_seq_len);
+    println!("  tie_weights: {}", config.tie_weights);
 
-    let q = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq_len, head_dim]);
-    let k = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq_len, head_dim]);
-    let v = Tensor::from_f32_slice(&qkv_data, &[batch, heads, seq_len, head_dim]);
+    let model = GPTModel::new(config.clone());
+    println!("\n{}", model.summary());
 
-    println!("   Input shape: [batch={}, heads={}, seq={}, head_dim={}]", batch, heads, seq_len, head_dim);
-
-    // Compare memory usage
-    let standard_mem = batch * heads * seq_len * seq_len * 4; // O(N^2) for attention matrix
-    let flash_mem = batch * heads * seq_len * head_dim * 4;   // O(N) for output only
-    println!("   Standard attention memory: {} bytes (O(N²))", standard_mem);
-    println!("   FlashAttention memory: {} bytes (O(N))", flash_mem);
-    println!("   Memory savings: {:.1}x", standard_mem as f64 / flash_mem as f64);
-
-    let flash_out = flash_attention(&q, &k, &v, true); // causal=true
-    println!("   Output shape: {:?}", flash_out.shape());
-    println!("   First values: {:?}\n", &flash_out.as_f32_slice()[0..5]);
-
-    // --- FusedLinearCrossEntropy ---
-    println!("2. FusedLinearCrossEntropy (Memory-Efficient Output Layer)");
-    let batch_seq = 16;
-    let hidden_dim = 64;
-    let vocab_size = 1000;
-
-    // Hidden states from the model's last layer
-    let hidden_data: Vec<f32> = (0..batch_seq * hidden_dim)
-        .map(|i| (i as f32 * 0.01).sin() * 0.5)
-        .collect();
-    let hidden = Tensor::from_f32_slice(&hidden_data, &[batch_seq, hidden_dim]);
-
-    // Vocabulary projection weights
-    let weight_data: Vec<f32> = (0..vocab_size * hidden_dim)
-        .map(|i| (i as f32 * 0.001).cos() * 0.3)
-        .collect();
-    let weight = Tensor::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
-
-    // Target tokens
-    let targets: Vec<i32> = (0..batch_seq).map(|i| (i * 37 % vocab_size) as i32).collect();
-
-    println!("   Hidden shape: [batch_seq={}, hidden_dim={}]", batch_seq, hidden_dim);
-    println!("   Weight shape: [vocab_size={}, hidden_dim={}]", vocab_size, hidden_dim);
-
-    // Compare memory usage
-    let standard_logits_mem = batch_seq * vocab_size * 4; // Full logits tensor
-    let fused_mem = batch_seq * hidden_dim * 4;           // Only hidden gradients
-    println!("   Standard method memory: {} KB (full logits)", standard_logits_mem / 1024);
-    println!("   Fused method memory: {} KB (no logits)", fused_mem / 1024);
-    println!("   Memory savings: {:.1}x", standard_logits_mem as f64 / fused_mem as f64);
-
-    let (loss, grad_hidden, _grad_weight) = fused_linear_cross_entropy(&hidden, &weight, &targets);
-    println!("   Loss: {:.4}", loss);
-    println!("   grad_hidden shape: {:?}", grad_hidden.shape());
-    println!("   grad_hidden first 5 values: {:?}\n", &grad_hidden.as_f32_slice()[0..5]);
-
-    // --- Comparison with separate operations ---
-    println!("3. Comparing Fused vs Separate Operations");
-
-    // Separate: compute logits, then cross-entropy
-    // Note: We'd need to materialize the full [batch_seq, vocab_size] logits tensor
-    // which for vocab_size=50000 and batch_seq=1024 would be 200MB!
-
-    // With 50K vocabulary (typical for LLMs):
-    let large_vocab = 50000;
-    let large_batch_seq = 1024;
-    let separate_mem = large_batch_seq * large_vocab * 4;
-    let fused_mem_large = large_batch_seq * hidden_dim * 4;
-    println!("   For typical LLM (vocab=50K, batch_seq=1024):");
-    println!("   Separate: {:.1} MB (need to store full logits)", separate_mem as f64 / 1e6);
-    println!("   Fused: {:.1} MB (only store hidden gradients)", fused_mem_large as f64 / 1e6);
-    println!("   Memory savings: {:.0}x\n", separate_mem as f64 / fused_mem_large as f64);
+    let expected_initial_loss = (vocab_size as f64).ln();
+    println!("Expected initial loss (random): {:.4} (ln({}))\n", expected_initial_loss, vocab_size);
 
     // =====================================================================
-    // PHASE 6: Training Infrastructure
+    // Step 5: Training
     // =====================================================================
-    println!("=== Phase 6: Training Infrastructure ===\n");
+    println!("=== Step 5: Training ===\n");
 
-    // --- Learning Rate Schedulers ---
-    println!("1. Learning Rate Schedulers");
+    let seq_len = 256; // Sequence length for training
+    let batch_size = 16; // Batch size
 
-    let cosine_scheduler = CosineAnnealingLR::with_warmup(1e-3, 100, 1000);
-    println!("   CosineAnnealingLR (warmup=100, total=1000):");
-    println!("     Step 0: {:.6}", cosine_scheduler.get_lr(0));
-    println!("     Step 50 (warmup): {:.6}", cosine_scheduler.get_lr(50));
-    println!("     Step 100 (peak): {:.6}", cosine_scheduler.get_lr(100));
-    println!("     Step 500: {:.6}", cosine_scheduler.get_lr(500));
-    println!("     Step 999: {:.6}\n", cosine_scheduler.get_lr(999));
+    let train_dataset = TokenDataset::open(train_path, seq_len).expect("Failed to open train dataset");
+    let val_dataset = TokenDataset::open(val_path, seq_len).expect("Failed to open val dataset");
 
-    // --- Training Configuration ---
-    println!("2. Training Configuration");
+    println!("Train sequences: {}", train_dataset.num_sequences());
+    println!("Val sequences: {}", val_dataset.num_sequences());
+    println!("Batch size: {}", batch_size);
+    println!("Sequence length: {}", seq_len);
+
+    // Training configuration
     let train_config = TrainingConfig {
         learning_rate: 3e-4,
         weight_decay: 0.1,
         beta1: 0.9,
         beta2: 0.99,
         max_grad_norm: 1.0,
-        warmup_steps: 100,
-        total_steps: 10000,
-        log_interval: 100,
-        save_interval: 1000,
-        eval_interval: 500,
+        warmup_steps: 50,
+        total_steps: 500,  // Reduced for testing
+        log_interval: 10,  // More frequent logging
+        save_interval: 100,
+        eval_interval: 50,
         checkpoint_dir: "checkpoints".to_string(),
     };
-    println!("   LR: {}, weight_decay: {}", train_config.learning_rate, train_config.weight_decay);
-    println!("   Warmup: {} steps, Total: {} steps", train_config.warmup_steps, train_config.total_steps);
-    println!("   Gradient clipping: max_norm={}\n", train_config.max_grad_norm);
 
-    // --- Model Checkpointing ---
-    println!("3. Model Checkpointing");
-    let checkpoint_path = std::env::temp_dir().join("irontensor_checkpoint_demo.bin");
-
-    // Create a model and checkpoint
-    let model_config = ModelConfig::tiny();
-    let model = GPTModel::new(model_config.clone());
-    let checkpoint = Checkpoint::new(model_config.clone());
-
-    // Save the checkpoint
-    save_model_weights(&checkpoint_path, &model, &checkpoint).unwrap();
-    println!("   Saved checkpoint to: {:?}", checkpoint_path);
-
-    // Load it back
-    let (loaded_model, loaded_checkpoint) = load_model_weights(&checkpoint_path).unwrap();
-    println!("   Loaded model with {} layers, {} hidden dim",
-        loaded_checkpoint.config.num_layers,
-        loaded_checkpoint.config.hidden_dim);
-    println!("   Checkpoint: step={}, epoch={}, best_val_loss={:.4}",
-        loaded_checkpoint.step,
-        loaded_checkpoint.epoch,
-        loaded_checkpoint.best_val_loss);
-
-    // Verify weights match
-    let orig_embed = model.embed_tokens.as_f32_slice();
-    let loaded_embed = loaded_model.embed_tokens.as_f32_slice();
-    let weights_match = orig_embed.iter()
-        .zip(loaded_embed.iter())
-        .all(|(a, b)| (a - b).abs() < 1e-6);
-    println!("   Weights match: {}\n", weights_match);
-
-    // Cleanup
-    std::fs::remove_file(&checkpoint_path).ok();
-
-    // --- Trainer (Overview) ---
-    println!("4. Trainer Overview");
-    let model_config = ModelConfig::tiny();
-    let train_config = TrainingConfig::default();
-    let trainer = Trainer::new(model_config, train_config);
-
-    println!("   Trainer initialized with:");
-    println!("     Model params: {:.2}M", trainer.model.config.num_params() as f64 / 1e6);
-    println!("     Optimizer: Lion");
-    println!("     Scheduler: CosineAnnealingLR");
-    println!("     Current step: {}, epoch: {}", trainer.step, trainer.epoch);
+    println!("\nTraining Configuration:");
+    println!("  learning_rate: {}", train_config.learning_rate);
+    println!("  weight_decay: {}", train_config.weight_decay);
+    println!("  warmup_steps: {}", train_config.warmup_steps);
+    println!("  total_steps: {}", train_config.total_steps);
+    println!("  max_grad_norm: {}", train_config.max_grad_norm);
     println!();
 
-    // Compute loss on a sample batch
-    let input_ids: Vec<u32> = (0..32).collect();
-    let target_ids: Vec<u32> = (1..33).collect();
-    let loss = trainer.compute_loss(&input_ids, &target_ids, 2, 16);
-    println!("   Sample loss (random init): {:.4}\n", loss);
+    // Create trainer
+    let mut trainer = Trainer::new(config.clone(), train_config.clone());
+
+    // Training loop
+    let num_batches = train_dataset.num_sequences() / batch_size;
+    let steps_per_epoch = num_batches.max(1);
+
+    println!("Starting training...");
+    println!("Steps per epoch: {}", steps_per_epoch);
+    println!("{}", "-".repeat(60));
+
+    let scheduler = CosineAnnealingLR::with_warmup(
+        train_config.learning_rate,
+        train_config.warmup_steps,
+        train_config.total_steps,
+    );
+
+    let mut running_loss = 0.0;
+    let mut loss_count = 0;
+
+    for step in 0..train_config.total_steps {
+        // Get batch
+        let batch_idx = (step % steps_per_epoch) * batch_size;
+        let (input_ids, target_ids) = get_batch(&train_dataset, batch_idx, batch_size, seq_len);
+
+        // Training step (handles forward, backward, optimizer update internally)
+        let (loss, _grad_norm) = trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
+
+        let lr = scheduler.get_lr(step);
+
+        running_loss += loss;
+        loss_count += 1;
+
+        // Logging
+        if (step + 1) % train_config.log_interval == 0 {
+            let avg_loss = running_loss / loss_count as f32;
+            println!(
+                "Step {:5}/{} | Loss: {:.4} | LR: {:.2e}",
+                step + 1,
+                train_config.total_steps,
+                avg_loss,
+                lr
+            );
+            running_loss = 0.0;
+            loss_count = 0;
+        }
+
+        // Evaluation
+        if (step + 1) % train_config.eval_interval == 0 {
+            let val_loss = evaluate(&trainer, &val_dataset, batch_size, seq_len, 10);
+            println!("  Validation Loss: {:.4}", val_loss);
+        }
+
+        // Checkpointing
+        if (step + 1) % train_config.save_interval == 0 {
+            let checkpoint_path = format!("{}/step_{}.bin", train_config.checkpoint_dir, step + 1);
+            let checkpoint = Checkpoint {
+                config: config.clone(),
+                step: step + 1,
+                epoch: step / steps_per_epoch,
+                best_val_loss: f32::INFINITY,
+                learning_rate: lr,
+            };
+            save_model_weights(Path::new(&checkpoint_path), &trainer.model, &checkpoint)
+                .expect("Failed to save checkpoint");
+            println!("  Saved checkpoint: {}", checkpoint_path);
+        }
+    }
+
+    println!("{}", "-".repeat(60));
+    println!("Training complete!\n");
 
     // =====================================================================
-    // Summary
+    // Step 6: Text Generation
     // =====================================================================
-    println!("=== Summary ===");
-    println!("IronTensor provides GPU-accelerated tensor operations for LLM training:");
-    println!("- Phase 1: Forward ops (matmul, activations, normalization, attention, etc.)");
-    println!("- Phase 2: Backward ops for automatic differentiation");
-    println!("- Phase 3: Lion optimizer with gradient clipping and weight decay");
-    println!("- Phase 4: GPT model architecture and memory-mapped data loading");
-    println!("- Phase 5: FlashAttention and FusedLinearCrossEntropy for memory efficiency");
-    println!("- Phase 6: Training infrastructure (LR schedulers, checkpointing, Trainer)");
-    println!("\nAll operations run on Metal GPU with unified memory (zero-copy on Apple Silicon).");
+    println!("=== Step 6: Text Generation ===\n");
+
+    let prompts = vec![
+        "ROMEO:",
+        "To be or not",
+        "The king",
+        "JULIET:\nO Romeo,",
+    ];
+
+    for prompt in prompts {
+        println!("Prompt: \"{}\"", prompt);
+        let generated = generate(&trainer.model, &tokenizer, prompt, 100, 0.8);
+        println!("Generated:\n{}\n", generated);
+        println!("{}", "-".repeat(40));
+    }
+
+    println!("\nDone!");
+}
+
+/// Download text from a URL (simple blocking HTTP)
+fn download_text(url: &str) -> String {
+    // Use a simple curl command for downloading
+    use std::process::Command;
+
+    let output = Command::new("curl")
+        .args(["-s", url])
+        .output()
+        .expect("Failed to execute curl");
+
+    String::from_utf8(output.stdout).expect("Invalid UTF-8 in response")
+}
+
+/// Train a BPE tokenizer on the given text
+fn train_bpe_tokenizer(text: &str, vocab_size: usize) -> Tokenizer {
+    use tokenizers::models::TrainerWrapper;
+
+    // Create a temporary file for training
+    let temp_path = std::env::temp_dir().join("bpe_train_text.txt");
+    fs::write(&temp_path, text).expect("Failed to write temp file");
+
+    // Create trainer wrapped for the generic Tokenizer
+    let trainer = BpeTrainerBuilder::new()
+        .vocab_size(vocab_size)
+        .min_frequency(2)
+        .special_tokens(vec![
+            tokenizers::AddedToken::from("<|endoftext|>", true),
+            tokenizers::AddedToken::from("<|pad|>", true),
+        ])
+        .build();
+    let mut trainer_wrapper = TrainerWrapper::BpeTrainer(trainer);
+
+    // Build the tokenizer with empty BPE model
+    let mut tokenizer = Tokenizer::new(BPE::default());
+
+    // Use byte-level pre-tokenization (like GPT-2)
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::ByteLevel(ByteLevel::default())));
+
+    // Train
+    tokenizer
+        .train_from_files(&mut trainer_wrapper, vec![temp_path.to_str().unwrap().to_string()])
+        .expect("Failed to train tokenizer");
+
+    // Add decoder for proper decoding
+    tokenizer.with_decoder(Some(DecoderWrapper::ByteLevel(
+        tokenizers::decoders::byte_level::ByteLevel::default(),
+    )));
+
+    // Cleanup
+    fs::remove_file(&temp_path).ok();
+
+    tokenizer
+}
+
+/// Get a batch of training data
+fn get_batch(
+    dataset: &TokenDataset,
+    start_idx: usize,
+    batch_size: usize,
+    seq_len: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut input_ids = Vec::with_capacity(batch_size * seq_len);
+    let mut target_ids = Vec::with_capacity(batch_size * seq_len);
+
+    for b in 0..batch_size {
+        let idx = (start_idx + b) % dataset.num_sequences();
+        let (inp, tgt) = dataset.get_batch(idx);
+        input_ids.extend_from_slice(&inp[..seq_len.min(inp.len())]);
+        target_ids.extend_from_slice(&tgt[..seq_len.min(tgt.len())]);
+
+        // Pad if necessary
+        while input_ids.len() < (b + 1) * seq_len {
+            input_ids.push(0);
+            target_ids.push(0);
+        }
+    }
+
+    (input_ids, target_ids)
+}
+
+/// Evaluate on validation set
+fn evaluate(
+    trainer: &Trainer,
+    val_dataset: &TokenDataset,
+    batch_size: usize,
+    seq_len: usize,
+    num_batches: usize,
+) -> f32 {
+    let mut total_loss = 0.0;
+    let num_batches = num_batches.min(val_dataset.num_sequences() / batch_size).max(1);
+
+    for i in 0..num_batches {
+        let (input_ids, target_ids) = get_batch(val_dataset, i * batch_size, batch_size, seq_len);
+        let loss = trainer.compute_loss(&input_ids, &target_ids, batch_size, seq_len);
+        total_loss += loss;
+    }
+
+    total_loss / num_batches as f32
+}
+
+/// Generate text from a prompt
+fn generate(
+    model: &GPTModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+) -> String {
+    // Encode prompt
+    let encoding = tokenizer.encode(prompt, false).expect("Failed to encode prompt");
+    let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+    let max_len = model.config.max_seq_len;
+
+    // Generate tokens one at a time
+    for _ in 0..max_tokens {
+        // Truncate if necessary
+        let context_tokens = if tokens.len() > max_len {
+            &tokens[tokens.len() - max_len..]
+        } else {
+            &tokens[..]
+        };
+
+        // Forward pass
+        let logits = model.forward(context_tokens, 1, context_tokens.len(), 0);
+
+        // Get logits for last position
+        let vocab_size = model.config.vocab_size;
+        let last_pos = context_tokens.len() - 1;
+        let logits_slice = logits.as_f32_slice();
+        let last_logits = &logits_slice[last_pos * vocab_size..(last_pos + 1) * vocab_size];
+
+        // Apply temperature
+        let scaled_logits: Vec<f32> = if temperature > 0.0 {
+            last_logits.iter().map(|&x| x / temperature).collect()
+        } else {
+            last_logits.to_vec()
+        };
+
+        // Sample from distribution
+        let next_token = if temperature > 0.0 {
+            sample_from_logits(&scaled_logits)
+        } else {
+            // Greedy: argmax
+            scaled_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+
+        tokens.push(next_token);
+
+        // Stop at end of text token
+        if next_token == 0 {
+            break;
+        }
+    }
+
+    // Decode
+    tokenizer.decode(&tokens, true).expect("Failed to decode")
+}
+
+/// Sample a token from logits using softmax probabilities
+fn sample_from_logits(logits: &[f32]) -> u32 {
+    // Compute softmax
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp_logits: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
+    let sum: f32 = exp_logits.iter().sum();
+    let probs: Vec<f32> = exp_logits.iter().map(|&x| x / sum).collect();
+
+    // Sample using simple random
+    let r: f32 = simple_random();
+    let mut cumsum = 0.0;
+    for (i, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if r < cumsum {
+            return i as u32;
+        }
+    }
+
+    (probs.len() - 1) as u32
+}
+
+/// Simple pseudo-random number generator (0.0 to 1.0)
+fn simple_random() -> f32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static mut SEED: u64 = 0;
+    unsafe {
+        if SEED == 0 {
+            SEED = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+        }
+        // LCG parameters
+        SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (SEED >> 33) as f32 / (1u64 << 31) as f32
+    }
 }

@@ -84,6 +84,24 @@ impl ModelConfig {
         }
     }
 
+    /// Create a Shakespeare-optimized config for training on TinyShakespeare
+    /// with BPE tokenization (~2048 vocab, ~5.5M params)
+    pub fn shakespeare() -> Self {
+        Self {
+            vocab_size: 2048,
+            hidden_dim: 256,
+            num_layers: 6,
+            num_heads: 8,
+            num_kv_heads: 8,
+            intermediate_dim: 512,
+            max_seq_len: 512,
+            rope_base: 10000.0,
+            norm_eps: 1e-5,
+            tie_weights: true,
+            precision: Precision::FP32,
+        }
+    }
+
     /// Return a new config with BF16 precision
     pub fn with_bf16(mut self) -> Self {
         self.precision = Precision::BF16;
@@ -193,6 +211,16 @@ impl GPTModel {
     ///
     /// - `position_offset`: Starting position for RoPE (for KV cache)
     pub fn forward(&self, input_ids: &[u32], batch_size: usize, seq_len: usize, position_offset: usize) -> Tensor {
+        let (logits, _) = self.forward_with_hidden(input_ids, batch_size, seq_len, position_offset);
+        logits
+    }
+
+    /// Forward pass returning both logits and final hidden states
+    ///
+    /// Returns: (logits, final_hidden_before_output)
+    /// - logits: [batch, seq_len, vocab_size]
+    /// - final_hidden: [batch * seq_len, hidden_dim] (after final norm, before output projection)
+    pub fn forward_with_hidden(&self, input_ids: &[u32], batch_size: usize, seq_len: usize, position_offset: usize) -> (Tensor, Tensor) {
         assert_eq!(input_ids.len(), batch_size * seq_len);
 
         // Token embedding
@@ -209,8 +237,16 @@ impl GPTModel {
         // Final norm
         hidden = rmsnorm(&hidden, &self.final_norm, self.config.norm_eps);
 
+        // Save hidden states for backward pass (reshape to 2D)
+        let final_hidden = Tensor::from_f32_slice(
+            hidden.as_f32_slice(),
+            &[batch_size * seq_len, self.config.hidden_dim],
+        );
+
         // Output projection (compute logits)
-        self.compute_logits(&hidden, batch_size, seq_len)
+        let logits = self.compute_logits(&hidden, batch_size, seq_len);
+
+        (logits, final_hidden)
     }
 
     /// Compute logits from hidden states

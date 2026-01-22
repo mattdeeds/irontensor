@@ -9,6 +9,7 @@ mod gemm;
 mod norm;
 mod rope;
 mod softmax;
+mod transpose;
 
 pub use attention::attention;
 pub use backward::{
@@ -29,3 +30,4 @@ pub use gemm::matmul;
 pub use norm::rmsnorm;
 pub use rope::{rope, rope_default};
 pub use softmax::softmax;
+pub use transpose::{transpose_2d, transpose_for_attention, transpose_from_attention};

@@ -19,6 +19,8 @@ pub use ops::{
     scale, silu, softmax, swiglu,
     // Optimized ops (Phase 5)
     flash_attention, fused_linear_cross_entropy, fused_linear_cross_entropy_forward_only,
+    // Transpose ops (GPU-accelerated)
+    transpose_2d, transpose_for_attention, transpose_from_attention,
     // Backward ops
     cross_entropy, cross_entropy_backward, cross_entropy_fused, embedding_backward, gelu_backward,
     matmul_backward, matmul_backward_a, matmul_backward_b, mul_backward, relu_backward,
