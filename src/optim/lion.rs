@@ -16,6 +16,7 @@ use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const LION_SHADER: &str = include_str!("../shaders/lion.metal");
+const BF16_SHADER: &str = include_str!("../shaders/bf16_ops.metal");
 
 #[repr(C)]
 struct LionParams {
@@ -26,9 +27,20 @@ struct LionParams {
     weight_decay: f32,
 }
 
+/// LionParams for BF16 kernel (matches bf16_ops.metal layout)
+#[repr(C)]
+struct LionParamsBF16 {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    weight_decay: f32,
+    lr_scale: f32,
+}
+
 struct LionPipelines {
     lion_step: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     lion_step_scaled: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    lion_step_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     zero_gradients: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     grad_norm_squared: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     grad_clip: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -45,8 +57,12 @@ fn get_pipelines() -> &'static LionPipelines {
             .newLibraryWithSource_options_error(ns_string!(LION_SHADER), None)
             .unwrap_or_else(|e| panic!("Failed to compile Lion shader: {e}"));
 
-        let make_pipeline = |name: &str| {
-            let func = library
+        let bf16_library = device
+            .newLibraryWithSource_options_error(ns_string!(BF16_SHADER), None)
+            .unwrap_or_else(|e| panic!("Failed to compile BF16 shader: {e}"));
+
+        let make_pipeline = |lib: &ProtocolObject<dyn MTLLibrary>, name: &str| {
+            let func = lib
                 .newFunctionWithName(&objc2_foundation::NSString::from_str(name))
                 .unwrap_or_else(|| panic!("{} function not found", name));
             device
@@ -55,11 +71,12 @@ fn get_pipelines() -> &'static LionPipelines {
         };
 
         LionPipelines {
-            lion_step: make_pipeline("lion_step_f32"),
-            lion_step_scaled: make_pipeline("lion_step_scaled_f32"),
-            zero_gradients: make_pipeline("zero_gradients_f32"),
-            grad_norm_squared: make_pipeline("grad_norm_squared_f32"),
-            grad_clip: make_pipeline("grad_clip_f32"),
+            lion_step: make_pipeline(&library, "lion_step_f32"),
+            lion_step_scaled: make_pipeline(&library, "lion_step_scaled_f32"),
+            lion_step_bf16: make_pipeline(&bf16_library, "lion_step_bf16"),
+            zero_gradients: make_pipeline(&library, "zero_gradients_f32"),
+            grad_norm_squared: make_pipeline(&library, "grad_norm_squared_f32"),
+            grad_clip: make_pipeline(&library, "grad_clip_f32"),
         }
     })
 }
@@ -221,6 +238,82 @@ impl Lion {
                 encoder.setBuffer_offset_atIndex(Some(momentum_buf), 0, 1);
                 encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 2);
                 encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+            },
+            grid_size,
+            threadgroup_size,
+        );
+    }
+
+    /// Perform one optimization step for BF16 weights with FP32 gradients
+    ///
+    /// This is the mixed-precision variant: weights are stored in BF16 for memory
+    /// efficiency, but gradients and momentum remain in FP32 for numerical stability.
+    pub fn step_bf16(&self, weights: &Tensor, gradients: &Tensor, state: &mut ParamState) {
+        let _timer = timed(OpCategory::LionStep, weights.numel());
+        assert_eq!(weights.precision(), Precision::BF16, "step_bf16 requires BF16 weights");
+        assert_eq!(gradients.precision(), Precision::FP32, "step_bf16 requires FP32 gradients");
+        assert_eq!(weights.shape(), gradients.shape());
+        assert_eq!(weights.shape(), state.momentum.shape());
+
+        let count = weights.numel();
+        if count == 0 {
+            return;
+        }
+
+        let ctx = MetalContext::global();
+        let pipelines = get_pipelines();
+
+        let params = LionParamsBF16 {
+            lr: self.config.lr,
+            beta1: self.config.beta1,
+            beta2: self.config.beta2,
+            weight_decay: self.config.weight_decay,
+            lr_scale: 1.0,
+        };
+
+        let params_buffer = unsafe {
+            ctx.device().newBufferWithBytes_length_options(
+                NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<LionParamsBF16>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("Failed to create params buffer");
+
+        let numel = count as u32;
+        let numel_buffer = unsafe {
+            ctx.device().newBufferWithBytes_length_options(
+                NonNull::new(&numel as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<u32>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("Failed to create numel buffer");
+
+        let weights_buf = weights.buffer();
+        let momentum_buf = state.momentum.buffer();
+        let gradients_buf = gradients.buffer();
+
+        let thread_width = pipelines.lion_step_bf16.threadExecutionWidth();
+        let grid_size = MTLSize {
+            width: count,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup_size = MTLSize {
+            width: thread_width.min(count),
+            height: 1,
+            depth: 1,
+        };
+
+        CommandBatch::dispatch(
+            &pipelines.lion_step_bf16,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(momentum_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&numel_buffer), 0, 4);
             },
             grid_size,
             threadgroup_size,

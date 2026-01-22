@@ -1,5 +1,16 @@
-use crate::ops::{matmul, matmul_mps_nt, matmul_mps_tn, softmax, softmax_backward};
+use crate::ops::{matmul, matmul_mps_nt, matmul_mps_tn, softmax, softmax_backward, to_f32_gpu};
+use crate::precision::Precision;
 use crate::tensor::Tensor;
+
+/// Ensure tensor is FP32 for compute. If BF16, converts to FP32.
+/// This enables mixed precision: weights stored in BF16 but computed in FP32.
+pub fn ensure_fp32(t: &Tensor) -> Tensor {
+    if t.precision() == Precision::BF16 {
+        to_f32_gpu(t)
+    } else {
+        t.clone()
+    }
+}
 
 /// Scale tensor by a scalar
 pub(crate) fn scale_tensor(t: &Tensor, scale: f32) -> Tensor {
@@ -38,20 +49,28 @@ pub(crate) fn compute_total_grad_norm(grads: &[&Tensor]) -> f32 {
 /// Linear forward: output = input @ weight.T
 ///
 /// Uses MPS's native transpose support to avoid explicit transposition.
+/// Supports mixed precision: BF16 weights are converted to FP32 for compute.
 pub(crate) fn linear_forward(input: &Tensor, weight: &Tensor) -> Tensor {
     // weight: [out, in], we want input @ weight.T
     // matmul_mps_nt handles the transpose natively
-    matmul_mps_nt(input, weight)
+    let weight_fp32 = ensure_fp32(weight);
+    matmul_mps_nt(input, &weight_fp32)
 }
 
 /// Linear backward: grad_input = grad_output @ weight, grad_weight = grad_output.T @ input
+///
+/// Supports mixed precision: BF16 weights are converted to FP32 for compute.
+/// Returns FP32 gradients regardless of weight precision.
 pub(crate) fn linear_backward(
     grad_output: &Tensor,
     input: &Tensor,
     weight: &Tensor,
 ) -> (Tensor, Tensor) {
+    // Convert weight to FP32 if needed for mixed precision
+    let weight_fp32 = ensure_fp32(weight);
+
     // grad_input = grad_output @ weight
-    let grad_input = matmul(grad_output, weight);
+    let grad_input = matmul(grad_output, &weight_fp32);
 
     // grad_weight = grad_output.T @ input
     let grad_weight = matmul_tn(grad_output, input);

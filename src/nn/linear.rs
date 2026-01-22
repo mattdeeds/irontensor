@@ -1,4 +1,4 @@
-use crate::ops::matmul;
+use crate::ops::{matmul, to_f32_gpu};
 use crate::optim::ParamState;
 use crate::precision::Precision;
 use crate::tensor::Tensor;
@@ -67,6 +67,7 @@ impl Linear {
     ///
     /// Input shape: [..., in_features]
     /// Output shape: [..., out_features]
+    /// Supports mixed precision: BF16 weights/inputs are converted to FP32.
     pub fn forward(&self, input: &Tensor) -> Tensor {
         let input_shape = input.shape();
         assert!(
@@ -80,6 +81,14 @@ impl Linear {
             input_shape[input_shape.len() - 1],
             self.in_features
         );
+
+        // Convert BF16 input to FP32 if needed
+        let input = if input.precision() == Precision::BF16 {
+            to_f32_gpu(input)
+        } else {
+            input.clone()
+        };
+        let input_shape = input.shape().to_vec();
 
         // Reshape input to 2D: [batch, in_features]
         let batch_size: usize = input_shape[..input_shape.len() - 1].iter().product();
@@ -97,6 +106,12 @@ impl Linear {
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
+            // Convert BF16 bias to FP32 if needed
+            let bias = if bias.precision() == Precision::BF16 {
+                to_f32_gpu(bias)
+            } else {
+                bias.clone()
+            };
             // Broadcast bias across batch dimension
             let bias_data = bias.as_f32_slice();
             let output_data = output.as_f32_slice();
@@ -123,7 +138,13 @@ impl Linear {
 
     /// Transpose weight matrix for efficient matmul
     fn transpose_weight(&self) -> Tensor {
-        let w = self.weight.as_f32_slice();
+        // Convert BF16 weight to FP32 if needed
+        let weight = if self.weight.precision() == Precision::BF16 {
+            to_f32_gpu(&self.weight)
+        } else {
+            self.weight.clone()
+        };
+        let w = weight.as_f32_slice();
         let mut wt = vec![0.0f32; self.in_features * self.out_features];
         for i in 0..self.out_features {
             for j in 0..self.in_features {

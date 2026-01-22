@@ -163,6 +163,9 @@ fn main() {
     println!("Batch size: {}", batch_size);
     println!("Sequence length: {}", seq_len);
 
+    // Check for BF16 flag via environment variable
+    let use_bf16 = std::env::var("IRONTENSOR_BF16").is_ok();
+
     // Training configuration
     let train_config = TrainingConfig {
         learning_rate: 3e-4,
@@ -176,6 +179,7 @@ fn main() {
         save_interval: 100,
         eval_interval: 50,
         checkpoint_dir: "checkpoints".to_string(),
+        use_bf16,
     };
 
     println!("\nTraining Configuration:");
@@ -184,6 +188,7 @@ fn main() {
     println!("  warmup_steps: {}", train_config.warmup_steps);
     println!("  total_steps: {}", train_config.total_steps);
     println!("  max_grad_norm: {}", train_config.max_grad_norm);
+    println!("  use_bf16: {}", train_config.use_bf16);
     println!();
 
     // Create trainer

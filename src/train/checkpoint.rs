@@ -3,6 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::nn::{GPTModel, ModelConfig};
+use crate::ops::to_f32_gpu;
 use crate::precision::Precision;
 use crate::tensor::Tensor;
 
@@ -41,7 +42,15 @@ impl Checkpoint {
 }
 
 /// Save a tensor to a writer
+/// Automatically converts BF16 tensors to FP32 for storage compatibility
 fn save_tensor<W: Write>(tensor: &Tensor, writer: &mut W) -> std::io::Result<()> {
+    // Convert BF16 to FP32 for saving (checkpoints are always FP32 for compatibility)
+    let tensor = if tensor.precision() == Precision::BF16 {
+        to_f32_gpu(tensor)
+    } else {
+        tensor.clone()
+    };
+
     let shape = tensor.shape();
     let ndim = shape.len() as u32;
     writer.write_all(&ndim.to_le_bytes())?;

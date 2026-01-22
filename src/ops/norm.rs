@@ -61,13 +61,20 @@ fn get_pipelines() -> &'static NormPipelines {
 ///
 /// Input shapes:
 /// - input: [..., hidden_dim] - last dimension is normalized
-/// - gamma: [hidden_dim] - learnable scale parameter
+/// - gamma: [hidden_dim] - learnable scale parameter (FP32 or BF16 - BF16 is converted)
 ///
-/// Returns tensor with same shape as input
+/// Returns tensor with same shape as input (always FP32)
 pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> Tensor {
     let _timer = timed(OpCategory::RmsNorm, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
-    assert_eq!(gamma.precision(), Precision::FP32);
+
+    // Convert BF16 gamma to FP32 if needed (mixed precision support)
+    let gamma = if gamma.precision() == Precision::BF16 {
+        crate::ops::to_f32_gpu(gamma)
+    } else {
+        gamma.clone()
+    };
+    let gamma = &gamma;
 
     let shape = input.shape();
     assert!(shape.len() >= 1, "Input must have at least 1 dimension");

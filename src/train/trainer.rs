@@ -18,7 +18,7 @@ use super::callbacks::TrainCallback;
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::{TrainMetrics, TrainingConfig};
 use super::helpers::{
-    add_tensors, attention_backward_recompute, compute_total_grad_norm, linear_backward,
+    add_tensors, attention_backward_recompute, compute_total_grad_norm, ensure_fp32, linear_backward,
     linear_forward, repeat_kv, repeat_kv_backward, scale_tensor,
 };
 use super::scheduler::{CosineAnnealingLR, LRScheduler};
@@ -38,7 +38,13 @@ pub struct Trainer {
 impl Trainer {
     /// Create a new trainer
     pub fn new(model_config: ModelConfig, train_config: TrainingConfig) -> Self {
-        let model = GPTModel::new(model_config.clone());
+        let mut model = GPTModel::new(model_config.clone());
+
+        // Convert model to BF16 for mixed precision training if enabled
+        if train_config.use_bf16 {
+            model.to_bf16();
+        }
+
         let model_state = GPTModelState::new(&model);
 
         let optimizer = Lion::new(LionConfig {
@@ -170,17 +176,19 @@ impl Trainer {
         let grad_embed_out = matmul_tn(&grad_logits, &cache.final_hidden);
 
         // Gradient flowing back through output projection
-        // grad_final_hidden = grad_logits @ embed
-        let grad_hidden_2d = matmul(&grad_logits, &self.model.embed_tokens);
+        // grad_final_hidden = grad_logits @ embed (convert BF16 weights to FP32 if needed)
+        let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
+        let grad_hidden_2d = matmul(&grad_logits, &embed_fp32);
         // Reshape to 3D for norm backward
         let hidden_dim = self.model.config.hidden_dim;
         let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
 
-        // Backward through final norm
+        // Backward through final norm (convert BF16 gamma to FP32 if needed)
+        let final_norm_fp32 = ensure_fp32(&self.model.final_norm);
         let (grad_pre_norm, grad_final_norm) = rmsnorm_backward(
             &grad_hidden_3d,
             &self.get_pre_final_norm_hidden(&cache, batch_size, seq_len),
-            &self.model.final_norm,
+            &final_norm_fp32,
             self.model.config.norm_eps,
         );
         let mut grad_hidden = grad_pre_norm;
@@ -236,21 +244,33 @@ impl Trainer {
 
         // ========== Apply optimizer to all parameters ==========
         Profiler::set_phase(Phase::Optimizer);
+        let use_bf16 = self.config.use_bf16;
+
+        // Helper macro to handle precision-aware optimizer step
+        macro_rules! opt_step {
+            ($weights:expr, $grads:expr, $state:expr) => {
+                if use_bf16 {
+                    self.optimizer.step_bf16($weights, $grads, $state);
+                } else {
+                    self.optimizer.step($weights, $grads, $state);
+                }
+            };
+        }
 
         // Embedding
         let grad_embed_clipped = scale_tensor(&grad_embed, clip_scale);
-        self.optimizer.step(
+        opt_step!(
             &self.model.embed_tokens,
             &grad_embed_clipped,
-            &mut self.model_state.embed_state,
+            &mut self.model_state.embed_state
         );
 
         // Final norm
         let grad_final_norm_clipped = scale_tensor(&grad_final_norm, clip_scale);
-        self.optimizer.step(
+        opt_step!(
             &self.model.final_norm,
             &grad_final_norm_clipped,
-            &mut self.model_state.final_norm_state,
+            &mut self.model_state.final_norm_state
         );
 
         // Transformer layers
@@ -260,40 +280,33 @@ impl Trainer {
 
             // Attention norms
             let g = scale_tensor(&grads.grad_attn_norm, clip_scale);
-            self.optimizer.step(&layer.attn_norm, &g, &mut state.attn_norm_state);
+            opt_step!(&layer.attn_norm, &g, &mut state.attn_norm_state);
 
             let g = scale_tensor(&grads.grad_ffn_norm, clip_scale);
-            self.optimizer.step(&layer.ffn_norm, &g, &mut state.ffn_norm_state);
+            opt_step!(&layer.ffn_norm, &g, &mut state.ffn_norm_state);
 
             // Attention weights
             let g = scale_tensor(&grads.grad_wq, clip_scale);
-            self.optimizer
-                .step(&layer.attention.wq.weight, &g, &mut state.attention_state.wq_state);
+            opt_step!(&layer.attention.wq.weight, &g, &mut state.attention_state.wq_state);
 
             let g = scale_tensor(&grads.grad_wk, clip_scale);
-            self.optimizer
-                .step(&layer.attention.wk.weight, &g, &mut state.attention_state.wk_state);
+            opt_step!(&layer.attention.wk.weight, &g, &mut state.attention_state.wk_state);
 
             let g = scale_tensor(&grads.grad_wv, clip_scale);
-            self.optimizer
-                .step(&layer.attention.wv.weight, &g, &mut state.attention_state.wv_state);
+            opt_step!(&layer.attention.wv.weight, &g, &mut state.attention_state.wv_state);
 
             let g = scale_tensor(&grads.grad_wo, clip_scale);
-            self.optimizer
-                .step(&layer.attention.wo.weight, &g, &mut state.attention_state.wo_state);
+            opt_step!(&layer.attention.wo.weight, &g, &mut state.attention_state.wo_state);
 
             // FFN weights
             let g = scale_tensor(&grads.grad_w_gate, clip_scale);
-            self.optimizer
-                .step(&layer.ffn.w_gate.weight, &g, &mut state.ffn_state.w_gate_state);
+            opt_step!(&layer.ffn.w_gate.weight, &g, &mut state.ffn_state.w_gate_state);
 
             let g = scale_tensor(&grads.grad_w_up, clip_scale);
-            self.optimizer
-                .step(&layer.ffn.w_up.weight, &g, &mut state.ffn_state.w_up_state);
+            opt_step!(&layer.ffn.w_up.weight, &g, &mut state.ffn_state.w_up_state);
 
             let g = scale_tensor(&grads.grad_w_down, clip_scale);
-            self.optimizer
-                .step(&layer.ffn.w_down.weight, &g, &mut state.ffn_state.w_down_state);
+            opt_step!(&layer.ffn.w_down.weight, &g, &mut state.ffn_state.w_down_state);
         }
 
         self.step += 1;
@@ -305,6 +318,7 @@ impl Trainer {
         (loss, total_grad_norm)
     }
 
+
     /// Forward pass with activation caching for backward
     fn forward_with_cache(
         &self,
@@ -315,8 +329,9 @@ impl Trainer {
         let hidden_dim = self.model.config.hidden_dim;
         let n = batch_size * seq_len;
 
-        // Embedding lookup
-        let embedded = embedding(&self.model.embed_tokens, input_ids);
+        // Embedding lookup (convert BF16 weights to FP32 if needed)
+        let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
+        let embedded = embedding(&embed_fp32, input_ids);
         let mut hidden = embedded.view(&[batch_size, seq_len, hidden_dim]);
 
         // Process each transformer layer
@@ -333,8 +348,9 @@ impl Trainer {
         // Store hidden state before final norm (for backward pass through RMSNorm)
         let pre_final_norm = hidden.clone();
 
-        // Final norm
-        let final_hidden = rmsnorm(&hidden, &self.model.final_norm, self.model.config.norm_eps);
+        // Final norm (convert BF16 gamma to FP32 if needed)
+        let final_norm_fp32 = ensure_fp32(&self.model.final_norm);
+        let final_hidden = rmsnorm(&hidden, &final_norm_fp32, self.model.config.norm_eps);
         let final_hidden_2d = final_hidden.view(&[n, hidden_dim]);
 
         ForwardCache {
@@ -363,8 +379,9 @@ impl Trainer {
         // Store input
         let input = x.clone();
 
-        // Attention norm
-        let normed_attn = rmsnorm(x, &layer.attn_norm, layer.norm_eps);
+        // Attention norm (convert BF16 gamma to FP32 if needed)
+        let attn_norm_fp32 = ensure_fp32(&layer.attn_norm);
+        let normed_attn = rmsnorm(x, &attn_norm_fp32, layer.norm_eps);
 
         // Q, K, V projections
         let normed_2d = normed_attn.view(&[n, hidden_dim]);
@@ -419,8 +436,9 @@ impl Trainer {
         // Residual connection
         let post_attn = add(x, &attn_projected);
 
-        // FFN norm
-        let normed_ffn = rmsnorm(&post_attn, &layer.ffn_norm, layer.norm_eps);
+        // FFN norm (convert BF16 gamma to FP32 if needed)
+        let ffn_norm_fp32 = ensure_fp32(&layer.ffn_norm);
+        let normed_ffn = rmsnorm(&post_attn, &ffn_norm_fp32, layer.norm_eps);
 
         // FFN: gate and up projections
         let normed_ffn_2d = normed_ffn.view(&[n, hidden_dim]);
@@ -500,10 +518,11 @@ impl Trainer {
             linear_backward(&grad_up, &normed_ffn_2d, &layer.ffn.w_up.weight);
         let grad_normed_ffn = add_tensors(&grad_normed_ffn_from_gate, &grad_normed_ffn_from_up);
 
-        // Backward through FFN norm
+        // Backward through FFN norm (convert BF16 gamma to FP32 if needed)
         let grad_normed_ffn_3d = grad_normed_ffn.view(&[batch_size, seq_len, hidden_dim]);
+        let ffn_norm_fp32 = ensure_fp32(&layer.ffn_norm);
         let (grad_post_attn_from_norm, grad_ffn_norm) =
-            rmsnorm_backward(&grad_normed_ffn_3d, &cache.post_attn, &layer.ffn_norm, layer.norm_eps);
+            rmsnorm_backward(&grad_normed_ffn_3d, &cache.post_attn, &ffn_norm_fp32, layer.norm_eps);
 
         // Combine gradients for post_attn
         let grad_post_attn = add_tensors(&grad_post_attn_from_ffn, &grad_post_attn_from_norm);
@@ -580,10 +599,11 @@ impl Trainer {
             &grad_normed_attn_from_v,
         );
 
-        // Backward through attention norm
+        // Backward through attention norm (convert BF16 gamma to FP32 if needed)
         let grad_normed_attn_3d = grad_normed_attn.view(&[batch_size, seq_len, hidden_dim]);
+        let attn_norm_fp32 = ensure_fp32(&layer.attn_norm);
         let (grad_input_from_norm, grad_attn_norm) =
-            rmsnorm_backward(&grad_normed_attn_3d, &cache.input, &layer.attn_norm, layer.norm_eps);
+            rmsnorm_backward(&grad_normed_attn_3d, &cache.input, &attn_norm_fp32, layer.norm_eps);
 
         // Combine gradients for layer input
         let grad_input = add_tensors(&grad_input_from_attn_residual, &grad_input_from_norm);
@@ -606,8 +626,9 @@ impl Trainer {
     fn compute_logits_from_hidden(&self, hidden: &Tensor) -> Tensor {
         // hidden: [n, hidden_dim], embed: [vocab, hidden_dim]
         // logits = hidden @ embed.T = [n, vocab]
-        // Use MPS's native transpose support
-        crate::ops::matmul_mps_nt(hidden, &self.model.embed_tokens)
+        // Use MPS's native transpose support (convert BF16 weights to FP32 if needed)
+        let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
+        crate::ops::matmul_mps_nt(hidden, &embed_fp32)
     }
 
     /// Get hidden states before final norm (from last layer cache)

@@ -53,13 +53,20 @@ fn get_pipelines() -> &'static EmbeddingPipelines {
 /// Embedding lookup: output[i] = weights[indices[i]]
 ///
 /// Input shapes:
-/// - weights: [vocab_size, embed_dim]
+/// - weights: [vocab_size, embed_dim] (FP32 or BF16 - BF16 is converted to FP32)
 /// - indices: [num_indices] - each value is a token ID in [0, vocab_size)
 ///
-/// Returns: [num_indices, embed_dim]
+/// Returns: [num_indices, embed_dim] (always FP32)
 pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
     let _timer = timed(OpCategory::Embedding, indices.len() * weights.shape()[1]);
-    assert_eq!(weights.precision(), Precision::FP32);
+
+    // Convert BF16 weights to FP32 if needed (mixed precision support)
+    let weights = if weights.precision() == Precision::BF16 {
+        crate::ops::to_f32_gpu(weights)
+    } else {
+        weights.clone()
+    };
+    let weights = &weights;
 
     let weights_shape = weights.shape();
     assert_eq!(weights_shape.len(), 2, "Weights must be 2D [vocab_size, embed_dim]");

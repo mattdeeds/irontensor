@@ -1,4 +1,4 @@
-use crate::ops::{embedding, matmul, rmsnorm};
+use crate::ops::{embedding, matmul, rmsnorm, to_f32_gpu};
 use crate::optim::ParamState;
 use crate::precision::Precision;
 use crate::tensor::Tensor;
@@ -252,6 +252,13 @@ impl GPTModel {
     /// Compute logits from hidden states
     fn compute_logits(&self, hidden: &Tensor, batch_size: usize, seq_len: usize) -> Tensor {
         let output_weight = self.output_weight.as_ref().unwrap_or(&self.embed_tokens);
+
+        // Convert BF16 weights to FP32 if needed (mixed precision support)
+        let output_weight = if output_weight.precision() == Precision::BF16 {
+            to_f32_gpu(output_weight)
+        } else {
+            output_weight.clone()
+        };
 
         // hidden: [batch, seq_len, hidden_dim]
         // output_weight: [vocab_size, hidden_dim]

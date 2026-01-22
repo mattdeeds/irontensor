@@ -23,6 +23,10 @@ pub struct TrainingConfig {
     pub eval_interval: usize,
     /// Checkpoint save directory
     pub checkpoint_dir: String,
+    /// Use BF16 mixed precision training
+    /// When enabled, model weights are stored in BF16 for ~50% memory reduction.
+    /// Forward/backward passes compute in FP32 for numerical stability.
+    pub use_bf16: bool,
 }
 
 impl Default for TrainingConfig {
@@ -39,6 +43,7 @@ impl Default for TrainingConfig {
             save_interval: 1000,
             eval_interval: 100,
             checkpoint_dir: "checkpoints".to_string(),
+            use_bf16: false,
         }
     }
 }
