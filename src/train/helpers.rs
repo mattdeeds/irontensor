@@ -1,4 +1,7 @@
-use crate::ops::{matmul, matmul_mps_nt, matmul_mps_tn, softmax, softmax_backward, to_f32_gpu};
+use crate::ops::{
+    add as gpu_add, causal_mask_3d_gpu, matmul, matmul_mps_nt, matmul_mps_tn, scale as gpu_scale,
+    softmax, softmax_backward, to_f32_gpu, transpose_3d_gpu,
+};
 use crate::precision::Precision;
 use crate::tensor::Tensor;
 
@@ -12,27 +15,14 @@ pub fn ensure_fp32(t: &Tensor) -> Tensor {
     }
 }
 
-/// Scale tensor by a scalar
+/// Scale tensor by a scalar (GPU-accelerated)
 pub(crate) fn scale_tensor(t: &Tensor, scale: f32) -> Tensor {
-    let data = t.as_f32_slice();
-    let result: Vec<f32> = data.iter().map(|x| x * scale).collect();
-    Tensor::from_f32_slice(&result, t.shape())
+    gpu_scale(t, scale)
 }
 
-/// Add two tensors element-wise
+/// Add two tensors element-wise (GPU-accelerated)
 pub(crate) fn add_tensors(a: &Tensor, b: &Tensor) -> Tensor {
-    let a_data = a.as_f32_slice();
-    let b_data = b.as_f32_slice();
-
-    // Handle shape mismatch by using the smaller size
-    let len = a_data.len().min(b_data.len());
-    let result: Vec<f32> = a_data[..len]
-        .iter()
-        .zip(b_data[..len].iter())
-        .map(|(x, y)| x + y)
-        .collect();
-
-    Tensor::from_f32_slice(&result, a.shape())
+    gpu_add(a, b)
 }
 
 /// Compute total L2 norm of multiple gradient tensors
@@ -120,42 +110,15 @@ pub(crate) fn repeat_kv(
     Tensor::from_f32_slice(&expanded, &[batch, seq_len, num_heads, head_dim])
 }
 
-/// Transpose last two dimensions of a 3D tensor: [batch, m, n] -> [batch, n, m]
+/// Transpose last two dimensions of a 3D tensor: [batch, m, n] -> [batch, n, m] (GPU-accelerated)
 pub(crate) fn transpose_last_two_dims_3d(t: &Tensor, batch: usize, m: usize, n: usize) -> Tensor {
-    let input = t.as_f32_slice();
-    let mut output = vec![0.0f32; batch * n * m];
-
-    for b in 0..batch {
-        for i in 0..m {
-            for j in 0..n {
-                output[b * n * m + j * m + i] = input[b * m * n + i * n + j];
-            }
-        }
-    }
-
-    Tensor::from_f32_slice(&output, &[batch, n, m])
+    transpose_3d_gpu(t, batch, m, n)
 }
 
-/// Apply causal mask to 3D attention scores: [batch, seq, seq]
+/// Apply causal mask to 3D attention scores: [batch, seq, seq] (GPU-accelerated)
 /// Sets positions where col > row to -inf
 pub(crate) fn apply_causal_mask_3d(scores: &Tensor, batch: usize, seq_len: usize) -> Tensor {
-    let data = scores.as_f32_slice();
-    let mut output = vec![0.0f32; batch * seq_len * seq_len];
-
-    for b in 0..batch {
-        for row in 0..seq_len {
-            for col in 0..seq_len {
-                let idx = b * seq_len * seq_len + row * seq_len + col;
-                if col > row {
-                    output[idx] = f32::NEG_INFINITY;
-                } else {
-                    output[idx] = data[idx];
-                }
-            }
-        }
-    }
-
-    Tensor::from_f32_slice(&output, &[batch, seq_len, seq_len])
+    causal_mask_3d_gpu(scores, batch, seq_len)
 }
 
 /// Attention backward pass that recomputes attention weights from Q, K, V

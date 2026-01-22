@@ -150,3 +150,58 @@ kernel void transpose_output_f32(
 
     output[out_offset] = input[in_offset];
 }
+
+// Parameters for 3D tensor operations
+struct Transpose3DParams {
+    uint batch;   // Number of batches
+    uint m;       // First spatial dimension
+    uint n;       // Second spatial dimension
+};
+
+// Transpose last two dimensions of 3D tensor: [batch, m, n] -> [batch, n, m]
+// Used in attention backward for transposing K, V, gradients, etc.
+kernel void transpose_3d_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant Transpose3DParams& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.z;   // batch index
+    uint j = gid.y;   // output row (was column)
+    uint i = gid.x;   // output column (was row)
+
+    if (b >= params.batch || j >= params.n || i >= params.m) return;
+
+    // Input: [batch, m, n] at [b, i, j]
+    uint in_offset = b * params.m * params.n + i * params.n + j;
+
+    // Output: [batch, n, m] at [b, j, i]
+    uint out_offset = b * params.n * params.m + j * params.m + i;
+
+    output[out_offset] = input[in_offset];
+}
+
+// Apply causal mask to 3D attention scores: [batch, seq, seq]
+// Sets positions where col > row to -inf
+kernel void causal_mask_3d_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch [[buffer(2)]],
+    constant uint& seq_len [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint b = gid.z;    // batch index
+    uint row = gid.y;  // query position
+    uint col = gid.x;  // key position
+
+    if (b >= batch || row >= seq_len || col >= seq_len) return;
+
+    uint idx = b * seq_len * seq_len + row * seq_len + col;
+
+    // Causal mask: can only attend to positions <= current position
+    if (col > row) {
+        output[idx] = -INFINITY;
+    } else {
+        output[idx] = input[idx];
+    }
+}

@@ -26,10 +26,19 @@ struct AttentionParams {
     scale: f32,
 }
 
+#[repr(C)]
+struct Transpose3DParams {
+    batch: u32,
+    m: u32,
+    n: u32,
+}
+
 struct AttentionPipelines {
     causal_mask: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     transpose_qkv: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     transpose_output: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    transpose_3d: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    causal_mask_3d: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 static ATTENTION_PIPELINES: OnceLock<AttentionPipelines> = OnceLock::new();
@@ -56,6 +65,8 @@ fn get_pipelines() -> &'static AttentionPipelines {
             causal_mask: make_pipeline("causal_mask_f32"),
             transpose_qkv: make_pipeline("transpose_qkv_f32"),
             transpose_output: make_pipeline("transpose_output_f32"),
+            transpose_3d: make_pipeline("transpose_3d_f32"),
+            causal_mask_3d: make_pipeline("causal_mask_3d_f32"),
         }
     })
 }
@@ -372,20 +383,137 @@ fn reshape_for_batched_matmul(t: &Tensor, batch: usize, m: usize, n: usize) -> T
     Tensor::from_f32_slice(data, &[batch, m, n])
 }
 
-/// Transpose last two dimensions: [batch, m, n] -> [batch, n, m]
+/// Transpose last two dimensions: [batch, m, n] -> [batch, n, m] (GPU-accelerated)
 fn transpose_last_two_dims(t: &Tensor, batch: usize, m: usize, n: usize) -> Tensor {
-    let input = t.as_f32_slice();
-    let mut output = vec![0.0f32; batch * n * m];
+    transpose_3d_gpu(t, batch, m, n)
+}
 
-    for b in 0..batch {
-        for i in 0..m {
-            for j in 0..n {
-                output[b * n * m + j * m + i] = input[b * m * n + i * n + j];
-            }
-        }
+/// GPU-accelerated transpose of last two dimensions: [batch, m, n] -> [batch, n, m]
+///
+/// This is a public function for use in attention backward and other operations
+/// that need 3D transpose without reading data to CPU.
+pub fn transpose_3d_gpu(t: &Tensor, batch: usize, m: usize, n: usize) -> Tensor {
+    assert_eq!(t.numel(), batch * m * n, "Tensor size mismatch");
+
+    let output = Tensor::zeros(&[batch, n, m], Precision::FP32);
+
+    if batch == 0 || m == 0 || n == 0 {
+        return output;
     }
 
-    Tensor::from_f32_slice(&output, &[batch, n, m])
+    let ctx = MetalContext::global();
+    let pipelines = get_pipelines();
+
+    let params = Transpose3DParams {
+        batch: batch as u32,
+        m: m as u32,
+        n: n as u32,
+    };
+    let params_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&params as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<Transpose3DParams>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .expect("Failed to create params buffer");
+
+    let input_buf = t.buffer();
+    let output_buf = output.buffer();
+
+    let grid_size = MTLSize {
+        width: m,
+        height: n,
+        depth: batch,
+    };
+    let thread_width = pipelines.transpose_3d.threadExecutionWidth();
+    let max_threads = pipelines.transpose_3d.maxTotalThreadsPerThreadgroup();
+    let threadgroup_size = MTLSize {
+        width: thread_width.min(m).max(1),
+        height: (max_threads / thread_width).min(n).max(1),
+        depth: 1,
+    };
+
+    CommandBatch::dispatch(
+        &pipelines.transpose_3d,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    output
+}
+
+/// GPU-accelerated causal mask for 3D attention scores: [batch, seq, seq]
+///
+/// Sets positions where col > row to -inf (causal attention).
+/// This is used in attention backward to recompute attention weights.
+pub fn causal_mask_3d_gpu(t: &Tensor, batch: usize, seq_len: usize) -> Tensor {
+    assert_eq!(t.numel(), batch * seq_len * seq_len, "Tensor size mismatch");
+
+    let output = Tensor::zeros(&[batch, seq_len, seq_len], Precision::FP32);
+
+    if batch == 0 || seq_len == 0 {
+        return output;
+    }
+
+    let ctx = MetalContext::global();
+    let pipelines = get_pipelines();
+
+    let batch_u32 = batch as u32;
+    let seq_len_u32 = seq_len as u32;
+
+    let batch_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&batch_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .expect("Failed to create batch buffer");
+
+    let seq_len_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&seq_len_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .expect("Failed to create seq_len buffer");
+
+    let input_buf = t.buffer();
+    let output_buf = output.buffer();
+
+    let grid_size = MTLSize {
+        width: seq_len,
+        height: seq_len,
+        depth: batch,
+    };
+    let thread_width = pipelines.causal_mask_3d.threadExecutionWidth();
+    let max_threads = pipelines.causal_mask_3d.maxTotalThreadsPerThreadgroup();
+    let threadgroup_size = MTLSize {
+        width: thread_width.min(seq_len).max(1),
+        height: (max_threads / thread_width).min(seq_len).max(1),
+        depth: 1,
+    };
+
+    CommandBatch::dispatch(
+        &pipelines.causal_mask_3d,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&seq_len_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    output
 }
 
 /// Softmax for 4D tensor, applied over the last dimension

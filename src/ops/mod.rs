@@ -12,7 +12,7 @@ mod rope;
 mod softmax;
 mod transpose;
 
-pub use attention::attention;
+pub use attention::{attention, causal_mask_3d_gpu, transpose_3d_gpu};
 pub use backward::{
     cross_entropy, cross_entropy_backward, cross_entropy_fused, embedding_backward, gelu_backward,
     matmul_backward, matmul_backward_a, matmul_backward_b, mul_backward, relu_backward,
