@@ -3,6 +3,7 @@
 //! Uses MPSMatrixMultiplication which leverages the AMX (Apple Matrix coprocessor)
 //! for highly optimized matrix multiplication on Apple Silicon.
 
+use objc2::rc::autoreleasepool;
 use objc2::AllocAnyThread;
 use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
@@ -62,88 +63,305 @@ fn matmul_mps_2d(a: &Tensor, b: &Tensor) -> Tensor {
     // Need to sync before MPS operations since MPS uses its own command buffer
     CommandBatch::sync();
 
-    let ctx = MetalContext::global();
-    let device = ctx.device();
+    // Wrap MPS operations in autoreleasepool to ensure Objective-C objects are freed
+    autoreleasepool(|_| {
+        let ctx = MetalContext::global();
+        let device = ctx.device();
 
-    // Create matrix descriptors
-    // Row-major layout: rowBytes = columns * sizeof(float)
-    let row_bytes_a = k * std::mem::size_of::<f32>();
-    let row_bytes_b = n * std::mem::size_of::<f32>();
-    let row_bytes_c = n * std::mem::size_of::<f32>();
+        // Create matrix descriptors
+        // Row-major layout: rowBytes = columns * sizeof(float)
+        let row_bytes_a = k * std::mem::size_of::<f32>();
+        let row_bytes_b = n * std::mem::size_of::<f32>();
+        let row_bytes_c = n * std::mem::size_of::<f32>();
 
-    let desc_a = unsafe {
-        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-            m,
-            k,
-            row_bytes_a,
-            MPSDataType::Float32,
-        )
-    };
+        let desc_a = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                m,
+                k,
+                row_bytes_a,
+                MPSDataType::Float32,
+            )
+        };
 
-    let desc_b = unsafe {
-        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-            k,
-            n,
-            row_bytes_b,
-            MPSDataType::Float32,
-        )
-    };
+        let desc_b = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                k,
+                n,
+                row_bytes_b,
+                MPSDataType::Float32,
+            )
+        };
 
-    let desc_c = unsafe {
-        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
-            m,
-            n,
-            row_bytes_c,
-            MPSDataType::Float32,
-        )
-    };
+        let desc_c = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                m,
+                n,
+                row_bytes_c,
+                MPSDataType::Float32,
+            )
+        };
 
-    // Create MPS matrices from existing buffers
-    let matrix_a = unsafe {
-        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), a.buffer(), &desc_a)
-    };
+        // Create MPS matrices from existing buffers
+        let matrix_a = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), a.buffer(), &desc_a)
+        };
 
-    let matrix_b = unsafe {
-        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), b.buffer(), &desc_b)
-    };
+        let matrix_b = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), b.buffer(), &desc_b)
+        };
 
-    let matrix_c = unsafe {
-        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), c.buffer(), &desc_c)
-    };
+        let matrix_c = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), c.buffer(), &desc_c)
+        };
 
-    // Create the multiplication kernel
-    // C = alpha * A @ B + beta * C
-    // We want C = A @ B, so alpha = 1.0, beta = 0.0
-    let kernel = unsafe {
-        MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
-            MPSMatrixMultiplication::alloc(),
-            device,
-            false,  // don't transpose A
-            false,  // don't transpose B
-            m,      // result rows
-            n,      // result columns
-            k,      // interior columns (shared dimension)
-            1.0,    // alpha
-            0.0,    // beta
-        )
-    };
+        // Create the multiplication kernel
+        // C = alpha * A @ B + beta * C
+        // We want C = A @ B, so alpha = 1.0, beta = 0.0
+        let kernel = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                device,
+                false,  // don't transpose A
+                false,  // don't transpose B
+                m,      // result rows
+                n,      // result columns
+                k,      // interior columns (shared dimension)
+                1.0,    // alpha
+                0.0,    // beta
+            )
+        };
 
-    // Create command buffer and encode
-    let command_buffer = ctx.command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer for MPS");
+        // Create command buffer and encode
+        let command_buffer = ctx.command_queue()
+            .commandBuffer()
+            .expect("Failed to create command buffer for MPS");
 
-    unsafe {
-        kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
-            &command_buffer,
-            &matrix_a,
-            &matrix_b,
-            &matrix_c,
-        );
-    }
+        unsafe {
+            kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                &command_buffer,
+                &matrix_a,
+                &matrix_b,
+                &matrix_c,
+            );
+        }
 
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    });
+
+    c
+}
+
+/// MPS-based matrix multiplication with B transposed: C = A @ B^T
+///
+/// This avoids explicitly transposing B by using MPS's native transpose support.
+/// Useful for linear layers: output = input @ weight^T
+///
+/// Input shapes:
+/// - A: [M, K]
+/// - B: [N, K] (will be transposed to [K, N])
+/// - Output: [M, N]
+pub fn matmul_mps_nt(a: &Tensor, b: &Tensor) -> Tensor {
+    assert_eq!(a.precision(), Precision::FP32, "MPS matmul currently only supports FP32");
+    assert_eq!(b.precision(), Precision::FP32, "MPS matmul currently only supports FP32");
+    assert_eq!(a.shape().len(), 2, "matmul_mps_nt requires 2D tensors");
+    assert_eq!(b.shape().len(), 2, "matmul_mps_nt requires 2D tensors");
+
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+
+    let m = a_shape[0];
+    let k = a_shape[1];
+    // B is [N, K], transposed to [K, N]
+    let n = b_shape[0];
+    let k2 = b_shape[1];
+
+    assert_eq!(k, k2, "Inner dimensions must match: A[{}, {}] @ B[{}, {}]^T", m, k, n, k2);
+
+    let _timer = timed(OpCategory::Matmul, m * n);
+
+    let c = Tensor::zeros(&[m, n], Precision::FP32);
+
+    CommandBatch::sync();
+
+    autoreleasepool(|_| {
+        let ctx = MetalContext::global();
+        let device = ctx.device();
+
+        // Row-major layout
+        let row_bytes_a = k * std::mem::size_of::<f32>();
+        let row_bytes_b = k * std::mem::size_of::<f32>();  // B is [N, K]
+        let row_bytes_c = n * std::mem::size_of::<f32>();
+
+        let desc_a = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                m, k, row_bytes_a, MPSDataType::Float32,
+            )
+        };
+
+        // B descriptor: actual shape [N, K]
+        let desc_b = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                n, k, row_bytes_b, MPSDataType::Float32,
+            )
+        };
+
+        let desc_c = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                m, n, row_bytes_c, MPSDataType::Float32,
+            )
+        };
+
+        let matrix_a = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), a.buffer(), &desc_a)
+        };
+
+        let matrix_b = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), b.buffer(), &desc_b)
+        };
+
+        let matrix_c = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), c.buffer(), &desc_c)
+        };
+
+        // C = A @ B^T: transposeRight = true
+        let kernel = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                device,
+                false,  // don't transpose A
+                true,   // transpose B
+                m,
+                n,
+                k,
+                1.0,
+                0.0,
+            )
+        };
+
+        let command_buffer = ctx.command_queue()
+            .commandBuffer()
+            .expect("Failed to create command buffer for MPS");
+
+        unsafe {
+            kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                &command_buffer,
+                &matrix_a,
+                &matrix_b,
+                &matrix_c,
+            );
+        }
+
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    });
+
+    c
+}
+
+/// MPS-based matrix multiplication with A transposed: C = A^T @ B
+///
+/// This avoids explicitly transposing A by using MPS's native transpose support.
+/// Useful for gradient computations: grad_weight = grad_output^T @ input
+///
+/// Input shapes:
+/// - A: [K, M] (will be transposed to [M, K])
+/// - B: [K, N]
+/// - Output: [M, N]
+pub fn matmul_mps_tn(a: &Tensor, b: &Tensor) -> Tensor {
+    assert_eq!(a.precision(), Precision::FP32, "MPS matmul currently only supports FP32");
+    assert_eq!(b.precision(), Precision::FP32, "MPS matmul currently only supports FP32");
+    assert_eq!(a.shape().len(), 2, "matmul_mps_tn requires 2D tensors");
+    assert_eq!(b.shape().len(), 2, "matmul_mps_tn requires 2D tensors");
+
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+
+    // A is [K, M], transposed to [M, K]
+    let k = a_shape[0];
+    let m = a_shape[1];
+    let k2 = b_shape[0];
+    let n = b_shape[1];
+
+    assert_eq!(k, k2, "Inner dimensions must match: A[{}, {}]^T @ B[{}, {}]", k, m, k2, n);
+
+    let _timer = timed(OpCategory::Matmul, m * n);
+
+    let c = Tensor::zeros(&[m, n], Precision::FP32);
+
+    CommandBatch::sync();
+
+    autoreleasepool(|_| {
+        let ctx = MetalContext::global();
+        let device = ctx.device();
+
+        // Row-major layout
+        let row_bytes_a = m * std::mem::size_of::<f32>();  // A is [K, M]
+        let row_bytes_b = n * std::mem::size_of::<f32>();
+        let row_bytes_c = n * std::mem::size_of::<f32>();
+
+        // A descriptor: actual shape [K, M]
+        let desc_a = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                k, m, row_bytes_a, MPSDataType::Float32,
+            )
+        };
+
+        let desc_b = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                k, n, row_bytes_b, MPSDataType::Float32,
+            )
+        };
+
+        let desc_c = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_rowBytes_dataType(
+                m, n, row_bytes_c, MPSDataType::Float32,
+            )
+        };
+
+        let matrix_a = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), a.buffer(), &desc_a)
+        };
+
+        let matrix_b = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), b.buffer(), &desc_b)
+        };
+
+        let matrix_c = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), c.buffer(), &desc_c)
+        };
+
+        // C = A^T @ B: transposeLeft = true
+        let kernel = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                device,
+                true,   // transpose A
+                false,  // don't transpose B
+                m,
+                n,
+                k,
+                1.0,
+                0.0,
+            )
+        };
+
+        let command_buffer = ctx.command_queue()
+            .commandBuffer()
+            .expect("Failed to create command buffer for MPS");
+
+        unsafe {
+            kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                &command_buffer,
+                &matrix_a,
+                &matrix_b,
+                &matrix_c,
+            );
+        }
+
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    });
 
     c
 }
@@ -167,99 +385,102 @@ fn matmul_mps_batched(a: &Tensor, b: &Tensor) -> Tensor {
     // Need to sync before MPS operations
     CommandBatch::sync();
 
-    let ctx = MetalContext::global();
-    let device = ctx.device();
+    // Wrap MPS operations in autoreleasepool to ensure Objective-C objects are freed
+    autoreleasepool(|_| {
+        let ctx = MetalContext::global();
+        let device = ctx.device();
 
-    // For batched matmul, we need to set up matrix descriptors with matrixBytes
-    let row_bytes_a = k * std::mem::size_of::<f32>();
-    let row_bytes_b = n * std::mem::size_of::<f32>();
-    let row_bytes_c = n * std::mem::size_of::<f32>();
+        // For batched matmul, we need to set up matrix descriptors with matrixBytes
+        let row_bytes_a = k * std::mem::size_of::<f32>();
+        let row_bytes_b = n * std::mem::size_of::<f32>();
+        let row_bytes_c = n * std::mem::size_of::<f32>();
 
-    let matrix_bytes_a = m * row_bytes_a;
-    let matrix_bytes_b = k * row_bytes_b;
-    let matrix_bytes_c = m * row_bytes_c;
+        let matrix_bytes_a = m * row_bytes_a;
+        let matrix_bytes_b = k * row_bytes_b;
+        let matrix_bytes_c = m * row_bytes_c;
 
-    let desc_a = unsafe {
-        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
-            m,
-            k,
-            batch,
-            row_bytes_a,
-            matrix_bytes_a,
-            MPSDataType::Float32,
-        )
-    };
+        let desc_a = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
+                m,
+                k,
+                batch,
+                row_bytes_a,
+                matrix_bytes_a,
+                MPSDataType::Float32,
+            )
+        };
 
-    let desc_b = unsafe {
-        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
-            k,
-            n,
-            batch,
-            row_bytes_b,
-            matrix_bytes_b,
-            MPSDataType::Float32,
-        )
-    };
+        let desc_b = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
+                k,
+                n,
+                batch,
+                row_bytes_b,
+                matrix_bytes_b,
+                MPSDataType::Float32,
+            )
+        };
 
-    let desc_c = unsafe {
-        MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
-            m,
-            n,
-            batch,
-            row_bytes_c,
-            matrix_bytes_c,
-            MPSDataType::Float32,
-        )
-    };
+        let desc_c = unsafe {
+            MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
+                m,
+                n,
+                batch,
+                row_bytes_c,
+                matrix_bytes_c,
+                MPSDataType::Float32,
+            )
+        };
 
-    let matrix_a = unsafe {
-        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), a.buffer(), &desc_a)
-    };
+        let matrix_a = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), a.buffer(), &desc_a)
+        };
 
-    let matrix_b = unsafe {
-        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), b.buffer(), &desc_b)
-    };
+        let matrix_b = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), b.buffer(), &desc_b)
+        };
 
-    let matrix_c = unsafe {
-        MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), c.buffer(), &desc_c)
-    };
+        let matrix_c = unsafe {
+            MPSMatrix::initWithBuffer_descriptor(MPSMatrix::alloc(), c.buffer(), &desc_c)
+        };
 
-    // Create kernel - MPS handles batching automatically based on descriptor
-    let kernel = unsafe {
-        MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
-            MPSMatrixMultiplication::alloc(),
-            device,
-            false,
-            false,
-            m,
-            n,
-            k,
-            1.0,
-            0.0,
-        )
-    };
+        // Create kernel - MPS handles batching automatically based on descriptor
+        let kernel = unsafe {
+            MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(),
+                device,
+                false,
+                false,
+                m,
+                n,
+                k,
+                1.0,
+                0.0,
+            )
+        };
 
-    // Set batch parameters
-    unsafe {
-        kernel.setBatchStart(0);
-        kernel.setBatchSize(batch);
-    }
+        // Set batch parameters
+        unsafe {
+            kernel.setBatchStart(0);
+            kernel.setBatchSize(batch);
+        }
 
-    let command_buffer = ctx.command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer for MPS");
+        let command_buffer = ctx.command_queue()
+            .commandBuffer()
+            .expect("Failed to create command buffer for MPS");
 
-    unsafe {
-        kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
-            &command_buffer,
-            &matrix_a,
-            &matrix_b,
-            &matrix_c,
-        );
-    }
+        unsafe {
+            kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                &command_buffer,
+                &matrix_a,
+                &matrix_b,
+                &matrix_c,
+            );
+        }
 
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    });
 
     c
 }

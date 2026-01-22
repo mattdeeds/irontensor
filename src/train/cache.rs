@@ -22,8 +22,6 @@ pub(crate) struct LayerCache {
     pub k_for_attn: Tensor,
     /// V transposed for attention (expanded if GQA) [batch, heads, seq, head_dim]
     pub v_for_attn: Tensor,
-    /// Attention weights after softmax [batch, heads, seq, seq]
-    pub attn_weights: Tensor,
     /// Attention output before wo [batch*seq, hidden]
     pub attn_out_pre_wo: Tensor,
     /// After attention + residual [batch, seq, hidden]

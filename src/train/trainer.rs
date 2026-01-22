@@ -5,8 +5,8 @@ use crate::command_batch::CommandBatch;
 use crate::data::{DatasetIterator, TokenDataset};
 use crate::nn::{GPTModel, GPTModelState, ModelConfig};
 use crate::ops::{
-    add, cross_entropy_fused, embedding, embedding_backward, matmul, rmsnorm, rmsnorm_backward,
-    rope, rope_backward, swiglu, swiglu_backward, transpose_2d, transpose_for_attention,
+    add, cross_entropy_fused, embedding, embedding_backward, flash_attention, matmul, rmsnorm,
+    rmsnorm_backward, rope, rope_backward, swiglu, swiglu_backward, transpose_for_attention,
     transpose_for_attention_backward, transpose_from_attention,
 };
 use crate::optim::{Lion, LionConfig};
@@ -18,9 +18,8 @@ use super::callbacks::TrainCallback;
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::{TrainMetrics, TrainingConfig};
 use super::helpers::{
-    add_tensors, apply_causal_mask_3d, attention_backward, compute_total_grad_norm,
-    linear_backward, linear_forward, repeat_kv, repeat_kv_backward, scale_tensor,
-    transpose_last_two_dims_3d,
+    add_tensors, attention_backward_recompute, compute_total_grad_norm, linear_backward,
+    linear_forward, repeat_kv, repeat_kv_backward, scale_tensor,
 };
 use super::scheduler::{CosineAnnealingLR, LRScheduler};
 
@@ -397,43 +396,16 @@ impl Trainer {
         let k_t = transpose_for_attention(&k_expanded);
         let v_t = transpose_for_attention(&v_expanded);
 
-        // Compute attention step-by-step for caching
+        // Cache Q, K, V for backward pass (recomputing attention backward)
         // q_t, k_t, v_t: [batch, heads, seq, head_dim]
         let q_for_attn = q_t.clone();
         let k_for_attn = k_t.clone();
         let v_for_attn = v_t.clone();
 
-        // Compute Q @ K^T: need K transposed on last two dims
-        // Reshape to 3D for batched matmul: [batch*heads, seq, head_dim]
-        let batch_heads = batch_size * num_heads;
-        let q_flat = q_t.view(&[batch_heads, seq_len, head_dim]);
-        let k_flat = k_t.view(&[batch_heads, seq_len, head_dim]);
-        let v_flat = v_t.view(&[batch_heads, seq_len, head_dim]);
-
-        // Transpose K for matmul: [batch*heads, head_dim, seq]
-        let k_t_for_scores = transpose_last_two_dims_3d(&k_flat, batch_heads, seq_len, head_dim);
-
-        // scores = Q @ K^T: [batch*heads, seq, seq]
-        let scores_flat = matmul(&q_flat, &k_t_for_scores);
-
-        // Scale by 1/sqrt(d_k)
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let scores_scaled = crate::ops::scale(&scores_flat, scale);
-
-        // Apply causal mask
-        let scores_masked = apply_causal_mask_3d(&scores_scaled, batch_heads, seq_len);
-
-        // Softmax over last dimension
-        let attn_weights_flat = crate::ops::softmax(&scores_masked);
-
-        // Reshape to 4D for caching: [batch, heads, seq, seq]
-        let attn_weights = attn_weights_flat.view(&[batch_size, num_heads, seq_len, seq_len]);
-
-        // Compute attn_weights @ V: [batch*heads, seq, head_dim]
-        let attn_out_flat = matmul(&attn_weights_flat, &v_flat);
-
-        // Reshape to 4D: [batch, heads, seq, head_dim]
-        let attn_out_4d = attn_out_flat.view(&[batch_size, num_heads, seq_len, head_dim]);
+        // Use FlashAttention for fused, memory-efficient attention
+        // FlashAttention computes: softmax(Q @ K^T / sqrt(d) + causal_mask) @ V
+        // Input/output: [batch, heads, seq, head_dim]
+        let attn_out_4d = flash_attention(&q_t, &k_t, &v_t, true);
 
         // Transpose back: [batch, seq, heads, head_dim]
         let attn_out = transpose_from_attention(&attn_out_4d, batch_size, seq_len, num_heads, head_dim);
@@ -476,7 +448,6 @@ impl Trainer {
             q_for_attn,
             k_for_attn,
             v_for_attn,
-            attn_weights,
             attn_out_pre_wo,
             post_attn,
             normed_ffn,
@@ -558,13 +529,13 @@ impl Trainer {
         // Transpose to attention layout: [batch, heads, seq, head_dim]
         let grad_attn_transposed = transpose_for_attention(&grad_attn_4d);
 
-        // Call proper attention backward to get grad_Q, grad_K, grad_V
-        let (grad_q_attn, grad_k_attn, grad_v_attn) = attention_backward(
+        // Call attention backward (recomputes attention weights from Q, K, V)
+        // This trades compute for memory - no need to cache O(seq^2) attention weights
+        let (grad_q_attn, grad_k_attn, grad_v_attn) = attention_backward_recompute(
             &grad_attn_transposed,
             &cache.q_for_attn,
             &cache.k_for_attn,
             &cache.v_for_attn,
-            &cache.attn_weights,
         );
 
         // Transpose gradients back: [batch, heads, seq, head_dim] -> [batch, seq, heads, head_dim]
@@ -635,8 +606,8 @@ impl Trainer {
     fn compute_logits_from_hidden(&self, hidden: &Tensor) -> Tensor {
         // hidden: [n, hidden_dim], embed: [vocab, hidden_dim]
         // logits = hidden @ embed.T = [n, vocab]
-        let embed_t = transpose_2d(&self.model.embed_tokens);
-        matmul(hidden, &embed_t)
+        // Use MPS's native transpose support
+        crate::ops::matmul_mps_nt(hidden, &self.model.embed_tokens)
     }
 
     /// Get hidden states before final norm (from last layer cache)
@@ -809,9 +780,10 @@ impl Trainer {
 }
 
 /// Matrix multiply with first operand transposed: A.T @ B
+///
+/// Uses MPS's native transpose support to avoid explicit transposition.
 fn matmul_tn(a: &Tensor, b: &Tensor) -> Tensor {
-    let a_t = transpose_2d(a);
-    matmul(&a_t, b)
+    crate::ops::matmul_mps_tn(a, b)
 }
 
 #[cfg(test)]

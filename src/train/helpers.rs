@@ -1,4 +1,4 @@
-use crate::ops::{matmul, softmax_backward, transpose_2d};
+use crate::ops::{matmul, matmul_mps_nt, matmul_mps_tn, softmax, softmax_backward};
 use crate::tensor::Tensor;
 
 /// Scale tensor by a scalar
@@ -36,10 +36,12 @@ pub(crate) fn compute_total_grad_norm(grads: &[&Tensor]) -> f32 {
 }
 
 /// Linear forward: output = input @ weight.T
+///
+/// Uses MPS's native transpose support to avoid explicit transposition.
 pub(crate) fn linear_forward(input: &Tensor, weight: &Tensor) -> Tensor {
-    // weight: [out, in], need [in, out] for matmul
-    let weight_t = transpose_2d(weight);
-    matmul(input, &weight_t)
+    // weight: [out, in], we want input @ weight.T
+    // matmul_mps_nt handles the transpose natively
+    matmul_mps_nt(input, weight)
 }
 
 /// Linear backward: grad_input = grad_output @ weight, grad_weight = grad_output.T @ input
@@ -58,9 +60,10 @@ pub(crate) fn linear_backward(
 }
 
 /// Matrix multiply with first operand transposed: A.T @ B
+///
+/// Uses MPS's native transpose support to avoid explicit transposition.
 pub(crate) fn matmul_tn(a: &Tensor, b: &Tensor) -> Tensor {
-    let a_t = transpose_2d(a);
-    matmul(&a_t, b)
+    matmul_mps_tn(a, b)
 }
 
 /// Repeat KV heads for GQA (Grouped Query Attention)
@@ -136,34 +139,23 @@ pub(crate) fn apply_causal_mask_3d(scores: &Tensor, batch: usize, seq_len: usize
     Tensor::from_f32_slice(&output, &[batch, seq_len, seq_len])
 }
 
-/// Attention backward pass
+/// Attention backward pass that recomputes attention weights from Q, K, V
 ///
-/// Forward:
-///   S = Q @ K^T / sqrt(d)
-///   P = softmax(S)  (with causal mask applied before softmax)
-///   O = P @ V
+/// This version doesn't require cached attention weights, instead recomputing them
+/// during backward. Trades compute for memory - useful with FlashAttention forward.
 ///
-/// Backward:
-///   grad_V = P^T @ grad_O
-///   grad_P = grad_O @ V^T
-///   grad_S = softmax_backward(grad_P, P)
-///   grad_Q = grad_S @ K / sqrt(d)
-///   grad_K = grad_S^T @ Q / sqrt(d)
-///
-/// Inputs:
+/// Input shapes:
 ///   - grad_output: [batch, heads, seq, head_dim]
 ///   - q: [batch, heads, seq, head_dim]
 ///   - k: [batch, heads, seq, head_dim]
 ///   - v: [batch, heads, seq, head_dim]
-///   - attn_weights: [batch, heads, seq, seq] (softmax output P)
 ///
 /// Returns: (grad_Q, grad_K, grad_V) all with shape [batch, heads, seq, head_dim]
-pub(crate) fn attention_backward(
+pub(crate) fn attention_backward_recompute(
     grad_output: &Tensor,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    attn_weights: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
     let q_shape = q.shape();
     let batch = q_shape[0];
@@ -174,52 +166,50 @@ pub(crate) fn attention_backward(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     // Reshape to 3D for batched matmul: [batch*heads, seq, dim]
-    let grad_o_flat = grad_output.view(&[batch_heads, seq_len, head_dim]);
     let q_flat = q.view(&[batch_heads, seq_len, head_dim]);
     let k_flat = k.view(&[batch_heads, seq_len, head_dim]);
     let v_flat = v.view(&[batch_heads, seq_len, head_dim]);
-    let p_flat = attn_weights.view(&[batch_heads, seq_len, seq_len]);
+    let grad_o_flat = grad_output.view(&[batch_heads, seq_len, head_dim]);
 
+    // Recompute attention weights: P = softmax(causal_mask(Q @ K^T / sqrt(d)))
+    // K^T: [batch*heads, head_dim, seq]
+    let k_t = transpose_last_two_dims_3d(&k_flat, batch_heads, seq_len, head_dim);
+
+    // scores = Q @ K^T: [batch*heads, seq, seq]
+    let scores = matmul(&q_flat, &k_t);
+
+    // Scale and apply causal mask
+    let scores_scaled = scale_tensor(&scores, scale);
+    let scores_masked = apply_causal_mask_3d(&scores_scaled, batch_heads, seq_len);
+
+    // Softmax to get attention weights
+    let p_flat = softmax(&scores_masked);
+
+    // Now compute gradients using the recomputed P
     // grad_V = P^T @ grad_O
-    // P: [batch*heads, seq, seq], grad_O: [batch*heads, seq, head_dim]
-    // P^T: [batch*heads, seq, seq]
     let p_t = transpose_last_two_dims_3d(&p_flat, batch_heads, seq_len, seq_len);
     let grad_v_flat = matmul(&p_t, &grad_o_flat);
 
     // grad_P = grad_O @ V^T
-    // grad_O: [batch*heads, seq, head_dim], V: [batch*heads, seq, head_dim]
-    // V^T: [batch*heads, head_dim, seq]
     let v_t = transpose_last_two_dims_3d(&v_flat, batch_heads, seq_len, head_dim);
     let grad_p_flat = matmul(&grad_o_flat, &v_t);
 
     // grad_S = softmax_backward(grad_P, P)
-    // Both are [batch*heads, seq, seq]
     let grad_s_flat = softmax_backward(&grad_p_flat, &p_flat);
 
     // grad_Q = grad_S @ K / sqrt(d)
-    // grad_S: [batch*heads, seq, seq], K: [batch*heads, seq, head_dim]
     let grad_q_unscaled = matmul(&grad_s_flat, &k_flat);
     let grad_q_flat = scale_tensor(&grad_q_unscaled, scale);
 
     // grad_K = grad_S^T @ Q / sqrt(d)
-    // grad_S^T: [batch*heads, seq, seq], Q: [batch*heads, seq, head_dim]
     let grad_s_t = transpose_last_two_dims_3d(&grad_s_flat, batch_heads, seq_len, seq_len);
     let grad_k_unscaled = matmul(&grad_s_t, &q_flat);
     let grad_k_flat = scale_tensor(&grad_k_unscaled, scale);
 
     // Reshape back to 4D
-    let grad_q = Tensor::from_f32_slice(
-        grad_q_flat.as_f32_slice(),
-        &[batch, heads, seq_len, head_dim],
-    );
-    let grad_k = Tensor::from_f32_slice(
-        grad_k_flat.as_f32_slice(),
-        &[batch, heads, seq_len, head_dim],
-    );
-    let grad_v = Tensor::from_f32_slice(
-        grad_v_flat.as_f32_slice(),
-        &[batch, heads, seq_len, head_dim],
-    );
+    let grad_q = grad_q_flat.view(&[batch, heads, seq_len, head_dim]);
+    let grad_k = grad_k_flat.view(&[batch, heads, seq_len, head_dim]);
+    let grad_v = grad_v_flat.view(&[batch, heads, seq_len, head_dim]);
 
     (grad_q, grad_k, grad_v)
 }

@@ -29,7 +29,7 @@ pub use embedding::embedding;
 pub use flash_attention::flash_attention;
 pub use fused_linear_cross_entropy::{fused_linear_cross_entropy, fused_linear_cross_entropy_forward_only};
 pub use gemm::matmul;
-pub use mps_gemm::matmul_mps;
+pub use mps_gemm::{matmul_mps, matmul_mps_nt, matmul_mps_tn};
 pub use norm::rmsnorm;
 pub use rope::{rope, rope_default};
 pub use softmax::softmax;
