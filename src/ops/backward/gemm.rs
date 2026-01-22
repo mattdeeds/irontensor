@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -182,16 +183,9 @@ fn compute_grad_a_2d(grad_c: &Tensor, b: &Tensor, m: usize, n: usize, k: usize) 
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.grad_a);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_c.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(grad_a.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-    }
+    let grad_c_buf = grad_c.buffer();
+    let b_buf = b.buffer();
+    let grad_a_buf = grad_a.buffer();
 
     let grid_size = MTLSize { width: k, height: m, depth: 1 };
     let thread_width = pipelines.grad_a.threadExecutionWidth();
@@ -201,11 +195,18 @@ fn compute_grad_a_2d(grad_c: &Tensor, b: &Tensor, m: usize, n: usize, k: usize) 
         height: (max_threads / thread_width).min(m).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.grad_a,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_c_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_a_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_a
 }
@@ -230,16 +231,9 @@ fn compute_grad_b_2d(grad_c: &Tensor, a: &Tensor, m: usize, n: usize, k: usize) 
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.grad_b);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(grad_c.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(grad_b.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-    }
+    let a_buf = a.buffer();
+    let grad_c_buf = grad_c.buffer();
+    let grad_b_buf = grad_b.buffer();
 
     let grid_size = MTLSize { width: n, height: k, depth: 1 };
     let thread_width = pipelines.grad_b.threadExecutionWidth();
@@ -249,11 +243,18 @@ fn compute_grad_b_2d(grad_c: &Tensor, a: &Tensor, m: usize, n: usize, k: usize) 
         height: (max_threads / thread_width).min(k).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.grad_b,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(grad_c_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_b_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_b
 }
@@ -308,17 +309,9 @@ fn compute_grad_a_batched(grad_c: &Tensor, b: &Tensor, batch: usize, m: usize, n
     }
     .expect("Failed to create batch buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.batched_grad_a);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_c.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(grad_a.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 4);
-    }
+    let grad_c_buf = grad_c.buffer();
+    let b_buf = b.buffer();
+    let grad_a_buf = grad_a.buffer();
 
     let grid_size = MTLSize { width: k, height: m, depth: batch };
     let thread_width = pipelines.batched_grad_a.threadExecutionWidth();
@@ -328,11 +321,19 @@ fn compute_grad_a_batched(grad_c: &Tensor, b: &Tensor, batch: usize, m: usize, n
         height: (max_threads / thread_width).min(m).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.batched_grad_a,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_c_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_a_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 4);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_a
 }
@@ -367,17 +368,9 @@ fn compute_grad_b_batched(grad_c: &Tensor, a: &Tensor, batch: usize, m: usize, n
     }
     .expect("Failed to create batch buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.batched_grad_b);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(grad_c.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(grad_b.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 4);
-    }
+    let a_buf = a.buffer();
+    let grad_c_buf = grad_c.buffer();
+    let grad_b_buf = grad_b.buffer();
 
     let grid_size = MTLSize { width: n, height: k, depth: batch };
     let thread_width = pipelines.batched_grad_b.threadExecutionWidth();
@@ -387,11 +380,19 @@ fn compute_grad_b_batched(grad_c: &Tensor, a: &Tensor, batch: usize, m: usize, n
         height: (max_threads / thread_width).min(k).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.batched_grad_b,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(grad_c_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_b_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 4);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_b
 }
@@ -418,15 +419,15 @@ fn matmul_backward_4d(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tenso
     // Collapse first two dims into one batch dimension
     let new_batch = batch1 * batch2;
 
-    let a_3d = Tensor::from_f32_slice(a.as_f32_slice(), &[new_batch, m, k]);
-    let b_3d = Tensor::from_f32_slice(b.as_f32_slice(), &[new_batch, k, n]);
-    let gc_3d = Tensor::from_f32_slice(grad_c.as_f32_slice(), &[new_batch, m, n]);
+    let a_3d = a.view(&[new_batch, m, k]);
+    let b_3d = b.view(&[new_batch, k, n]);
+    let gc_3d = grad_c.view(&[new_batch, m, n]);
 
     let (ga_3d, gb_3d) = matmul_backward_batched(&gc_3d, &a_3d, &b_3d);
 
     // Reshape back to 4D
-    let grad_a = Tensor::from_f32_slice(ga_3d.as_f32_slice(), a_shape);
-    let grad_b = Tensor::from_f32_slice(gb_3d.as_f32_slice(), b_shape);
+    let grad_a = ga_3d.view(a_shape);
+    let grad_b = gb_3d.view(b_shape);
 
     (grad_a, grad_b)
 }

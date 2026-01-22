@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -94,15 +95,8 @@ fn transpose_to_attention_layout(input: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.transpose_qkv);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-    }
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
 
     let grid_size = MTLSize {
         width: head_dim,
@@ -116,11 +110,17 @@ fn transpose_to_attention_layout(input: &Tensor) -> Tensor {
         height: (max_threads / thread_width).min(seq_len).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.transpose_qkv,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }
@@ -160,15 +160,8 @@ fn transpose_from_attention_layout(input: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.transpose_output);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-    }
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
 
     let grid_size = MTLSize {
         width: head_dim,
@@ -182,11 +175,17 @@ fn transpose_from_attention_layout(input: &Tensor) -> Tensor {
         height: (max_threads / thread_width).min(seq_len).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.transpose_output,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }
@@ -234,14 +233,7 @@ fn apply_causal_mask(scores: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.causal_mask);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 1);
-    }
+    let output_buf = output.buffer();
 
     let grid_size = MTLSize {
         width: seq_len,
@@ -255,11 +247,16 @@ fn apply_causal_mask(scores: &Tensor) -> Tensor {
         height: (max_threads / thread_width).min(seq_len).max(1),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.causal_mask,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 1);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }

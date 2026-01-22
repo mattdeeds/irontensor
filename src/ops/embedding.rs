@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -108,16 +109,8 @@ pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.embedding);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(weights.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&indices_buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-    }
+    let weights_buf = weights.buffer();
+    let output_buf = output.buffer();
 
     let grid_size = MTLSize {
         width: embed_dim,
@@ -131,11 +124,18 @@ pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
         height: (max_threads / thread_width).min(num_indices),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.embedding,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&indices_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }

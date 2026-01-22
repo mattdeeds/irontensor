@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -91,19 +92,12 @@ pub fn softmax(input: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
     let use_fast = dim >= SOFTMAX_THREADS;
 
-    if use_fast {
-        encoder.setComputePipelineState(&pipelines.softmax_fast);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-        }
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
 
+    if use_fast {
         let threadgroup_count = MTLSize {
             width: batch_seq,
             height: 1,
@@ -114,15 +108,18 @@ pub fn softmax(input: &Tensor) -> Tensor {
             height: 1,
             depth: 1,
         };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroup_count, threadgroup_size);
-    } else {
-        encoder.setComputePipelineState(&pipelines.softmax);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-        }
 
+        CommandBatch::dispatch_threadgroups(
+            &pipelines.softmax_fast,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+            },
+            threadgroup_count,
+            threadgroup_size,
+        );
+    } else {
         let grid_size = MTLSize {
             width: batch_seq,
             height: 1,
@@ -134,12 +131,18 @@ pub fn softmax(input: &Tensor) -> Tensor {
             height: 1,
             depth: 1,
         };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-    }
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+        CommandBatch::dispatch(
+            &pipelines.softmax,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+            },
+            grid_size,
+            threadgroup_size,
+        );
+    }
 
     output
 }

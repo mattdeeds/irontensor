@@ -160,6 +160,27 @@ impl Tensor {
         self.shape = new_shape.to_vec();
     }
 
+    /// Create a view of the tensor with a different shape (zero-copy).
+    ///
+    /// The returned tensor shares the same underlying buffer.
+    /// This is safe because the buffer is reference-counted.
+    pub fn view(&self, new_shape: &[usize]) -> Self {
+        let new_numel: usize = new_shape.iter().product();
+        assert_eq!(
+            self.numel(),
+            new_numel,
+            "Cannot view tensor of {} elements as shape {:?} ({} elements)",
+            self.numel(),
+            new_shape,
+            new_numel
+        );
+        Self {
+            buffer: self.buffer.clone(),
+            shape: new_shape.to_vec(),
+            precision: self.precision,
+        }
+    }
+
     // =========================================================================
     // BF16 Support
     // =========================================================================

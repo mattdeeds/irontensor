@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -86,35 +87,34 @@ pub fn rmsnorm_backward(
     let pipelines = get_pipelines();
 
     // First, zero the grad_gamma buffer (it will be accumulated with atomics)
-    {
-        let count_u32: u32 = hidden_dim as u32;
-        let count_buffer = unsafe {
-            ctx.device().newBufferWithBytes_length_options(
-                NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-                std::mem::size_of::<u32>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("Failed to create count buffer");
-
-        let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-        let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-        encoder.setComputePipelineState(&pipelines.zero_buffer);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_gamma.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 1);
-        }
-
-        let thread_width = pipelines.zero_buffer.threadExecutionWidth();
-        let grid_size = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: thread_width.min(hidden_dim), height: 1, depth: 1 };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
+    let count_u32: u32 = hidden_dim as u32;
+    let count_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
     }
+    .expect("Failed to create count buffer");
+
+    let grad_gamma_buf = grad_gamma.buffer();
+
+    let thread_width = pipelines.zero_buffer.threadExecutionWidth();
+    let grid_size = MTLSize { width: hidden_dim, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: thread_width.min(hidden_dim), height: 1, depth: 1 };
+
+    CommandBatch::dispatch(
+        &pipelines.zero_buffer,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_gamma_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 1);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    // Sync before backward pass (depends on zeroed grad_gamma)
+    CommandBatch::sync();
 
     // Now compute the backward pass
     let params = RMSNormParams {
@@ -131,28 +131,29 @@ pub fn rmsnorm_backward(
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.rmsnorm_backward);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_output.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(gamma.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(grad_input.buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(grad_gamma.buffer()), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 5);
-    }
+    let grad_output_buf = grad_output.buffer();
+    let input_buf = input.buffer();
+    let gamma_buf = gamma.buffer();
+    let grad_input_buf = grad_input.buffer();
 
     // One thread per row
     let thread_width = pipelines.rmsnorm_backward.threadExecutionWidth();
     let grid_size = MTLSize { width: batch_seq, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(batch_seq), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.rmsnorm_backward,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(gamma_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_gamma_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 5);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     (grad_input, grad_gamma)
 }

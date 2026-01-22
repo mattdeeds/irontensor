@@ -1,3 +1,4 @@
+pub mod command_batch;
 pub mod data;
 pub mod device;
 pub mod nn;
@@ -40,3 +41,4 @@ pub use train::{
 pub use profile::{
     OpCategory, Phase, ProfileReport, Profiler, ProfilerConfig,
 };
+pub use command_batch::CommandBatch;

@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -107,58 +108,57 @@ pub fn cross_entropy(logits: &Tensor, targets: &[u32]) -> (f32, Tensor) {
     .expect("Failed to create params buffer");
 
     // Forward pass
-    {
-        let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-        let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
+    let logits_buf = logits.buffer();
+    let losses_buf = losses.buffer();
 
-        encoder.setComputePipelineState(&pipelines.cross_entropy_forward);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(logits.buffer()), 0, 0);
+    let thread_width = pipelines.cross_entropy_forward.threadExecutionWidth();
+    let grid_size = MTLSize { width: batch_size, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: thread_width.min(batch_size), height: 1, depth: 1 };
+
+    CommandBatch::dispatch(
+        &pipelines.cross_entropy_forward,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(logits_buf), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(losses.buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        }
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
-        let thread_width = pipelines.cross_entropy_forward.threadExecutionWidth();
-        let grid_size = MTLSize { width: batch_size, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: thread_width.min(batch_size), height: 1, depth: 1 };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-    }
+    // Sync before reduce (depends on losses being computed)
+    CommandBatch::sync();
 
     // Reduce to mean
-    {
-        let count_u32: u32 = batch_size as u32;
-        let count_buffer = unsafe {
-            ctx.device().newBufferWithBytes_length_options(
-                NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-                std::mem::size_of::<u32>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("Failed to create count buffer");
-
-        let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-        let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-        encoder.setComputePipelineState(&pipelines.reduce_mean);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(losses.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(mean_loss.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-        }
-
-        let grid_size = MTLSize { width: 1, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: 1, height: 1, depth: 1 };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
+    let count_u32: u32 = batch_size as u32;
+    let count_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
     }
+    .expect("Failed to create count buffer");
+
+    let mean_loss_buf = mean_loss.buffer();
+
+    let grid_size = MTLSize { width: 1, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: 1, height: 1, depth: 1 };
+
+    CommandBatch::dispatch(
+        &pipelines.reduce_mean,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(mean_loss_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    // Sync before reading result
+    CommandBatch::sync();
 
     let mean = mean_loss.as_f32_slice()[0];
     (mean, losses)
@@ -220,26 +220,25 @@ pub fn cross_entropy_backward(logits: &Tensor, targets: &[u32]) -> Tensor {
     }
     .expect("Failed to create grad_scale buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.cross_entropy_backward);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(logits.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(grad_logits.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&grad_scale_buffer), 0, 4);
-    }
+    let logits_buf = logits.buffer();
+    let grad_logits_buf = grad_logits.buffer();
 
     let thread_width = pipelines.cross_entropy_backward.threadExecutionWidth();
     let grid_size = MTLSize { width: batch_size, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(batch_size), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.cross_entropy_backward,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(logits_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_logits_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&grad_scale_buffer), 0, 4);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_logits
 }
@@ -302,60 +301,60 @@ pub fn cross_entropy_fused(logits: &Tensor, targets: &[u32]) -> (f32, Tensor, Te
     .expect("Failed to create grad_scale buffer");
 
     // Fused forward + backward
-    {
-        let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-        let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
+    let logits_buf = logits.buffer();
+    let losses_buf = losses.buffer();
+    let grad_logits_buf = grad_logits.buffer();
 
-        encoder.setComputePipelineState(&pipelines.cross_entropy_fused);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(logits.buffer()), 0, 0);
+    let thread_width = pipelines.cross_entropy_fused.threadExecutionWidth();
+    let grid_size = MTLSize { width: batch_size, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: thread_width.min(batch_size), height: 1, depth: 1 };
+
+    CommandBatch::dispatch(
+        &pipelines.cross_entropy_fused,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(logits_buf), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(losses.buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(grad_logits.buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_logits_buf), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
             encoder.setBuffer_offset_atIndex(Some(&grad_scale_buffer), 0, 5);
-        }
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
-        let thread_width = pipelines.cross_entropy_fused.threadExecutionWidth();
-        let grid_size = MTLSize { width: batch_size, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: thread_width.min(batch_size), height: 1, depth: 1 };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-    }
+    // Sync before reduce (depends on losses being computed)
+    CommandBatch::sync();
 
     // Reduce to mean
-    {
-        let count_u32: u32 = batch_size as u32;
-        let count_buffer = unsafe {
-            ctx.device().newBufferWithBytes_length_options(
-                NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-                std::mem::size_of::<u32>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("Failed to create count buffer");
-
-        let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-        let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-        encoder.setComputePipelineState(&pipelines.reduce_mean);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(losses.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(mean_loss.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-        }
-
-        let grid_size = MTLSize { width: 1, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: 1, height: 1, depth: 1 };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
+    let count_u32: u32 = batch_size as u32;
+    let count_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
     }
+    .expect("Failed to create count buffer");
+
+    let mean_loss_buf = mean_loss.buffer();
+
+    let grid_size = MTLSize { width: 1, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: 1, height: 1, depth: 1 };
+
+    CommandBatch::dispatch(
+        &pipelines.reduce_mean,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(mean_loss_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    // Sync before reading result
+    CommandBatch::sync();
 
     let mean = mean_loss.as_f32_slice()[0];
     (mean, losses, grad_logits)

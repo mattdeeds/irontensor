@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -83,27 +84,29 @@ pub fn mul_backward(grad_output: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Te
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.mul_backward);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_output.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(a.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(b.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(grad_a.buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(grad_b.buffer()), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 5);
-    }
+    let grad_output_buf = grad_output.buffer();
+    let a_buf = a.buffer();
+    let b_buf = b.buffer();
+    let grad_a_buf = grad_a.buffer();
+    let grad_b_buf = grad_b.buffer();
 
     let thread_width = pipelines.mul_backward.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.mul_backward,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_a_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_b_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 5);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     (grad_a, grad_b)
 }
@@ -138,25 +141,24 @@ pub fn scale_backward(grad_output: &Tensor, scalar: f32) -> Tensor {
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.scale_backward);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_output.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(grad_input.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&scalar_buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
-    }
+    let grad_output_buf = grad_output.buffer();
+    let grad_input_buf = grad_input.buffer();
 
     let thread_width = pipelines.scale_backward.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.scale_backward,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&scalar_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_input
 }
@@ -185,25 +187,25 @@ fn dispatch_unary_backward(
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_output.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(grad_input.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
-    }
+    let grad_output_buf = grad_output.buffer();
+    let input_buf = input.buffer();
+    let grad_input_buf = grad_input.buffer();
 
     let thread_width = pipeline.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     grad_input
 }
@@ -253,27 +255,29 @@ pub fn swiglu_backward(grad_output: &Tensor, gate: &Tensor, up: &Tensor) -> (Ten
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.swiglu_backward);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(grad_output.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(gate.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(up.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(grad_gate.buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(grad_up.buffer()), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 5);
-    }
+    let grad_output_buf = grad_output.buffer();
+    let gate_buf = gate.buffer();
+    let up_buf = up.buffer();
+    let grad_gate_buf = grad_gate.buffer();
+    let grad_up_buf = grad_up.buffer();
 
     let thread_width = pipelines.swiglu_backward.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.swiglu_backward,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_gate_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_up_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 5);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     (grad_gate, grad_up)
 }

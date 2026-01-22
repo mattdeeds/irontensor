@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::command_batch::CommandBatch;
 use crate::data::{DatasetIterator, TokenDataset};
 use crate::nn::{GPTModel, GPTModelState, ModelConfig};
 use crate::ops::{
@@ -122,10 +123,7 @@ impl Trainer {
         let logits = self.model.forward(input_ids, batch_size, seq_len, 0);
 
         // Reshape logits to [batch_size * seq_len, vocab_size]
-        let logits_2d = {
-            let data = logits.as_f32_slice();
-            Tensor::from_f32_slice(data, &[batch_size * seq_len, self.model.config.vocab_size])
-        };
+        let logits_2d = logits.view(&[batch_size * seq_len, self.model.config.vocab_size]);
 
         let (loss, _, _) = cross_entropy_fused(&logits_2d, target_ids);
         loss
@@ -139,6 +137,9 @@ impl Trainer {
         batch_size: usize,
         seq_len: usize,
     ) -> (f32, f32) {
+        // Enable command buffer batching for reduced GPU synchronization
+        CommandBatch::begin();
+
         Profiler::begin_step();
 
         let lr = self.scheduler.get_lr(self.step);
@@ -154,9 +155,12 @@ impl Trainer {
 
         // Compute logits: final_hidden @ embed_tokens.T
         let logits = self.compute_logits_from_hidden(&cache.final_hidden);
-        let logits_2d = Tensor::from_f32_slice(logits.as_f32_slice(), &[n, vocab_size]);
 
-        // Compute loss and gradient w.r.t. logits
+        // Sync before operations that need completed results
+        CommandBatch::sync();
+        let logits_2d = logits.view(&[n, vocab_size]);
+
+        // Compute loss and gradient w.r.t. logits (has internal syncs for loss read)
         let (loss, _, grad_logits) = cross_entropy_fused(&logits_2d, target_ids);
 
         // ========== Backward pass ==========
@@ -171,10 +175,7 @@ impl Trainer {
         let grad_hidden_2d = matmul(&grad_logits, &self.model.embed_tokens);
         // Reshape to 3D for norm backward
         let hidden_dim = self.model.config.hidden_dim;
-        let grad_hidden_3d = Tensor::from_f32_slice(
-            grad_hidden_2d.as_f32_slice(),
-            &[batch_size, seq_len, hidden_dim],
-        );
+        let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
 
         // Backward through final norm
         let (grad_pre_norm, grad_final_norm) = rmsnorm_backward(
@@ -200,8 +201,7 @@ impl Trainer {
 
         // Backward through embedding lookup
         // Reshape grad_hidden to 2D for embedding_backward
-        let grad_hidden_2d_for_embed =
-            Tensor::from_f32_slice(grad_hidden.as_f32_slice(), &[n, hidden_dim]);
+        let grad_hidden_2d_for_embed = grad_hidden.view(&[n, hidden_dim]);
         let grad_embed_in = embedding_backward(&grad_hidden_2d_for_embed, input_ids, vocab_size);
 
         // Sum embedding gradients (input + output if tied)
@@ -212,6 +212,9 @@ impl Trainer {
         };
 
         // ========== Compute gradient norm and clip ==========
+        // Sync before computing gradient norms (need to read gradient data)
+        CommandBatch::sync();
+
         let mut all_grads: Vec<&Tensor> = vec![&grad_embed, &grad_final_norm];
         for grads in &layer_grads {
             all_grads.push(&grads.grad_attn_norm);
@@ -295,6 +298,10 @@ impl Trainer {
         }
 
         self.step += 1;
+
+        // End command batching (commits and waits for all optimizer steps)
+        CommandBatch::end();
+
         Profiler::end_step();
         (loss, total_grad_norm)
     }
@@ -311,10 +318,7 @@ impl Trainer {
 
         // Embedding lookup
         let embedded = embedding(&self.model.embed_tokens, input_ids);
-        let mut hidden = Tensor::from_f32_slice(
-            embedded.as_f32_slice(),
-            &[batch_size, seq_len, hidden_dim],
-        );
+        let mut hidden = embedded.view(&[batch_size, seq_len, hidden_dim]);
 
         // Process each transformer layer
         let mut layer_caches = Vec::new();
@@ -332,8 +336,7 @@ impl Trainer {
 
         // Final norm
         let final_hidden = rmsnorm(&hidden, &self.model.final_norm, self.model.config.norm_eps);
-        let final_hidden_2d =
-            Tensor::from_f32_slice(final_hidden.as_f32_slice(), &[n, hidden_dim]);
+        let final_hidden_2d = final_hidden.view(&[n, hidden_dim]);
 
         ForwardCache {
             embedded,
@@ -365,24 +368,15 @@ impl Trainer {
         let normed_attn = rmsnorm(x, &layer.attn_norm, layer.norm_eps);
 
         // Q, K, V projections
-        let normed_2d = Tensor::from_f32_slice(normed_attn.as_f32_slice(), &[n, hidden_dim]);
+        let normed_2d = normed_attn.view(&[n, hidden_dim]);
         let q_proj = linear_forward(&normed_2d, &layer.attention.wq.weight);
         let k_proj = linear_forward(&normed_2d, &layer.attention.wk.weight);
         let v_proj = linear_forward(&normed_2d, &layer.attention.wv.weight);
 
         // Reshape for attention
-        let q = Tensor::from_f32_slice(
-            q_proj.as_f32_slice(),
-            &[batch_size, seq_len, num_heads, head_dim],
-        );
-        let k = Tensor::from_f32_slice(
-            k_proj.as_f32_slice(),
-            &[batch_size, seq_len, num_kv_heads, head_dim],
-        );
-        let v = Tensor::from_f32_slice(
-            v_proj.as_f32_slice(),
-            &[batch_size, seq_len, num_kv_heads, head_dim],
-        );
+        let q = q_proj.view(&[batch_size, seq_len, num_heads, head_dim]);
+        let k = k_proj.view(&[batch_size, seq_len, num_kv_heads, head_dim]);
+        let v = v_proj.view(&[batch_size, seq_len, num_kv_heads, head_dim]);
 
         // Apply RoPE
         let q_rope = rope(&q, layer.attention.rope_base, 0);
@@ -412,9 +406,9 @@ impl Trainer {
         // Compute Q @ K^T: need K transposed on last two dims
         // Reshape to 3D for batched matmul: [batch*heads, seq, head_dim]
         let batch_heads = batch_size * num_heads;
-        let q_flat = Tensor::from_f32_slice(q_t.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
-        let k_flat = Tensor::from_f32_slice(k_t.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
-        let v_flat = Tensor::from_f32_slice(v_t.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
+        let q_flat = q_t.view(&[batch_heads, seq_len, head_dim]);
+        let k_flat = k_t.view(&[batch_heads, seq_len, head_dim]);
+        let v_flat = v_t.view(&[batch_heads, seq_len, head_dim]);
 
         // Transpose K for matmul: [batch*heads, head_dim, seq]
         let k_t_for_scores = transpose_last_two_dims_3d(&k_flat, batch_heads, seq_len, head_dim);
@@ -433,32 +427,22 @@ impl Trainer {
         let attn_weights_flat = crate::ops::softmax(&scores_masked);
 
         // Reshape to 4D for caching: [batch, heads, seq, seq]
-        let attn_weights = Tensor::from_f32_slice(
-            attn_weights_flat.as_f32_slice(),
-            &[batch_size, num_heads, seq_len, seq_len],
-        );
+        let attn_weights = attn_weights_flat.view(&[batch_size, num_heads, seq_len, seq_len]);
 
         // Compute attn_weights @ V: [batch*heads, seq, head_dim]
         let attn_out_flat = matmul(&attn_weights_flat, &v_flat);
 
         // Reshape to 4D: [batch, heads, seq, head_dim]
-        let attn_out_4d = Tensor::from_f32_slice(
-            attn_out_flat.as_f32_slice(),
-            &[batch_size, num_heads, seq_len, head_dim],
-        );
+        let attn_out_4d = attn_out_flat.view(&[batch_size, num_heads, seq_len, head_dim]);
 
         // Transpose back: [batch, seq, heads, head_dim]
         let attn_out = transpose_from_attention(&attn_out_4d, batch_size, seq_len, num_heads, head_dim);
-        let attn_out_2d =
-            Tensor::from_f32_slice(attn_out.as_f32_slice(), &[n, num_heads * head_dim]);
+        let attn_out_2d = attn_out.view(&[n, num_heads * head_dim]);
 
         // Output projection
         let attn_out_pre_wo = attn_out_2d.clone();
         let attn_projected = linear_forward(&attn_out_2d, &layer.attention.wo.weight);
-        let attn_projected = Tensor::from_f32_slice(
-            attn_projected.as_f32_slice(),
-            &[batch_size, seq_len, hidden_dim],
-        );
+        let attn_projected = attn_projected.view(&[batch_size, seq_len, hidden_dim]);
 
         // Residual connection
         let post_attn = add(x, &attn_projected);
@@ -467,7 +451,7 @@ impl Trainer {
         let normed_ffn = rmsnorm(&post_attn, &layer.ffn_norm, layer.norm_eps);
 
         // FFN: gate and up projections
-        let normed_ffn_2d = Tensor::from_f32_slice(normed_ffn.as_f32_slice(), &[n, hidden_dim]);
+        let normed_ffn_2d = normed_ffn.view(&[n, hidden_dim]);
         let gate = linear_forward(&normed_ffn_2d, &layer.ffn.w_gate.weight);
         let up = linear_forward(&normed_ffn_2d, &layer.ffn.w_up.weight);
 
@@ -476,8 +460,7 @@ impl Trainer {
 
         // Down projection
         let ffn_out = linear_forward(&swiglu_out, &layer.ffn.w_down.weight);
-        let ffn_out =
-            Tensor::from_f32_slice(ffn_out.as_f32_slice(), &[batch_size, seq_len, hidden_dim]);
+        let ffn_out = ffn_out.view(&[batch_size, seq_len, hidden_dim]);
 
         // Residual connection
         let output = add(&post_attn, &ffn_out);
@@ -520,10 +503,7 @@ impl Trainer {
 
         // Reshape grad_output to 3D if needed
         let grad_out_3d = if grad_output.shape().len() == 2 {
-            Tensor::from_f32_slice(
-                grad_output.as_f32_slice(),
-                &[batch_size, seq_len, hidden_dim],
-            )
+            grad_output.view(&[batch_size, seq_len, hidden_dim])
         } else {
             grad_output.clone()
         };
@@ -534,7 +514,7 @@ impl Trainer {
         let grad_post_attn_from_ffn = grad_out_3d.clone();
 
         // Backward through down projection
-        let grad_ffn_out_2d = Tensor::from_f32_slice(grad_ffn_out.as_f32_slice(), &[n, hidden_dim]);
+        let grad_ffn_out_2d = grad_ffn_out.view(&[n, hidden_dim]);
         let (grad_swiglu, grad_w_down) =
             linear_backward(&grad_ffn_out_2d, &cache.swiglu_out, &layer.ffn.w_down.weight);
 
@@ -542,7 +522,7 @@ impl Trainer {
         let (grad_gate, grad_up) = swiglu_backward(&grad_swiglu, &cache.gate, &cache.up);
 
         // Backward through gate and up projections
-        let normed_ffn_2d = Tensor::from_f32_slice(cache.normed_ffn.as_f32_slice(), &[n, hidden_dim]);
+        let normed_ffn_2d = cache.normed_ffn.view(&[n, hidden_dim]);
         let (grad_normed_ffn_from_gate, grad_w_gate) =
             linear_backward(&grad_gate, &normed_ffn_2d, &layer.ffn.w_gate.weight);
         let (grad_normed_ffn_from_up, grad_w_up) =
@@ -550,10 +530,7 @@ impl Trainer {
         let grad_normed_ffn = add_tensors(&grad_normed_ffn_from_gate, &grad_normed_ffn_from_up);
 
         // Backward through FFN norm
-        let grad_normed_ffn_3d = Tensor::from_f32_slice(
-            grad_normed_ffn.as_f32_slice(),
-            &[batch_size, seq_len, hidden_dim],
-        );
+        let grad_normed_ffn_3d = grad_normed_ffn.view(&[batch_size, seq_len, hidden_dim]);
         let (grad_post_attn_from_norm, grad_ffn_norm) =
             rmsnorm_backward(&grad_normed_ffn_3d, &cache.post_attn, &layer.ffn_norm, layer.norm_eps);
 
@@ -566,7 +543,7 @@ impl Trainer {
         let grad_input_from_attn_residual = grad_post_attn.clone();
 
         // Backward through output projection
-        let grad_attn_out_2d = Tensor::from_f32_slice(grad_attn_out.as_f32_slice(), &[n, hidden_dim]);
+        let grad_attn_out_2d = grad_attn_out.view(&[n, hidden_dim]);
         let (grad_attn_pre_wo, grad_wo) =
             linear_backward(&grad_attn_out_2d, &cache.attn_out_pre_wo, &layer.attention.wo.weight);
 
@@ -576,10 +553,7 @@ impl Trainer {
         let head_dim = layer.attention.head_dim;
 
         // Reshape grad_attn_pre_wo from [n, hidden] to [batch, seq, heads, head_dim]
-        let grad_attn_4d = Tensor::from_f32_slice(
-            grad_attn_pre_wo.as_f32_slice(),
-            &[batch_size, seq_len, num_heads, head_dim],
-        );
+        let grad_attn_4d = grad_attn_pre_wo.view(&[batch_size, seq_len, num_heads, head_dim]);
 
         // Transpose to attention layout: [batch, heads, seq, head_dim]
         let grad_attn_transposed = transpose_for_attention(&grad_attn_4d);
@@ -615,22 +589,12 @@ impl Trainer {
         let grad_k_pre_rope = rope_backward(&grad_k_4d, layer.attention.rope_base, 0);
 
         // Reshape to 2D for linear backward: [n, qkv_dim]
-        let grad_q_proj = Tensor::from_f32_slice(
-            grad_q_pre_rope.as_f32_slice(),
-            &[n, num_heads * head_dim],
-        );
-        let grad_k_proj = Tensor::from_f32_slice(
-            grad_k_pre_rope.as_f32_slice(),
-            &[n, num_kv_heads * head_dim],
-        );
-        let grad_v_proj = Tensor::from_f32_slice(
-            grad_v_4d.as_f32_slice(),
-            &[n, num_kv_heads * head_dim],
-        );
+        let grad_q_proj = grad_q_pre_rope.view(&[n, num_heads * head_dim]);
+        let grad_k_proj = grad_k_pre_rope.view(&[n, num_kv_heads * head_dim]);
+        let grad_v_proj = grad_v_4d.view(&[n, num_kv_heads * head_dim]);
 
         // Backward through Q, K, V projections
-        let normed_attn_2d =
-            Tensor::from_f32_slice(cache.normed_attn.as_f32_slice(), &[n, hidden_dim]);
+        let normed_attn_2d = cache.normed_attn.view(&[n, hidden_dim]);
 
         let (grad_normed_attn_from_q, grad_wq) =
             linear_backward(&grad_q_proj, &normed_attn_2d, &layer.attention.wq.weight);
@@ -646,10 +610,7 @@ impl Trainer {
         );
 
         // Backward through attention norm
-        let grad_normed_attn_3d = Tensor::from_f32_slice(
-            grad_normed_attn.as_f32_slice(),
-            &[batch_size, seq_len, hidden_dim],
-        );
+        let grad_normed_attn_3d = grad_normed_attn.view(&[batch_size, seq_len, hidden_dim]);
         let (grad_input_from_norm, grad_attn_norm) =
             rmsnorm_backward(&grad_normed_attn_3d, &cache.input, &layer.attn_norm, layer.norm_eps);
 

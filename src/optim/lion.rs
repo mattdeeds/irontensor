@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -197,21 +198,9 @@ impl Lion {
         }
         .expect("Failed to create params buffer");
 
-        let command_buffer = ctx
-            .command_queue()
-            .commandBuffer()
-            .expect("Failed to create command buffer");
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .expect("Failed to create compute encoder");
-
-        encoder.setComputePipelineState(&pipelines.lion_step);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(weights.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(state.momentum.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(gradients.buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        }
+        let weights_buf = weights.buffer();
+        let momentum_buf = state.momentum.buffer();
+        let gradients_buf = gradients.buffer();
 
         let thread_width = pipelines.lion_step.threadExecutionWidth();
         let grid_size = MTLSize {
@@ -224,11 +213,18 @@ impl Lion {
             height: 1,
             depth: 1,
         };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
+        CommandBatch::dispatch(
+            &pipelines.lion_step,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(momentum_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+            },
+            grid_size,
+            threadgroup_size,
+        );
     }
 
     /// Perform one optimization step with per-parameter learning rate scaling
@@ -271,22 +267,10 @@ impl Lion {
         }
         .expect("Failed to create params buffer");
 
-        let command_buffer = ctx
-            .command_queue()
-            .commandBuffer()
-            .expect("Failed to create command buffer");
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .expect("Failed to create compute encoder");
-
-        encoder.setComputePipelineState(&pipelines.lion_step_scaled);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(weights.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(state.momentum.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(gradients.buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(lr_scale.buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
-        }
+        let weights_buf = weights.buffer();
+        let momentum_buf = state.momentum.buffer();
+        let gradients_buf = gradients.buffer();
+        let lr_scale_buf = lr_scale.buffer();
 
         let thread_width = pipelines.lion_step_scaled.threadExecutionWidth();
         let grid_size = MTLSize {
@@ -299,11 +283,19 @@ impl Lion {
             height: 1,
             depth: 1,
         };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
+        CommandBatch::dispatch(
+            &pipelines.lion_step_scaled,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(momentum_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(lr_scale_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
+            },
+            grid_size,
+            threadgroup_size,
+        );
     }
 }
 
@@ -330,19 +322,7 @@ pub fn zero_gradients(gradients: &Tensor) {
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.zero_gradients);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(gradients.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 1);
-    }
+    let gradients_buf = gradients.buffer();
 
     let thread_width = pipelines.zero_gradients.threadExecutionWidth();
     let grid_size = MTLSize {
@@ -355,11 +335,16 @@ pub fn zero_gradients(gradients: &Tensor) {
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.zero_gradients,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 1);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 }
 
 /// Compute the global L2 norm of gradients
@@ -395,20 +380,7 @@ pub fn grad_norm(gradients: &Tensor) -> f32 {
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.grad_norm_squared);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(gradients.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&sum_sq_buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-    }
+    let gradients_buf = gradients.buffer();
 
     let thread_width = pipelines.grad_norm_squared.threadExecutionWidth();
     let grid_size = MTLSize {
@@ -421,11 +393,20 @@ pub fn grad_norm(gradients: &Tensor) -> f32 {
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.grad_norm_squared,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&sum_sq_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    // Sync before reading result
+    CommandBatch::sync();
 
     // Read back sum of squares
     let sum_sq = unsafe { *(sum_sq_buffer.contents().as_ptr() as *const f32) };
@@ -469,20 +450,7 @@ pub fn clip_grad_norm(gradients: &Tensor, max_norm: f32) -> f32 {
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.grad_clip);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(gradients.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&scale_buffer), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-    }
+    let gradients_buf = gradients.buffer();
 
     let thread_width = pipelines.grad_clip.threadExecutionWidth();
     let grid_size = MTLSize {
@@ -495,11 +463,17 @@ pub fn clip_grad_norm(gradients: &Tensor, max_norm: f32) -> f32 {
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.grad_clip,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(gradients_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&scale_buffer), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     actual_norm
 }

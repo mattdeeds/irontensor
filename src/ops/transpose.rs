@@ -9,6 +9,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -100,16 +101,28 @@ pub fn transpose_2d(input: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
 
     if use_tiled {
         const TILE_SIZE: usize = 16;
 
+        // Dispatch in tiles
+        let grid_x = (cols + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE;
+        let grid_y = (rows + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE;
+        let grid_size = MTLSize { width: grid_x, height: grid_y, depth: 1 };
+        let threadgroup_size = MTLSize { width: TILE_SIZE, height: TILE_SIZE, depth: 1 };
+
+        // Note: For tiled transpose with threadgroup memory, we need to fall back to immediate mode
+        // because CommandBatch::dispatch doesn't support setThreadgroupMemoryLength
+        let ctx = MetalContext::global();
+        let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
+        let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
+
         encoder.setComputePipelineState(&pipelines.transpose_2d_tiled);
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
             encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
         }
 
@@ -119,31 +132,28 @@ pub fn transpose_2d(input: &Tensor) -> Tensor {
             encoder.setThreadgroupMemoryLength_atIndex(tile_memory, 0);
         }
 
-        // Dispatch in tiles
-        let grid_x = (cols + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE;
-        let grid_y = (rows + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE;
-        let grid_size = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-        let threadgroup_size = MTLSize { width: TILE_SIZE, height: TILE_SIZE, depth: 1 };
         encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
     } else {
-        encoder.setComputePipelineState(&pipelines.transpose_2d);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-        }
-
         let thread_width = pipelines.transpose_2d.threadExecutionWidth();
         let grid_size = MTLSize { width: cols, height: rows, depth: 1 };
         let tg_width = thread_width.min(cols);
         let tg_height = (256 / tg_width).min(rows).max(1);
         let threadgroup_size = MTLSize { width: tg_width, height: tg_height, depth: 1 };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-    }
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+        CommandBatch::dispatch(
+            &pipelines.transpose_2d,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+            },
+            grid_size,
+            threadgroup_size,
+        );
+    }
 
     output
 }
@@ -184,15 +194,8 @@ pub fn transpose_for_attention(input: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.transpose_0213);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-    }
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
 
     let thread_width = pipelines.transpose_0213.threadExecutionWidth();
     let grid_size = MTLSize {
@@ -203,11 +206,17 @@ pub fn transpose_for_attention(input: &Tensor) -> Tensor {
     let tg_width = thread_width.min(dim2 * dim3);
     let tg_height = (256 / tg_width).min(dim1).max(1);
     let threadgroup_size = MTLSize { width: tg_width, height: tg_height, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.transpose_0213,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }
@@ -244,15 +253,8 @@ pub fn transpose_from_attention(input: &Tensor, batch: usize, dim1: usize, dim2:
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.transpose_0213_inverse);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-    }
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
 
     let thread_width = pipelines.transpose_0213_inverse.threadExecutionWidth();
     let grid_size = MTLSize {
@@ -263,11 +265,17 @@ pub fn transpose_from_attention(input: &Tensor, batch: usize, dim1: usize, dim2:
     let tg_width = thread_width.min(dim1 * dim3);
     let tg_height = (256 / tg_width).min(dim2).max(1);
     let threadgroup_size = MTLSize { width: tg_width, height: tg_height, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.transpose_0213_inverse,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }

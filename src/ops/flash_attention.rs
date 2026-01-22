@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -125,27 +126,15 @@ pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tens
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
     // Use the small kernel for short sequences, tiled kernel for longer ones
     let use_small_kernel = seq_len <= 256;
 
-    if use_small_kernel {
-        encoder.setComputePipelineState(&pipelines.flash_small);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(q.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(k.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(v.buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
-        }
+    let q_buf = q.buffer();
+    let k_buf = k.buffer();
+    let v_buf = v.buffer();
+    let output_buf = output.buffer();
 
+    if use_small_kernel {
         let grid_size = MTLSize {
             width: seq_len,
             height: 1,
@@ -157,22 +146,25 @@ pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tens
             height: 1,
             depth: 1,
         };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-    } else {
-        encoder.setComputePipelineState(&pipelines.flash_forward);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(q.buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(k.buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(v.buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
-        }
 
+        CommandBatch::dispatch(
+            &pipelines.flash_small,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
+            },
+            grid_size,
+            threadgroup_size,
+        );
+    } else {
         // Each threadgroup processes one query block
         let block_m = 32;
         let num_q_blocks = (seq_len + block_m - 1) / block_m;
 
-        let grid_size = MTLSize {
+        let threadgroup_count = MTLSize {
             width: num_q_blocks,
             height: 1,
             depth: batch_size * num_heads,
@@ -182,12 +174,20 @@ pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tens
             height: 1,
             depth: 1,
         };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-    }
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+        CommandBatch::dispatch_threadgroups(
+            &pipelines.flash_forward,
+            |encoder| unsafe {
+                encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
+            },
+            threadgroup_count,
+            threadgroup_size,
+        );
+    }
 
     output
 }

@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -160,24 +161,10 @@ pub fn fused_linear_cross_entropy(
     .expect("Failed to create targets buffer");
 
     // Run chunked forward pass to compute losses and grad_hidden
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.chunked);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(hidden.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(weight.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(losses.buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(grad_hidden.buffer()), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 5);
-    }
+    let hidden_buf = hidden.buffer();
+    let weight_buf = weight.buffer();
+    let losses_buf = losses.buffer();
+    let grad_hidden_buf = grad_hidden.buffer();
 
     let grid_size = MTLSize {
         width: batch_seq,
@@ -190,11 +177,23 @@ pub fn fused_linear_cross_entropy(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.chunked,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(hidden_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_hidden_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 5);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    // Need to sync before reading losses
+    CommandBatch::sync();
 
     // Compute mean loss from per-token losses
     let losses_data = losses.as_f32_slice();
@@ -213,23 +212,7 @@ pub fn fused_linear_cross_entropy(
     };
 
     // Run weight gradient computation
-    let command_buffer2 = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-
-    let encoder2 = command_buffer2
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
-    encoder2.setComputePipelineState(&pipelines.weight_grad);
-    unsafe {
-        encoder2.setBuffer_offset_atIndex(Some(hidden.buffer()), 0, 0);
-        encoder2.setBuffer_offset_atIndex(Some(weight.buffer()), 0, 1);
-        encoder2.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 2);
-        encoder2.setBuffer_offset_atIndex(Some(grad_weight.buffer()), 0, 3);
-        encoder2.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
-    }
+    let grad_weight_buf = grad_weight.buffer();
 
     let grid_size2 = MTLSize {
         width: vocab_size,
@@ -241,11 +224,19 @@ pub fn fused_linear_cross_entropy(
         height: 1,
         depth: 1,
     };
-    encoder2.dispatchThreads_threadsPerThreadgroup(grid_size2, threadgroup_size2);
 
-    encoder2.endEncoding();
-    command_buffer2.commit();
-    command_buffer2.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.weight_grad,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(hidden_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_weight_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 4);
+        },
+        grid_size2,
+        threadgroup_size2,
+    );
 
     (mean_loss, grad_hidden, grad_weight)
 }
@@ -329,24 +320,10 @@ pub fn fused_linear_cross_entropy_forward_only(
     }
     .expect("Failed to create targets buffer");
 
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .expect("Failed to create command buffer");
-
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.chunked);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(hidden.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(weight.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(losses.buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(grad_hidden.buffer()), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 5);
-    }
+    let hidden_buf = hidden.buffer();
+    let weight_buf = weight.buffer();
+    let losses_buf = losses.buffer();
+    let grad_hidden_buf = grad_hidden.buffer();
 
     let grid_size = MTLSize {
         width: batch_seq,
@@ -359,11 +336,23 @@ pub fn fused_linear_cross_entropy_forward_only(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.chunked,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(hidden_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&targets_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(losses_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_hidden_buf), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 5);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    // Need to sync before reading losses
+    CommandBatch::sync();
 
     // Compute mean loss
     let losses_data = losses.as_f32_slice();

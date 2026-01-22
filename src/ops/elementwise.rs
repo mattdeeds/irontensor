@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -84,25 +85,25 @@ fn dispatch_binary_op(
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
-    }
-
     let thread_width = pipeline.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    let a_buf = a.buffer();
+    let b_buf = b.buffer();
+    let c_buf = c.buffer();
+
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     c
 }
@@ -128,24 +129,23 @@ fn dispatch_unary_op(
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-    }
-
     let thread_width = pipeline.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
+
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }
@@ -181,25 +181,24 @@ fn dispatch_scalar_op(
     }
     .expect("Failed to create count buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&scalar_buffer), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
-    }
-
     let thread_width = pipeline.threadExecutionWidth();
     let grid_size = MTLSize { width: count, height: 1, depth: 1 };
     let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    let input_buf = input.buffer();
+    let output_buf = output.buffer();
+
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&scalar_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     output
 }

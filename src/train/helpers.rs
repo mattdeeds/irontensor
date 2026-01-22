@@ -174,17 +174,11 @@ pub(crate) fn attention_backward(
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     // Reshape to 3D for batched matmul: [batch*heads, seq, dim]
-    let grad_o_flat = Tensor::from_f32_slice(
-        grad_output.as_f32_slice(),
-        &[batch_heads, seq_len, head_dim],
-    );
-    let q_flat = Tensor::from_f32_slice(q.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
-    let k_flat = Tensor::from_f32_slice(k.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
-    let v_flat = Tensor::from_f32_slice(v.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
-    let p_flat = Tensor::from_f32_slice(
-        attn_weights.as_f32_slice(),
-        &[batch_heads, seq_len, seq_len],
-    );
+    let grad_o_flat = grad_output.view(&[batch_heads, seq_len, head_dim]);
+    let q_flat = q.view(&[batch_heads, seq_len, head_dim]);
+    let k_flat = k.view(&[batch_heads, seq_len, head_dim]);
+    let v_flat = v.view(&[batch_heads, seq_len, head_dim]);
+    let p_flat = attn_weights.view(&[batch_heads, seq_len, seq_len]);
 
     // grad_V = P^T @ grad_O
     // P: [batch*heads, seq, seq], grad_O: [batch*heads, seq, head_dim]

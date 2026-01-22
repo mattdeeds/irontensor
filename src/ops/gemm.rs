@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::ns_string;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -132,53 +133,53 @@ fn matmul_2d(a: &Tensor, b: &Tensor) -> Tensor {
     }
     .expect("Failed to create params buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
+    let a_buf = a.buffer();
+    let b_buf = b.buffer();
+    let c_buf = c.buffer();
 
-    if use_tiled {
-        encoder.setComputePipelineState(&pipelines.tiled);
+    let pipeline = if use_tiled { &pipelines.tiled } else { &pipelines.simple };
+
+    let (grid_size, threadgroup_size) = if use_tiled {
+        (
+            MTLSize {
+                width: (n + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE,
+                height: (m + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE,
+                depth: 1,
+            },
+            MTLSize {
+                width: TILE_SIZE,
+                height: TILE_SIZE,
+                depth: 1,
+            },
+        )
     } else {
-        encoder.setComputePipelineState(&pipelines.simple);
-    }
-
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-    }
-
-    if use_tiled {
-        let grid_size = MTLSize {
-            width: (n + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE,
-            height: (m + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE,
-            depth: 1,
-        };
-        let threadgroup_size = MTLSize {
-            width: TILE_SIZE,
-            height: TILE_SIZE,
-            depth: 1,
-        };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-    } else {
-        let grid_size = MTLSize {
-            width: n,
-            height: m,
-            depth: 1,
-        };
         let max_threads = pipelines.simple.maxTotalThreadsPerThreadgroup();
         let thread_width = pipelines.simple.threadExecutionWidth();
-        let threadgroup_size = MTLSize {
-            width: thread_width.min(n),
-            height: (max_threads / thread_width).min(m),
-            depth: 1,
-        };
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
-    }
+        (
+            MTLSize {
+                width: n,
+                height: m,
+                depth: 1,
+            },
+            MTLSize {
+                width: thread_width.min(n),
+                height: (max_threads / thread_width).min(m),
+                depth: 1,
+            },
+        )
+    };
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     c
 }
@@ -226,18 +227,9 @@ fn matmul_batched(a: &Tensor, b: &Tensor) -> Tensor {
     }
     .expect("Failed to create batch buffer");
 
-    let command_buffer = ctx.command_queue().commandBuffer().expect("Failed to create command buffer");
-    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create compute encoder");
-
-    encoder.setComputePipelineState(&pipelines.batched);
-
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 4);
-    }
+    let a_buf = a.buffer();
+    let b_buf = b.buffer();
+    let c_buf = c.buffer();
 
     let grid_size = MTLSize {
         width: n,
@@ -251,11 +243,19 @@ fn matmul_batched(a: &Tensor, b: &Tensor) -> Tensor {
         height: (max_threads / thread_width).min(m),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
-    encoder.endEncoding();
-    command_buffer.commit();
-    command_buffer.waitUntilCompleted();
+    CommandBatch::dispatch(
+        &pipelines.batched,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&batch_buffer), 0, 4);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     c
 }
