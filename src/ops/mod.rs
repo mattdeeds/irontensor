@@ -16,7 +16,8 @@ pub use backward::{
     cross_entropy, cross_entropy_backward, cross_entropy_fused, embedding_backward, gelu_backward,
     matmul_backward, matmul_backward_a, matmul_backward_b, mul_backward, relu_backward,
     rmsnorm_backward, rope_backward, scale_backward, silu_backward, softmax_backward,
-    swiglu_backward,
+    swiglu_backward, transpose_2d_backward, transpose_for_attention_backward,
+    transpose_from_attention_backward,
 };
 pub use bf16_ops::{
     add_bf16, matmul_bf16, matmul_bf16_batched, mul_bf16, rmsnorm_bf16, scale_bf16, silu_bf16,

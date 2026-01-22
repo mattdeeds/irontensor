@@ -74,8 +74,9 @@ pub fn matmul_backward(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tens
     match (a.shape().len(), b.shape().len()) {
         (2, 2) => matmul_backward_2d(grad_c, a, b),
         (3, 3) => matmul_backward_batched(grad_c, a, b),
+        (4, 4) => matmul_backward_4d(grad_c, a, b),
         _ => panic!(
-            "matmul_backward requires 2D or 3D tensors, got shapes {:?} and {:?}",
+            "matmul_backward requires 2D, 3D, or 4D tensors, got shapes {:?} and {:?}",
             a.shape(), b.shape()
         ),
     }
@@ -391,6 +392,41 @@ fn compute_grad_b_batched(grad_c: &Tensor, a: &Tensor, batch: usize, m: usize, n
     grad_b
 }
 
+/// Backward pass for 4D batched matmul
+/// Reshapes to 3D by collapsing first two dims, computes backward, then reshapes back
+fn matmul_backward_4d(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let grad_c_shape = grad_c.shape();
+
+    // 4D: [batch1, batch2, m, k] @ [batch1, batch2, k, n] = [batch1, batch2, m, n]
+    let batch1 = a_shape[0];
+    let batch2 = a_shape[1];
+    let m = a_shape[2];
+    let k = a_shape[3];
+    let n = b_shape[3];
+
+    assert_eq!(b_shape[0], batch1);
+    assert_eq!(b_shape[1], batch2);
+    assert_eq!(b_shape[2], k);
+    assert_eq!(grad_c_shape, &[batch1, batch2, m, n]);
+
+    // Collapse first two dims into one batch dimension
+    let new_batch = batch1 * batch2;
+
+    let a_3d = Tensor::from_f32_slice(a.as_f32_slice(), &[new_batch, m, k]);
+    let b_3d = Tensor::from_f32_slice(b.as_f32_slice(), &[new_batch, k, n]);
+    let gc_3d = Tensor::from_f32_slice(grad_c.as_f32_slice(), &[new_batch, m, n]);
+
+    let (ga_3d, gb_3d) = matmul_backward_batched(&gc_3d, &a_3d, &b_3d);
+
+    // Reshape back to 4D
+    let grad_a = Tensor::from_f32_slice(ga_3d.as_f32_slice(), a_shape);
+    let grad_b = Tensor::from_f32_slice(gb_3d.as_f32_slice(), b_shape);
+
+    (grad_a, grad_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +521,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_matmul_backward_4d() {
+        let batch1 = 2;
+        let batch2 = 3;
+        let m = 4;
+        let k = 5;
+        let n = 6;
+
+        let a_data: Vec<f32> = (0..(batch1 * batch2 * m * k))
+            .map(|i| (i as f32 * 0.01) % 1.0)
+            .collect();
+        let b_data: Vec<f32> = (0..(batch1 * batch2 * k * n))
+            .map(|i| (i as f32 * 0.01) % 1.0)
+            .collect();
+        let grad_c_data: Vec<f32> = vec![1.0f32; batch1 * batch2 * m * n];
+
+        let a = Tensor::from_f32_slice(&a_data, &[batch1, batch2, m, k]);
+        let b = Tensor::from_f32_slice(&b_data, &[batch1, batch2, k, n]);
+        let grad_c = Tensor::from_f32_slice(&grad_c_data, &[batch1, batch2, m, n]);
+
+        let (grad_a, grad_b) = matmul_backward(&grad_c, &a, &b);
+
+        // Verify shapes
+        assert_eq!(grad_a.shape(), &[batch1, batch2, m, k]);
+        assert_eq!(grad_b.shape(), &[batch1, batch2, k, n]);
+
+        // Verify first element of first batch against CPU reference
+        let grad_a_result = grad_a.as_f32_slice();
+        // For grad_a[0,0,0,0], we compute sum over n of grad_c[0,0,0,l] * b[0,0,0,l]
+        let mut expected = 0.0f32;
+        for l in 0..n {
+            expected += grad_c_data[l] * b_data[l];
+        }
+        assert!(
+            (grad_a_result[0] - expected).abs() < 1e-3,
+            "grad_A[0,0,0,0] mismatch: expected {}, got {}",
+            expected, grad_a_result[0]
+        );
     }
 }

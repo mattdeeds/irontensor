@@ -228,7 +228,16 @@ pub fn silu(input: &Tensor) -> Tensor {
     dispatch_unary_op(&get_pipelines().silu, input)
 }
 
-/// GELU activation (approximate)
+/// GELU (Gaussian Error Linear Unit) activation using tanh approximation.
+///
+/// Uses the fast tanh approximation formula:
+/// ```text
+/// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+/// ```
+///
+/// This approximation is commonly used in transformer models (GPT-2, BERT)
+/// as it is faster to compute than the exact GELU while maintaining
+/// similar accuracy. The maximum error vs exact GELU is ~0.004.
 pub fn gelu(input: &Tensor) -> Tensor {
     dispatch_unary_op(&get_pipelines().gelu, input)
 }

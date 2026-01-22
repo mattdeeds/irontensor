@@ -25,7 +25,8 @@ pub use ops::{
     cross_entropy, cross_entropy_backward, cross_entropy_fused, embedding_backward, gelu_backward,
     matmul_backward, matmul_backward_a, matmul_backward_b, mul_backward, relu_backward,
     rmsnorm_backward, rope_backward, scale_backward, silu_backward, softmax_backward,
-    swiglu_backward,
+    swiglu_backward, transpose_2d_backward, transpose_for_attention_backward,
+    transpose_from_attention_backward,
 };
 pub use optim::{clip_grad_norm, grad_norm, zero_gradients, Lion, LionConfig, ParamState};
 pub use precision::Precision;

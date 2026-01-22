@@ -5,6 +5,7 @@ mod loss;
 mod norm;
 mod rope;
 mod softmax;
+mod transpose;
 
 pub use elementwise::{
     gelu_backward, mul_backward, relu_backward, scale_backward, silu_backward, swiglu_backward,
@@ -15,3 +16,6 @@ pub use loss::{cross_entropy, cross_entropy_backward, cross_entropy_fused};
 pub use norm::rmsnorm_backward;
 pub use rope::rope_backward;
 pub use softmax::softmax_backward;
+pub use transpose::{
+    transpose_2d_backward, transpose_for_attention_backward, transpose_from_attention_backward,
+};

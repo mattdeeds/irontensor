@@ -5,7 +5,8 @@ use crate::data::{DatasetIterator, TokenDataset};
 use crate::nn::{GPTModel, GPTModelState, ModelConfig};
 use crate::ops::{
     add, cross_entropy_fused, embedding, embedding_backward, matmul, rmsnorm, rmsnorm_backward,
-    rope, swiglu, swiglu_backward, transpose_2d, transpose_for_attention, transpose_from_attention,
+    rope, rope_backward, swiglu, swiglu_backward, transpose_2d, transpose_for_attention,
+    transpose_for_attention_backward, transpose_from_attention,
 };
 use crate::optim::{Lion, LionConfig};
 use crate::tensor::Tensor;
@@ -15,7 +16,9 @@ use super::callbacks::TrainCallback;
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::{TrainMetrics, TrainingConfig};
 use super::helpers::{
-    add_tensors, compute_total_grad_norm, linear_backward, linear_forward, repeat_kv, scale_tensor,
+    add_tensors, apply_causal_mask_3d, attention_backward, compute_total_grad_norm,
+    linear_backward, linear_forward, repeat_kv, repeat_kv_backward, scale_tensor,
+    transpose_last_two_dims_3d,
 };
 use super::scheduler::{CosineAnnealingLR, LRScheduler};
 
@@ -313,6 +316,9 @@ impl Trainer {
             hidden = new_hidden;
         }
 
+        // Store hidden state before final norm (for backward pass through RMSNorm)
+        let pre_final_norm = hidden.clone();
+
         // Final norm
         let final_hidden = rmsnorm(&hidden, &self.model.final_norm, self.model.config.norm_eps);
         let final_hidden_2d =
@@ -321,6 +327,7 @@ impl Trainer {
         ForwardCache {
             embedded,
             layers: layer_caches,
+            pre_final_norm,
             final_hidden: final_hidden_2d,
         }
     }
@@ -385,11 +392,52 @@ impl Trainer {
         let k_t = transpose_for_attention(&k_expanded);
         let v_t = transpose_for_attention(&v_expanded);
 
-        // Compute attention
-        let attn_out = crate::ops::attention(&q_t, &k_t, &v_t, true);
+        // Compute attention step-by-step for caching
+        // q_t, k_t, v_t: [batch, heads, seq, head_dim]
+        let q_for_attn = q_t.clone();
+        let k_for_attn = k_t.clone();
+        let v_for_attn = v_t.clone();
 
-        // Transpose back and reshape
-        let attn_out = transpose_from_attention(&attn_out, batch_size, seq_len, num_heads, head_dim);
+        // Compute Q @ K^T: need K transposed on last two dims
+        // Reshape to 3D for batched matmul: [batch*heads, seq, head_dim]
+        let batch_heads = batch_size * num_heads;
+        let q_flat = Tensor::from_f32_slice(q_t.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
+        let k_flat = Tensor::from_f32_slice(k_t.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
+        let v_flat = Tensor::from_f32_slice(v_t.as_f32_slice(), &[batch_heads, seq_len, head_dim]);
+
+        // Transpose K for matmul: [batch*heads, head_dim, seq]
+        let k_t_for_scores = transpose_last_two_dims_3d(&k_flat, batch_heads, seq_len, head_dim);
+
+        // scores = Q @ K^T: [batch*heads, seq, seq]
+        let scores_flat = matmul(&q_flat, &k_t_for_scores);
+
+        // Scale by 1/sqrt(d_k)
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let scores_scaled = crate::ops::scale(&scores_flat, scale);
+
+        // Apply causal mask
+        let scores_masked = apply_causal_mask_3d(&scores_scaled, batch_heads, seq_len);
+
+        // Softmax over last dimension
+        let attn_weights_flat = crate::ops::softmax(&scores_masked);
+
+        // Reshape to 4D for caching: [batch, heads, seq, seq]
+        let attn_weights = Tensor::from_f32_slice(
+            attn_weights_flat.as_f32_slice(),
+            &[batch_size, num_heads, seq_len, seq_len],
+        );
+
+        // Compute attn_weights @ V: [batch*heads, seq, head_dim]
+        let attn_out_flat = matmul(&attn_weights_flat, &v_flat);
+
+        // Reshape to 4D: [batch, heads, seq, head_dim]
+        let attn_out_4d = Tensor::from_f32_slice(
+            attn_out_flat.as_f32_slice(),
+            &[batch_size, num_heads, seq_len, head_dim],
+        );
+
+        // Transpose back: [batch, seq, heads, head_dim]
+        let attn_out = transpose_from_attention(&attn_out_4d, batch_size, seq_len, num_heads, head_dim);
         let attn_out_2d =
             Tensor::from_f32_slice(attn_out.as_f32_slice(), &[n, num_heads * head_dim]);
 
@@ -431,6 +479,10 @@ impl Trainer {
             v_proj,
             q_rope,
             k_rope,
+            q_for_attn,
+            k_for_attn,
+            v_for_attn,
+            attn_weights,
             attn_out_pre_wo,
             post_attn,
             normed_ffn,
@@ -507,26 +559,80 @@ impl Trainer {
         let (grad_attn_pre_wo, grad_wo) =
             linear_backward(&grad_attn_out_2d, &cache.attn_out_pre_wo, &layer.attention.wo.weight);
 
-        // For attention backward, we use a simplified approach:
-        // We compute gradients for Q, K, V projections based on the attention output gradient
-        // This is approximate but captures the main learning signal
+        // ===== Proper Attention Backward =====
+        let num_heads = layer.attention.num_heads;
+        let num_kv_heads = layer.attention.num_kv_heads;
+        let head_dim = layer.attention.head_dim;
 
-        // Backward through attention (simplified - gradient flows to Q projection)
-        // In practice, attention backward is complex; here we propagate to Q as main signal
-        let grad_q_proj = grad_attn_pre_wo.clone();
+        // Reshape grad_attn_pre_wo from [n, hidden] to [batch, seq, heads, head_dim]
+        let grad_attn_4d = Tensor::from_f32_slice(
+            grad_attn_pre_wo.as_f32_slice(),
+            &[batch_size, seq_len, num_heads, head_dim],
+        );
 
-        // Backward through Q projection
+        // Transpose to attention layout: [batch, heads, seq, head_dim]
+        let grad_attn_transposed = transpose_for_attention(&grad_attn_4d);
+
+        // Call proper attention backward to get grad_Q, grad_K, grad_V
+        let (grad_q_attn, grad_k_attn, grad_v_attn) = attention_backward(
+            &grad_attn_transposed,
+            &cache.q_for_attn,
+            &cache.k_for_attn,
+            &cache.v_for_attn,
+            &cache.attn_weights,
+        );
+
+        // Transpose gradients back: [batch, heads, seq, head_dim] -> [batch, seq, heads, head_dim]
+        let grad_q_4d = transpose_for_attention_backward(&grad_q_attn, batch_size, seq_len, num_heads, head_dim);
+        let grad_k_expanded = transpose_for_attention_backward(&grad_k_attn, batch_size, seq_len, num_heads, head_dim);
+        let grad_v_expanded = transpose_for_attention_backward(&grad_v_attn, batch_size, seq_len, num_heads, head_dim);
+
+        // If GQA, reduce K and V gradients back to KV heads
+        let (grad_k_4d, grad_v_4d) = if num_kv_heads != num_heads {
+            (
+                repeat_kv_backward(&grad_k_expanded, batch_size, seq_len, num_heads, num_kv_heads, head_dim),
+                repeat_kv_backward(&grad_v_expanded, batch_size, seq_len, num_heads, num_kv_heads, head_dim),
+            )
+        } else {
+            (grad_k_expanded, grad_v_expanded)
+        };
+
+        // Backward through RoPE for Q
+        let grad_q_pre_rope = rope_backward(&grad_q_4d, layer.attention.rope_base, 0);
+
+        // Backward through RoPE for K
+        let grad_k_pre_rope = rope_backward(&grad_k_4d, layer.attention.rope_base, 0);
+
+        // Reshape to 2D for linear backward: [n, qkv_dim]
+        let grad_q_proj = Tensor::from_f32_slice(
+            grad_q_pre_rope.as_f32_slice(),
+            &[n, num_heads * head_dim],
+        );
+        let grad_k_proj = Tensor::from_f32_slice(
+            grad_k_pre_rope.as_f32_slice(),
+            &[n, num_kv_heads * head_dim],
+        );
+        let grad_v_proj = Tensor::from_f32_slice(
+            grad_v_4d.as_f32_slice(),
+            &[n, num_kv_heads * head_dim],
+        );
+
+        // Backward through Q, K, V projections
         let normed_attn_2d =
             Tensor::from_f32_slice(cache.normed_attn.as_f32_slice(), &[n, hidden_dim]);
-        let (grad_normed_attn, grad_wq) =
+
+        let (grad_normed_attn_from_q, grad_wq) =
             linear_backward(&grad_q_proj, &normed_attn_2d, &layer.attention.wq.weight);
+        let (grad_normed_attn_from_k, grad_wk) =
+            linear_backward(&grad_k_proj, &normed_attn_2d, &layer.attention.wk.weight);
+        let (grad_normed_attn_from_v, grad_wv) =
+            linear_backward(&grad_v_proj, &normed_attn_2d, &layer.attention.wv.weight);
 
-        // K and V gradients (simplified - use same signal scaled down)
-        let grad_k_proj = scale_tensor(&grad_attn_pre_wo, 0.5);
-        let grad_v_proj = scale_tensor(&grad_attn_pre_wo, 0.5);
-
-        let (_, grad_wk) = linear_backward(&grad_k_proj, &normed_attn_2d, &layer.attention.wk.weight);
-        let (_, grad_wv) = linear_backward(&grad_v_proj, &normed_attn_2d, &layer.attention.wv.weight);
+        // Sum gradients from Q, K, V paths
+        let grad_normed_attn = add_tensors(
+            &add_tensors(&grad_normed_attn_from_q, &grad_normed_attn_from_k),
+            &grad_normed_attn_from_v,
+        );
 
         // Backward through attention norm
         let grad_normed_attn_3d = Tensor::from_f32_slice(
@@ -565,16 +671,11 @@ impl Trainer {
     fn get_pre_final_norm_hidden(
         &self,
         cache: &ForwardCache,
-        batch_size: usize,
-        seq_len: usize,
+        _batch_size: usize,
+        _seq_len: usize,
     ) -> Tensor {
-        let hidden_dim = self.model.config.hidden_dim;
-        // The output of the last layer (before final norm)
-        // This is a simplification; proper implementation would cache this
-        Tensor::from_f32_slice(
-            cache.embedded.as_f32_slice(),
-            &[batch_size, seq_len, hidden_dim],
-        )
+        // Return the cached pre-final-norm hidden state (output of last transformer layer)
+        cache.pre_final_norm.clone()
     }
 
     /// Train for one epoch

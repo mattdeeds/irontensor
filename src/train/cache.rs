@@ -16,6 +16,14 @@ pub(crate) struct LayerCache {
     pub q_rope: Tensor,
     /// K after RoPE [batch, kv_heads, seq, head_dim]
     pub k_rope: Tensor,
+    /// Q transposed for attention [batch, heads, seq, head_dim]
+    pub q_for_attn: Tensor,
+    /// K transposed for attention (expanded if GQA) [batch, heads, seq, head_dim]
+    pub k_for_attn: Tensor,
+    /// V transposed for attention (expanded if GQA) [batch, heads, seq, head_dim]
+    pub v_for_attn: Tensor,
+    /// Attention weights after softmax [batch, heads, seq, seq]
+    pub attn_weights: Tensor,
     /// Attention output before wo [batch*seq, hidden]
     pub attn_out_pre_wo: Tensor,
     /// After attention + residual [batch, seq, hidden]
@@ -36,6 +44,8 @@ pub(crate) struct ForwardCache {
     pub embedded: Tensor,
     /// Per-layer caches
     pub layers: Vec<LayerCache>,
+    /// Hidden state before final norm [batch, seq, hidden] (output of last layer)
+    pub pre_final_norm: Tensor,
     /// After final norm [batch*seq, hidden]
     pub final_hidden: Tensor,
 }
