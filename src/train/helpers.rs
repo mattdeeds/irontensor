@@ -26,6 +26,10 @@ pub(crate) fn add_tensors(a: &Tensor, b: &Tensor) -> Tensor {
 }
 
 /// Compute total L2 norm of multiple gradient tensors
+///
+/// Note: This uses CPU because on Apple Silicon's unified memory,
+/// reading from GPU buffers is fast and avoids the overhead of
+/// dispatching additional GPU reduction kernels.
 pub(crate) fn compute_total_grad_norm(grads: &[&Tensor]) -> f32 {
     let mut sum_sq = 0.0f32;
     for g in grads {
