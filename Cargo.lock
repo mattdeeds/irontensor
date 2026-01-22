@@ -300,6 +300,7 @@ dependencies = [
 name = "irontensor"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "half",
  "memmap2",
  "objc2",

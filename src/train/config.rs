@@ -27,6 +27,10 @@ pub struct TrainingConfig {
     /// When enabled, model weights are stored in BF16 for ~50% memory reduction.
     /// Forward/backward passes compute in FP32 for numerical stability.
     pub use_bf16: bool,
+    /// Use async GPU command submission for CPU/GPU overlap.
+    /// When enabled, the optimizer step commits asynchronously, allowing
+    /// the CPU to start preparing the next batch while the GPU finishes.
+    pub async_gpu: bool,
 }
 
 impl Default for TrainingConfig {
@@ -44,6 +48,7 @@ impl Default for TrainingConfig {
             eval_interval: 100,
             checkpoint_dir: "checkpoints".to_string(),
             use_bf16: false,
+            async_gpu: true, // Enabled by default for better performance
         }
     }
 }

@@ -165,6 +165,8 @@ fn main() {
 
     // Check for BF16 flag via environment variable
     let use_bf16 = std::env::var("IRONTENSOR_BF16").is_ok();
+    // Check for async GPU flag (enabled by default, disable with IRONTENSOR_SYNC_GPU=1)
+    let async_gpu = std::env::var("IRONTENSOR_SYNC_GPU").is_err();
 
     // Training configuration
     let train_config = TrainingConfig {
@@ -180,6 +182,7 @@ fn main() {
         eval_interval: 50,
         checkpoint_dir: "checkpoints".to_string(),
         use_bf16,
+        async_gpu,
     };
 
     println!("\nTraining Configuration:");
@@ -189,6 +192,7 @@ fn main() {
     println!("  total_steps: {}", train_config.total_steps);
     println!("  max_grad_norm: {}", train_config.max_grad_norm);
     println!("  use_bf16: {}", train_config.use_bf16);
+    println!("  async_gpu: {}", train_config.async_gpu);
     println!();
 
     // Create trainer

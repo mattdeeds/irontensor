@@ -15,9 +15,23 @@
 //! // Commit and wait for all accumulated operations
 //! CommandBatch::sync();
 //! ```
+//!
+//! # Async Mode (Phase 6)
+//! ```ignore
+//! // For CPU/GPU overlap, use async commit:
+//! CommandBatch::begin();
+//! // ... GPU operations ...
+//! CommandBatch::commit_async(); // Returns immediately
+//! // ... CPU work (prepare next batch) ...
+//! CommandBatch::wait_for_completion(); // Wait before reading results
+//! ```
 
 use std::cell::RefCell;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -29,6 +43,33 @@ use crate::device::MetalContext;
 
 thread_local! {
     static BATCH: RefCell<Option<BatchState>> = const { RefCell::new(None) };
+    /// Tracks the last async command buffer for wait_for_completion
+    static PENDING_BUFFER: RefCell<Option<PendingBuffer>> = const { RefCell::new(None) };
+}
+
+/// Tracks an asynchronously submitted command buffer
+struct PendingBuffer {
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    completed: Arc<AtomicBool>,
+    /// Keep the completion block alive until command buffer completes
+    _block: RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>,
+}
+
+impl PendingBuffer {
+    /// Wait for the command buffer to complete
+    fn wait(&self) {
+        // First check the atomic flag (fast path)
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
+        // Fall back to blocking wait
+        self.command_buffer.waitUntilCompleted();
+    }
+
+    /// Check if the command buffer has completed without blocking
+    fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
 }
 
 struct BatchState {
@@ -73,6 +114,34 @@ impl BatchState {
         self.end_current_encoder();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();
+    }
+
+    /// Commit the command buffer asynchronously and return a completion tracker
+    fn commit_async(mut self) -> PendingBuffer {
+        self.end_current_encoder();
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = completed.clone();
+
+        // Create an RcBlock that takes NonNull<ProtocolObject<dyn MTLCommandBuffer>>
+        // SAFETY: The block is invoked on a Metal internal thread when the command buffer completes
+        let block = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            completed_clone.store(true, Ordering::Release);
+        });
+
+        unsafe {
+            // Convert RcBlock to the raw pointer expected by addCompletedHandler
+            self.command_buffer
+                .addCompletedHandler(&*block as *const _ as *mut _);
+        }
+        self.command_buffer.commit();
+
+        PendingBuffer {
+            command_buffer: self.command_buffer,
+            completed,
+            // Keep the block alive until command buffer completes
+            _block: block,
+        }
     }
 }
 
@@ -130,6 +199,70 @@ impl CommandBatch {
             }
             *b.borrow_mut() = None;
         });
+    }
+
+    /// Commit the current batch asynchronously without waiting.
+    ///
+    /// This allows CPU work to proceed while the GPU executes.
+    /// Call `wait_for_completion()` before reading any results.
+    ///
+    /// After calling this, a new batch is automatically started for subsequent operations.
+    pub fn commit_async() {
+        BATCH.with(|b| {
+            let pending = {
+                let mut batch_ref = b.borrow_mut();
+                batch_ref.take().map(|batch| batch.commit_async())
+            };
+
+            // Store the pending buffer for later wait
+            if let Some(pending) = pending {
+                PENDING_BUFFER.with(|p| {
+                    // Wait for any previous pending buffer first
+                    if let Some(old) = p.borrow_mut().take() {
+                        old.wait();
+                    }
+                    *p.borrow_mut() = Some(pending);
+                });
+            }
+
+            // Start a new batch for subsequent operations
+            *b.borrow_mut() = Some(BatchState::new());
+        });
+    }
+
+    /// Wait for the last async-committed batch to complete.
+    ///
+    /// This must be called before reading any GPU buffer contents after `commit_async()`.
+    pub fn wait_for_completion() {
+        PENDING_BUFFER.with(|p| {
+            if let Some(pending) = p.borrow().as_ref() {
+                pending.wait();
+            }
+        });
+    }
+
+    /// Check if the last async-committed batch has completed.
+    ///
+    /// Returns true if there's no pending async work or if it has completed.
+    pub fn is_async_complete() -> bool {
+        PENDING_BUFFER.with(|p| {
+            p.borrow()
+                .as_ref()
+                .map(|pending| pending.is_completed())
+                .unwrap_or(true)
+        })
+    }
+
+    /// End async mode and clean up pending buffer.
+    ///
+    /// Waits for any pending async work and clears the pending buffer.
+    pub fn end_async() {
+        PENDING_BUFFER.with(|p| {
+            if let Some(pending) = p.borrow_mut().take() {
+                pending.wait();
+            }
+        });
+        Self::end();
     }
 
     /// Execute a compute operation, using the batch if active.
@@ -284,5 +417,73 @@ mod tests {
         assert_eq!(result, &[6.0, 8.0, 10.0, 12.0]);
 
         CommandBatch::end();
+    }
+
+    #[test]
+    fn test_async_commit() {
+        CommandBatch::begin();
+
+        let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
+        let c = add(&a, &b);
+
+        // Commit async - returns immediately
+        CommandBatch::commit_async();
+
+        // Do some "CPU work" while GPU executes
+        let _cpu_result: i32 = (0..100).sum();
+
+        // Wait before reading results
+        CommandBatch::wait_for_completion();
+
+        let result = c.as_f32_slice();
+        assert_eq!(result, &[6.0, 8.0, 10.0, 12.0]);
+
+        CommandBatch::end_async();
+    }
+
+    #[test]
+    fn test_is_async_complete() {
+        CommandBatch::begin();
+
+        let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
+        let _c = add(&a, &b);
+
+        CommandBatch::commit_async();
+
+        // Poll for completion
+        while !CommandBatch::is_async_complete() {
+            std::thread::yield_now();
+        }
+
+        assert!(CommandBatch::is_async_complete());
+        CommandBatch::end_async();
+    }
+
+    #[test]
+    fn test_multiple_async_batches() {
+        // First batch
+        CommandBatch::begin();
+        let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
+        let c1 = add(&a, &b);
+        CommandBatch::commit_async();
+
+        // Second batch (starts immediately, waits for first internally)
+        let d = Tensor::from_f32_slice(&[10.0, 20.0, 30.0, 40.0], &[4]);
+        let e = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let c2 = add(&d, &e);
+        CommandBatch::commit_async();
+
+        // Wait for all
+        CommandBatch::wait_for_completion();
+
+        let r1 = c1.as_f32_slice();
+        let r2 = c2.as_f32_slice();
+        assert_eq!(r1, &[6.0, 8.0, 10.0, 12.0]);
+        assert_eq!(r2, &[11.0, 22.0, 33.0, 44.0]);
+
+        CommandBatch::end_async();
     }
 }

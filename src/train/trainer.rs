@@ -142,6 +142,12 @@ impl Trainer {
         batch_size: usize,
         seq_len: usize,
     ) -> (f32, f32) {
+        // Wait for any pending async work from previous step
+        // This ensures optimizer updates are complete before we read weights
+        if self.config.async_gpu {
+            CommandBatch::wait_for_completion();
+        }
+
         // Enable command buffer batching for reduced GPU synchronization
         CommandBatch::begin();
 
@@ -311,8 +317,15 @@ impl Trainer {
 
         self.step += 1;
 
-        // End command batching (commits and waits for all optimizer steps)
-        CommandBatch::end();
+        // End command batching
+        if self.config.async_gpu {
+            // Async mode: commit without waiting, allowing CPU to prepare next batch
+            // The wait happens at the start of the next train_step
+            CommandBatch::commit_async();
+        } else {
+            // Sync mode: commit and wait for all optimizer steps
+            CommandBatch::end();
+        }
 
         Profiler::end_step();
         (loss, total_grad_norm)
@@ -643,6 +656,8 @@ impl Trainer {
     }
 
     /// Train for one epoch
+    ///
+    /// Uses async command submission to overlap CPU data preparation with GPU execution.
     pub fn train_epoch<C: TrainCallback>(
         &mut self,
         dataset: &TokenDataset,
@@ -657,14 +672,25 @@ impl Trainer {
         let mut step_start = Instant::now();
         let mut tokens_processed = 0usize;
 
-        for (input_ids, target_ids) in &mut iter {
+        // Prefetch first batch
+        let mut next_batch = iter.next();
+
+        while let Some((input_ids, target_ids)) = next_batch {
             let actual_batch = input_ids.len() / seq_len;
             if actual_batch == 0 {
+                next_batch = iter.next();
                 continue;
             }
 
+            // Prefetch next batch while GPU executes current batch
+            // This overlaps CPU data loading with GPU computation
+            let prefetch_batch = iter.next();
+
             let (loss, gn) = self.train_step(&input_ids, &target_ids, actual_batch, seq_len);
             tokens_processed += actual_batch * seq_len;
+
+            // Use prefetched batch for next iteration
+            next_batch = prefetch_batch;
 
             // Log at intervals
             if self.step % self.config.log_interval == 0 {
@@ -787,6 +813,12 @@ impl Trainer {
                 );
                 break;
             }
+        }
+
+        // Ensure all async GPU work is complete before saving
+        if self.config.async_gpu {
+            CommandBatch::wait_for_completion();
+            CommandBatch::end_async();
         }
 
         // Save final checkpoint
