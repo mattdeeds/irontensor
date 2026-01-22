@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const BACKWARD_ELEMENTWISE_SHADER: &str = include_str!("../../shaders/backward/elementwise.metal");
@@ -58,6 +59,7 @@ fn get_pipelines() -> &'static ElementwiseBackwardPipelines {
 /// Backward pass for element-wise multiplication
 /// Returns (grad_a, grad_b)
 pub fn mul_backward(grad_output: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
+    let _timer = timed(OpCategory::ElementwiseBackward("mul".to_string()), grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
     assert_eq!(a.precision(), Precision::FP32);
     assert_eq!(b.precision(), Precision::FP32);
@@ -108,6 +110,7 @@ pub fn mul_backward(grad_output: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Te
 
 /// Backward pass for scale operation
 pub fn scale_backward(grad_output: &Tensor, scalar: f32) -> Tensor {
+    let _timer = timed(OpCategory::ElementwiseBackward("scale".to_string()), grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
 
     let count = grad_output.numel();
@@ -207,22 +210,26 @@ fn dispatch_unary_backward(
 
 /// Backward pass for SiLU activation
 pub fn silu_backward(grad_output: &Tensor, input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::ElementwiseBackward("silu".to_string()), grad_output.numel());
     dispatch_unary_backward(&get_pipelines().silu_backward, grad_output, input)
 }
 
 /// Backward pass for GELU activation
 pub fn gelu_backward(grad_output: &Tensor, input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::ElementwiseBackward("gelu".to_string()), grad_output.numel());
     dispatch_unary_backward(&get_pipelines().gelu_backward, grad_output, input)
 }
 
 /// Backward pass for ReLU activation
 pub fn relu_backward(grad_output: &Tensor, input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::ElementwiseBackward("relu".to_string()), grad_output.numel());
     dispatch_unary_backward(&get_pipelines().relu_backward, grad_output, input)
 }
 
 /// Backward pass for SwiGLU
 /// Returns (grad_gate, grad_up)
 pub fn swiglu_backward(grad_output: &Tensor, gate: &Tensor, up: &Tensor) -> (Tensor, Tensor) {
+    let _timer = timed(OpCategory::ElementwiseBackward("swiglu".to_string()), grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
     assert_eq!(gate.precision(), Precision::FP32);
     assert_eq!(up.precision(), Precision::FP32);

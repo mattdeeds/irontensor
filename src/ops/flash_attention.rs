@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const FLASH_ATTENTION_SHADER: &str = include_str!("../shaders/flash_attention.metal");
@@ -72,6 +73,7 @@ fn get_pipelines() -> &'static FlashAttentionPipelines {
 /// Arguments:
 /// - `causal`: If true, applies causal masking (each position can only attend to previous positions)
 pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
+    let _timer = timed(OpCategory::FlashAttention, q.numel());
     assert_eq!(q.precision(), Precision::FP32);
     assert_eq!(k.precision(), Precision::FP32);
     assert_eq!(v.precision(), Precision::FP32);

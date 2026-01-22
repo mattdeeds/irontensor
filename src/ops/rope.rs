@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const ROPE_SHADER: &str = include_str!("../shaders/rope.metal");
@@ -61,6 +62,7 @@ fn get_pipelines() -> &'static RoPEPipelines {
 ///
 /// Returns tensor with same shape as input
 pub fn rope(input: &Tensor, base: f32, position_offset: usize) -> Tensor {
+    let _timer = timed(OpCategory::RoPE, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
 
     let shape = input.shape();

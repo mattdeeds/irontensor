@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const ATTENTION_SHADER: &str = include_str!("../shaders/attention.metal");
@@ -275,6 +276,7 @@ fn apply_causal_mask(scores: &Tensor) -> Tensor {
 ///
 /// Returns: [batch, seq_len, num_heads, head_dim]
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
+    let _timer = timed(OpCategory::Attention, q.numel());
     assert_eq!(q.precision(), Precision::FP32);
     assert_eq!(k.precision(), Precision::FP32);
     assert_eq!(v.precision(), Precision::FP32);

@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const BACKWARD_GEMM_SHADER: &str = include_str!("../../shaders/backward/gemm.metal");
@@ -67,6 +68,7 @@ fn get_pipelines() -> &'static GemmBackwardPipelines {
 ///
 /// For 3D (batched): same formula applied per batch
 pub fn matmul_backward(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
+    let _timer = timed(OpCategory::MatmulBackward, grad_c.numel());
     assert_eq!(grad_c.precision(), Precision::FP32);
     assert_eq!(a.precision(), Precision::FP32);
     assert_eq!(b.precision(), Precision::FP32);
@@ -84,6 +86,7 @@ pub fn matmul_backward(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tens
 
 /// Compute only grad_A from matmul backward
 pub fn matmul_backward_a(grad_c: &Tensor, b: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::MatmulBackward, grad_c.numel());
     assert_eq!(grad_c.precision(), Precision::FP32);
     assert_eq!(b.precision(), Precision::FP32);
 
@@ -113,6 +116,7 @@ pub fn matmul_backward_a(grad_c: &Tensor, b: &Tensor) -> Tensor {
 
 /// Compute only grad_B from matmul backward
 pub fn matmul_backward_b(grad_c: &Tensor, a: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::MatmulBackward, grad_c.numel());
     assert_eq!(grad_c.precision(), Precision::FP32);
     assert_eq!(a.precision(), Precision::FP32);
 

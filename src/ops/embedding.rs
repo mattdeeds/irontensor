@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const EMBEDDING_SHADER: &str = include_str!("../shaders/embedding.metal");
@@ -56,6 +57,7 @@ fn get_pipelines() -> &'static EmbeddingPipelines {
 ///
 /// Returns: [num_indices, embed_dim]
 pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
+    let _timer = timed(OpCategory::Embedding, indices.len() * weights.shape()[1]);
     assert_eq!(weights.precision(), Precision::FP32);
 
     let weights_shape = weights.shape();

@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const BACKWARD_NORM_SHADER: &str = include_str!("../../shaders/backward/norm.metal");
@@ -62,6 +63,7 @@ pub fn rmsnorm_backward(
     gamma: &Tensor,
     eps: f32,
 ) -> (Tensor, Tensor) {
+    let _timer = timed(OpCategory::RmsNormBackward, grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
     assert_eq!(input.precision(), Precision::FP32);
     assert_eq!(gamma.precision(), Precision::FP32);

@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const BACKWARD_SOFTMAX_SHADER: &str = include_str!("../../shaders/backward/softmax.metal");
@@ -58,6 +59,7 @@ fn get_pipelines() -> &'static SoftmaxBackwardPipelines {
 /// grad_x = y * (grad_y - dot(grad_y, y))
 /// where y is the softmax output
 pub fn softmax_backward(grad_output: &Tensor, output: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::SoftmaxBackward, grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
     assert_eq!(output.precision(), Precision::FP32);
     assert_eq!(grad_output.shape(), output.shape());

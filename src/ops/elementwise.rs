@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const ELEMENTWISE_SHADER: &str = include_str!("../shaders/elementwise.metal");
@@ -205,26 +206,31 @@ fn dispatch_scalar_op(
 
 /// Element-wise addition: C = A + B
 pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("add".to_string()), a.numel());
     dispatch_binary_op(&get_pipelines().add, a, b)
 }
 
 /// Element-wise multiplication: C = A * B
 pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("mul".to_string()), a.numel());
     dispatch_binary_op(&get_pipelines().mul, a, b)
 }
 
 /// Scale tensor by scalar: B = A * scalar
 pub fn scale(a: &Tensor, scalar: f32) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("scale".to_string()), a.numel());
     dispatch_scalar_op(&get_pipelines().scale, a, scalar)
 }
 
 /// Add scalar to tensor: B = A + scalar
 pub fn add_scalar(a: &Tensor, scalar: f32) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("add_scalar".to_string()), a.numel());
     dispatch_scalar_op(&get_pipelines().add_scalar, a, scalar)
 }
 
 /// SiLU (Swish) activation: y = x * sigmoid(x)
 pub fn silu(input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("silu".to_string()), input.numel());
     dispatch_unary_op(&get_pipelines().silu, input)
 }
 
@@ -239,17 +245,20 @@ pub fn silu(input: &Tensor) -> Tensor {
 /// as it is faster to compute than the exact GELU while maintaining
 /// similar accuracy. The maximum error vs exact GELU is ~0.004.
 pub fn gelu(input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("gelu".to_string()), input.numel());
     dispatch_unary_op(&get_pipelines().gelu, input)
 }
 
 /// ReLU activation: y = max(0, x)
 pub fn relu(input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("relu".to_string()), input.numel());
     dispatch_unary_op(&get_pipelines().relu, input)
 }
 
 /// SwiGLU: output = silu(gate) * up
 /// Used in Llama-style FFN
 pub fn swiglu(gate: &Tensor, up: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Elementwise("swiglu".to_string()), gate.numel());
     dispatch_binary_op(&get_pipelines().swiglu, gate, up)
 }
 

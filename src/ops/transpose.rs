@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const TRANSPOSE_SHADER: &str = include_str!("../shaders/transpose.metal");
@@ -67,6 +68,7 @@ fn get_pipelines() -> &'static TransposePipelines {
 
 /// Transpose a 2D tensor: [rows, cols] -> [cols, rows]
 pub fn transpose_2d(input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Transpose, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
     let shape = input.shape();
     assert_eq!(shape.len(), 2, "transpose_2d requires 2D tensor");
@@ -149,6 +151,7 @@ pub fn transpose_2d(input: &Tensor) -> Tensor {
 /// Transpose dimensions 1 and 2 of a 4D tensor: [batch, dim1, dim2, dim3] -> [batch, dim2, dim1, dim3]
 /// Used for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
 pub fn transpose_for_attention(input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Transpose, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
     let shape = input.shape();
     assert_eq!(shape.len(), 4, "transpose_for_attention requires 4D tensor");
@@ -212,6 +215,7 @@ pub fn transpose_for_attention(input: &Tensor) -> Tensor {
 /// Transpose dimensions 1 and 2 back: [batch, dim2, dim1, dim3] -> [batch, dim1, dim2, dim3]
 /// Inverse of transpose_for_attention
 pub fn transpose_from_attention(input: &Tensor, batch: usize, dim1: usize, dim2: usize, dim3: usize) -> Tensor {
+    let _timer = timed(OpCategory::Transpose, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
     let shape = input.shape();
     assert_eq!(shape.len(), 4, "transpose_from_attention requires 4D tensor");

@@ -3,6 +3,7 @@ use irontensor::{
     CosineAnnealingLR, LRScheduler, Trainer, TrainingConfig,
     save_model_weights, Checkpoint,
     MetalContext,
+    Profiler, ProfilerConfig,
 };
 use objc2_metal::MTLDevice;
 use std::fs;
@@ -19,6 +20,17 @@ fn main() {
     println!("IronTensor - GPT Training on Tiny Shakespeare");
     println!("==============================================");
     println!("Device: {}\n", ctx.device().name());
+
+    // Initialize profiler (opt-in, enable via environment variable)
+    let profiling_enabled = std::env::var("IRONTENSOR_PROFILE").is_ok();
+    Profiler::init(ProfilerConfig {
+        enabled: profiling_enabled,
+        warmup_steps: 5,
+        report_interval: 0, // Print at end only
+    });
+    if profiling_enabled {
+        println!("Profiling enabled (set IRONTENSOR_PROFILE=0 to disable)\n");
+    }
 
     // Create data directory if it doesn't exist
     fs::create_dir_all("data").expect("Failed to create data directory");
@@ -159,7 +171,7 @@ fn main() {
         beta2: 0.99,
         max_grad_norm: 1.0,
         warmup_steps: 50,
-        total_steps: 500,  // Reduced for testing
+        total_steps: 100,  // Reduced for testing
         log_interval: 10,  // More frequent logging
         save_interval: 100,
         eval_interval: 50,
@@ -245,6 +257,12 @@ fn main() {
 
     println!("{}", "-".repeat(60));
     println!("Training complete!\n");
+
+    // Print profiling report if enabled
+    if profiling_enabled {
+        let report = Profiler::report();
+        report.print();
+    }
 
     // =====================================================================
     // Step 6: Text Generation

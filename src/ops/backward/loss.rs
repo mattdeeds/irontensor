@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const LOSS_SHADER: &str = include_str!("../../shaders/loss.metal");
@@ -62,6 +63,7 @@ fn get_pipelines() -> &'static LossPipelines {
 /// targets: [batch] - target class indices
 /// Returns: (mean_loss, per_sample_losses)
 pub fn cross_entropy(logits: &Tensor, targets: &[u32]) -> (f32, Tensor) {
+    let _timer = timed(OpCategory::CrossEntropyBackward, logits.numel());
     assert_eq!(logits.precision(), Precision::FP32);
 
     let shape = logits.shape();
@@ -165,6 +167,7 @@ pub fn cross_entropy(logits: &Tensor, targets: &[u32]) -> (f32, Tensor) {
 /// Cross-entropy backward (gradient of softmax + cross-entropy w.r.t. logits)
 /// This computes: grad_logits = softmax(logits) - one_hot(targets)
 pub fn cross_entropy_backward(logits: &Tensor, targets: &[u32]) -> Tensor {
+    let _timer = timed(OpCategory::CrossEntropyBackward, logits.numel());
     assert_eq!(logits.precision(), Precision::FP32);
 
     let shape = logits.shape();
@@ -244,6 +247,7 @@ pub fn cross_entropy_backward(logits: &Tensor, targets: &[u32]) -> Tensor {
 /// Fused cross-entropy: computes both loss and gradients in one pass
 /// Returns (mean_loss, per_sample_losses, grad_logits)
 pub fn cross_entropy_fused(logits: &Tensor, targets: &[u32]) -> (f32, Tensor, Tensor) {
+    let _timer = timed(OpCategory::CrossEntropyBackward, logits.numel());
     assert_eq!(logits.precision(), Precision::FP32);
 
     let shape = logits.shape();

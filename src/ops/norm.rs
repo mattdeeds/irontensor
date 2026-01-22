@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const NORM_SHADER: &str = include_str!("../shaders/norm.metal");
@@ -63,6 +64,7 @@ fn get_pipelines() -> &'static NormPipelines {
 ///
 /// Returns tensor with same shape as input
 pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> Tensor {
+    let _timer = timed(OpCategory::RmsNorm, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
     assert_eq!(gamma.precision(), Precision::FP32);
 

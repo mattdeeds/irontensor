@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const BACKWARD_EMBEDDING_SHADER: &str = include_str!("../../shaders/backward/embedding.metal");
@@ -60,6 +61,7 @@ pub fn embedding_backward(
     indices: &[u32],
     vocab_size: usize,
 ) -> Tensor {
+    let _timer = timed(OpCategory::EmbeddingBackward, grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
 
     let grad_shape = grad_output.shape();

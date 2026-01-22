@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const SOFTMAX_SHADER: &str = include_str!("../shaders/softmax.metal");
@@ -63,6 +64,7 @@ fn get_pipelines() -> &'static SoftmaxPipelines {
 ///
 /// Returns tensor with same shape as input
 pub fn softmax(input: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::Softmax, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
 
     let shape = input.shape();

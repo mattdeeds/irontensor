@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const LION_SHADER: &str = include_str!("../shaders/lion.metal");
@@ -165,6 +166,7 @@ impl Lion {
     ///
     /// Updates the weights in-place using the gradients and momentum state.
     pub fn step(&self, weights: &Tensor, gradients: &Tensor, state: &mut ParamState) {
+        let _timer = timed(OpCategory::LionStep, weights.numel());
         assert_eq!(weights.precision(), Precision::FP32);
         assert_eq!(gradients.precision(), Precision::FP32);
         assert_eq!(weights.shape(), gradients.shape());
@@ -307,6 +309,7 @@ impl Lion {
 
 /// Zero out gradients in a tensor
 pub fn zero_gradients(gradients: &Tensor) {
+    let _timer = timed(OpCategory::ZeroGradients, gradients.numel());
     assert_eq!(gradients.precision(), Precision::FP32);
 
     let count = gradients.numel();
@@ -361,6 +364,7 @@ pub fn zero_gradients(gradients: &Tensor) {
 
 /// Compute the global L2 norm of gradients
 pub fn grad_norm(gradients: &Tensor) -> f32 {
+    let _timer = timed(OpCategory::GradientNorm, gradients.numel());
     assert_eq!(gradients.precision(), Precision::FP32);
 
     let count = gradients.numel();
@@ -433,6 +437,7 @@ pub fn grad_norm(gradients: &Tensor) -> f32 {
 /// If the global norm exceeds `max_norm`, scales all gradients by `max_norm / actual_norm`.
 /// Returns the actual norm before clipping.
 pub fn clip_grad_norm(gradients: &Tensor, max_norm: f32) -> f32 {
+    let _timer = timed(OpCategory::GradientClip, gradients.numel());
     let actual_norm = grad_norm(gradients);
 
     if actual_norm <= max_norm || actual_norm == 0.0 {

@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const BACKWARD_ROPE_SHADER: &str = include_str!("../../shaders/backward/rope.metal");
@@ -55,6 +56,7 @@ fn get_pipelines() -> &'static RoPEBackwardPipelines {
 /// RoPE backward pass
 /// The backward of rotation is the inverse rotation (transpose)
 pub fn rope_backward(grad_output: &Tensor, base: f32, position_offset: usize) -> Tensor {
+    let _timer = timed(OpCategory::RoPEBackward, grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
 
     let shape = grad_output.shape();

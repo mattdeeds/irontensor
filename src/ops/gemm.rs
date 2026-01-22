@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const GEMM_SHADER: &str = include_str!("../shaders/gemm.metal");
@@ -79,6 +80,14 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
     let a_shape = a.shape();
     let b_shape = b.shape();
+
+    // Compute output elements for profiling
+    let output_elements = match (a_shape.len(), b_shape.len()) {
+        (2, 2) => a_shape[0] * b_shape[1],
+        (3, 3) => a_shape[0] * a_shape[1] * b_shape[2],
+        _ => 0,
+    };
+    let _timer = timed(OpCategory::Matmul, output_elements);
 
     match (a_shape.len(), b_shape.len()) {
         (2, 2) => matmul_2d(a, b),

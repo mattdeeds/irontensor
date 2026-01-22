@@ -9,6 +9,7 @@ use crate::ops::{
     transpose_for_attention_backward, transpose_from_attention,
 };
 use crate::optim::{Lion, LionConfig};
+use crate::profile::{Phase, Profiler};
 use crate::tensor::Tensor;
 
 use super::cache::{ForwardCache, LayerCache, LayerGradients};
@@ -138,6 +139,8 @@ impl Trainer {
         batch_size: usize,
         seq_len: usize,
     ) -> (f32, f32) {
+        Profiler::begin_step();
+
         let lr = self.scheduler.get_lr(self.step);
         self.optimizer.set_lr(lr);
 
@@ -146,6 +149,7 @@ impl Trainer {
         let n = batch_size * seq_len;
 
         // ========== Forward pass with activation caching ==========
+        Profiler::set_phase(Phase::Forward);
         let cache = self.forward_with_cache(input_ids, batch_size, seq_len);
 
         // Compute logits: final_hidden @ embed_tokens.T
@@ -156,6 +160,7 @@ impl Trainer {
         let (loss, _, grad_logits) = cross_entropy_fused(&logits_2d, target_ids);
 
         // ========== Backward pass ==========
+        Profiler::set_phase(Phase::Backward);
 
         // Gradient for embedding from output projection
         // logits = final_hidden @ embed.T, so grad_embed_out = grad_logits.T @ final_hidden
@@ -183,12 +188,14 @@ impl Trainer {
         // Backward through transformer layers (in reverse order)
         let mut layer_grads = Vec::new();
         for (layer_idx, layer_cache) in cache.layers.iter().enumerate().rev() {
+            Profiler::set_layer(Some(layer_idx));
             let layer = &self.model.layers[layer_idx];
             let grads =
                 self.backward_transformer_layer(&grad_hidden, layer_cache, layer, batch_size, seq_len);
             grad_hidden = grads.grad_input.clone();
             layer_grads.push(grads);
         }
+        Profiler::set_layer(None);
         layer_grads.reverse();
 
         // Backward through embedding lookup
@@ -226,6 +233,7 @@ impl Trainer {
         };
 
         // ========== Apply optimizer to all parameters ==========
+        Profiler::set_phase(Phase::Optimizer);
 
         // Embedding
         let grad_embed_clipped = scale_tensor(&grad_embed, clip_scale);
@@ -287,6 +295,7 @@ impl Trainer {
         }
 
         self.step += 1;
+        Profiler::end_step();
         (loss, total_grad_norm)
     }
 
@@ -309,12 +318,14 @@ impl Trainer {
 
         // Process each transformer layer
         let mut layer_caches = Vec::new();
-        for layer in &self.model.layers {
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            Profiler::set_layer(Some(layer_idx));
             let (new_hidden, cache) =
                 self.forward_layer_with_cache(&hidden, layer, batch_size, seq_len);
             layer_caches.push(cache);
             hidden = new_hidden;
         }
+        Profiler::set_layer(None);
 
         // Store hidden state before final norm (for backward pass through RMSNorm)
         let pre_final_norm = hidden.clone();

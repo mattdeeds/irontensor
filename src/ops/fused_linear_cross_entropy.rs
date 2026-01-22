@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::device::MetalContext;
 use crate::precision::Precision;
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 const FUSED_LINEAR_CE_SHADER: &str = include_str!("../shaders/fused_linear_cross_entropy.metal");
@@ -79,6 +80,7 @@ pub fn fused_linear_cross_entropy(
     weight: &Tensor,
     targets: &[i32],
 ) -> (f32, Tensor, Tensor) {
+    let _timer = timed(OpCategory::FusedLinearCE, hidden.numel() + weight.numel());
     assert_eq!(hidden.precision(), Precision::FP32);
     assert_eq!(weight.precision(), Precision::FP32);
 
@@ -255,6 +257,7 @@ pub fn fused_linear_cross_entropy_forward_only(
     weight: &Tensor,
     targets: &[i32],
 ) -> (f32, Tensor) {
+    let _timer = timed(OpCategory::FusedLinearCE, hidden.numel() + weight.numel());
     assert_eq!(hidden.precision(), Precision::FP32);
     assert_eq!(weight.precision(), Precision::FP32);
 

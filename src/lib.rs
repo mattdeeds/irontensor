@@ -4,6 +4,7 @@ pub mod nn;
 pub mod ops;
 pub mod optim;
 pub mod precision;
+pub mod profile;
 pub mod tensor;
 pub mod train;
 
@@ -35,4 +36,7 @@ pub use train::{
     load_model_weights, save_model_weights, Checkpoint, ConstantLR, CosineAnnealingLR,
     InverseSqrtLR, LRScheduler, LinearDecayLR, PrintCallback, TrainCallback, TrainMetrics,
     Trainer, TrainingConfig, WarmupConstantLR,
+};
+pub use profile::{
+    OpCategory, Phase, ProfileReport, Profiler, ProfilerConfig,
 };
