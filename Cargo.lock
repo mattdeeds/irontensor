@@ -308,6 +308,8 @@ dependencies = [
  "objc2-metal",
  "objc2-metal-performance-shaders",
  "rand",
+ "serde",
+ "serde_json",
  "tokenizers",
 ]
 

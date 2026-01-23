@@ -1,14 +1,14 @@
 use irontensor::{
-    GPTModel, ModelConfig, TokenDataset,
-    CosineAnnealingLR, LRScheduler, Trainer, TrainingConfig,
-    save_model_weights, Checkpoint,
-    MetalContext,
-    Profiler, ProfilerConfig,
+    GPTModel, MetalContext, ModelConfig, Profiler, ProfilerConfig, TokenDataset,
+    TrainConfigSnapshot, Trainer, TrainingConfig,
 };
+use irontensor::logging::{InferenceTimer, LogConfig, Logger, TrainStepRecord};
+use irontensor::train::{TrainCallback, TrainMetrics};
 use objc2_metal::MTLDevice;
 use rand::Rng;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{DecoderWrapper, PreTokenizerWrapper, Tokenizer};
@@ -196,82 +196,67 @@ fn main() {
     println!("  async_gpu: {}", train_config.async_gpu);
     println!();
 
+    // Initialize logger (opt-in, enable via environment variable)
+    let logging_enabled = std::env::var("IRONTENSOR_LOG").is_ok();
+    Logger::init(LogConfig {
+        enabled: logging_enabled,
+        log_dir: std::env::var("IRONTENSOR_LOG_DIR").unwrap_or_else(|_| "logs".to_string()),
+        model_name: "shakespeare".to_string(),
+        config: TrainConfigSnapshot {
+            learning_rate: train_config.learning_rate,
+            weight_decay: train_config.weight_decay,
+            batch_size,
+            seq_len,
+            warmup_steps: train_config.warmup_steps,
+            total_steps: train_config.total_steps,
+            use_bf16: train_config.use_bf16,
+        },
+        include_op_breakdown: std::env::var("IRONTENSOR_LOG_OPS").is_ok(),
+        ..Default::default()
+    });
+    if logging_enabled {
+        println!("Logging enabled (will write to: {})\n",
+            Logger::log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "logs".to_string()));
+    }
+
     // Create trainer
     let mut trainer = Trainer::new(&config, &train_config);
 
-    // Training loop
-    let num_batches = train_dataset.num_sequences() / batch_size;
-    let steps_per_epoch = num_batches.max(1);
+    // Create logging callback
+    let mut callback = LoggingCallback::new(batch_size, seq_len);
+
+    // Start training timer
+    Logger::start_training();
+    let training_start = Instant::now();
 
     println!("Starting training...");
-    println!("Steps per epoch: {}", steps_per_epoch);
     println!("{}", "-".repeat(60));
 
-    let scheduler = CosineAnnealingLR::with_warmup(
-        train_config.learning_rate,
-        train_config.warmup_steps,
-        train_config.total_steps,
-    );
+    // Use Trainer::train_epoch for proper training loop
+    let num_epochs = (train_config.total_steps / (train_dataset.num_sequences() / batch_size).max(1)).max(1) + 1;
+    trainer.train(&train_dataset, Some(&val_dataset), batch_size, num_epochs, &mut callback);
 
-    let mut running_loss = 0.0;
-    let mut loss_count = 0;
-
-    for step in 0..train_config.total_steps {
-        // Get batch
-        let batch_idx = (step % steps_per_epoch) * batch_size;
-        let (input_ids, target_ids) = get_batch(&train_dataset, batch_idx, batch_size, seq_len);
-
-        // Training step (handles forward, backward, optimizer update internally)
-        let (loss, _grad_norm) = trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
-
-        let lr = scheduler.get_lr(step);
-
-        running_loss += loss;
-        loss_count += 1;
-
-        // Logging
-        if (step + 1) % train_config.log_interval == 0 {
-            let avg_loss = running_loss / loss_count as f32;
-            println!(
-                "Step {:5}/{} | Loss: {:.4} | LR: {:.2e}",
-                step + 1,
-                train_config.total_steps,
-                avg_loss,
-                lr
-            );
-            running_loss = 0.0;
-            loss_count = 0;
-        }
-
-        // Evaluation
-        if (step + 1) % train_config.eval_interval == 0 {
-            let val_loss = evaluate(&trainer, &val_dataset, batch_size, seq_len, 10);
-            println!("  Validation Loss: {:.4}", val_loss);
-        }
-
-        // Checkpointing
-        if (step + 1) % train_config.save_interval == 0 {
-            let checkpoint_path = format!("{}/step_{}.bin", train_config.checkpoint_dir, step + 1);
-            let checkpoint = Checkpoint {
-                config: config.clone(),
-                step: step + 1,
-                epoch: step / steps_per_epoch,
-                best_val_loss: f32::INFINITY,
-                learning_rate: lr,
-            };
-            save_model_weights(Path::new(&checkpoint_path), &trainer.model, &checkpoint)
-                .expect("Failed to save checkpoint");
-            println!("  Saved checkpoint: {}", checkpoint_path);
-        }
-    }
-
+    let total_time_sec = training_start.elapsed().as_secs_f32();
     println!("{}", "-".repeat(60));
-    println!("Training complete!\n");
+    println!("Training complete in {:.1}s!\n", total_time_sec);
 
     // Print profiling report if enabled
-    if profiling_enabled {
+    let profiler_report = if profiling_enabled {
         let report = Profiler::report();
         report.print();
+        Some(report.to_record())
+    } else {
+        None
+    };
+
+    // Finalize training log
+    if logging_enabled {
+        Logger::finalize_training(
+            callback.last_loss,
+            callback.best_val_loss,
+            trainer.epoch,
+            profiler_report,
+        );
     }
 
     // =====================================================================
@@ -293,7 +278,80 @@ fn main() {
         println!("{}", "-".repeat(40));
     }
 
+    // Shutdown logger (writes the complete log file)
+    Logger::shutdown();
+
     println!("\nDone!");
+}
+
+/// Callback that prints to console and logs to file.
+struct LoggingCallback {
+    batch_size: usize,
+    seq_len: usize,
+    step_start: Instant,
+    last_loss: f32,
+    best_val_loss: Option<f32>,
+}
+
+impl LoggingCallback {
+    fn new(batch_size: usize, seq_len: usize) -> Self {
+        Self {
+            batch_size,
+            seq_len,
+            step_start: Instant::now(),
+            last_loss: 0.0,
+            best_val_loss: None,
+        }
+    }
+}
+
+impl TrainCallback for LoggingCallback {
+    fn on_step(&mut self, metrics: &TrainMetrics) {
+        self.last_loss = metrics.loss;
+
+        // Print to console
+        println!(
+            "Step {:>6} | Loss: {:.4} | Grad norm: {:.4} | LR: {:.2e} | {:.0} tok/s",
+            metrics.step,
+            metrics.loss,
+            metrics.grad_norm,
+            metrics.learning_rate,
+            metrics.tokens_per_sec
+        );
+
+        // Log to file
+        if Logger::is_enabled() {
+            let elapsed = self.step_start.elapsed().as_secs_f32();
+            let step_time_ms = elapsed * 1000.0;
+
+            let record = TrainStepRecord::new(
+                metrics.step,
+                0, // epoch is tracked by trainer
+                metrics.loss,
+                metrics.grad_norm,
+                metrics.learning_rate,
+                metrics.tokens_per_sec,
+                step_time_ms,
+                self.batch_size,
+                self.seq_len,
+            );
+            Logger::log_train_step(&record);
+        }
+
+        self.step_start = Instant::now();
+    }
+
+    fn on_eval(&mut self, step: usize, val_loss: f32) {
+        println!("Step {:>6} | Validation loss: {:.4}", step, val_loss);
+
+        if self.best_val_loss.is_none() || val_loss < self.best_val_loss.unwrap() {
+            self.best_val_loss = Some(val_loss);
+        }
+    }
+
+    fn on_save(&mut self, step: usize, path: &str) {
+        println!("Step {:>6} | Saved checkpoint to: {}", step, path);
+    }
 }
 
 /// Download text from a URL (simple blocking HTTP)
@@ -350,53 +408,7 @@ fn train_bpe_tokenizer(text: &str, vocab_size: usize) -> Tokenizer {
     tokenizer
 }
 
-/// Get a batch of training data
-fn get_batch(
-    dataset: &TokenDataset,
-    start_idx: usize,
-    batch_size: usize,
-    seq_len: usize,
-) -> (Vec<u32>, Vec<u32>) {
-    let mut input_ids = Vec::with_capacity(batch_size * seq_len);
-    let mut target_ids = Vec::with_capacity(batch_size * seq_len);
-
-    for b in 0..batch_size {
-        let idx = (start_idx + b) % dataset.num_sequences();
-        let (inp, tgt) = dataset.get_batch(idx);
-        input_ids.extend_from_slice(&inp[..seq_len.min(inp.len())]);
-        target_ids.extend_from_slice(&tgt[..seq_len.min(tgt.len())]);
-
-        // Pad if necessary
-        while input_ids.len() < (b + 1) * seq_len {
-            input_ids.push(0);
-            target_ids.push(0);
-        }
-    }
-
-    (input_ids, target_ids)
-}
-
-/// Evaluate on validation set
-fn evaluate(
-    trainer: &Trainer,
-    val_dataset: &TokenDataset,
-    batch_size: usize,
-    seq_len: usize,
-    num_batches: usize,
-) -> f32 {
-    let mut total_loss = 0.0;
-    let num_batches = num_batches.min(val_dataset.num_sequences() / batch_size).max(1);
-
-    for i in 0..num_batches {
-        let (input_ids, target_ids) = get_batch(val_dataset, i * batch_size, batch_size, seq_len);
-        let loss = trainer.compute_loss(&input_ids, &target_ids, batch_size, seq_len);
-        total_loss += loss;
-    }
-
-    total_loss / num_batches as f32
-}
-
-/// Generate text from a prompt
+/// Generate text from a prompt with optional performance logging.
 fn generate(
     model: &GPTModel,
     tokenizer: &Tokenizer,
@@ -407,11 +419,15 @@ fn generate(
     // Encode prompt
     let encoding = tokenizer.encode(prompt, false).expect("Failed to encode prompt");
     let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_len = tokens.len();
 
     let max_len = model.config.max_seq_len;
 
+    // Start inference timing
+    let mut timer = InferenceTimer::new(prompt_len, temperature);
+
     // Generate tokens one at a time
-    for _ in 0..max_tokens {
+    for i in 0..max_tokens {
         // Truncate if necessary
         let context_tokens = if tokens.len() > max_len {
             &tokens[tokens.len() - max_len..]
@@ -450,11 +466,21 @@ fn generate(
 
         tokens.push(next_token);
 
+        // Track inference timing
+        if i == 0 {
+            timer.mark_first_token();
+        } else {
+            timer.token_generated();
+        }
+
         // Stop at end of text token
         if next_token == 0 {
             break;
         }
     }
+
+    // Finish timing and log (automatically logs if Logger is enabled)
+    let _ = timer.finish();
 
     // Decode
     tokenizer.decode(&tokens, true).expect("Failed to decode")

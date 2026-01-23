@@ -62,6 +62,7 @@ impl Trainer {
                     tokens_per_sec,
                 };
                 callback.on_step(&metrics);
+
                 step_start = Instant::now();
             }
 

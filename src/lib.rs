@@ -2,6 +2,7 @@ pub mod command_batch;
 pub mod data;
 pub mod device;
 pub mod error;
+pub mod logging;
 pub mod nn;
 pub mod ops;
 pub mod optim;
@@ -41,6 +42,10 @@ pub use train::{
 };
 pub use profile::{
     OpCategory, Phase, ProfileReport, Profiler, ProfilerConfig,
+};
+pub use logging::{
+    InferenceRecord, InferenceTimer, LogConfig, Logger, ProfileReportRecord, RunLog,
+    TrainConfigSnapshot, TrainStepRecord, TrainingLog,
 };
 pub use command_batch::CommandBatch;
 pub use error::{TensorError, TensorResult};

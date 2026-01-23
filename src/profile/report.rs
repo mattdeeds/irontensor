@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::categories::{OpCategory, Phase};
+use crate::logging::{LayerTimingRecord, OpTimingRecord, ProfileReportRecord};
 
 /// Statistics for a single operation type.
 #[derive(Clone, Debug)]
@@ -164,6 +165,69 @@ impl ProfileReport {
             );
         }
         println!("{}", divider);
+    }
+
+    /// Convert to a serializable record for logging.
+    pub fn to_record(&self) -> ProfileReportRecord {
+        let total_time_ms = self.total_time.as_secs_f64() as f32 * 1000.0;
+        let avg_step_ms = if self.steps_recorded > 0 {
+            total_time_ms / self.steps_recorded as f32
+        } else {
+            0.0
+        };
+
+        // Convert phase breakdown
+        let phase_breakdown: HashMap<String, f32> = self
+            .phase_breakdown
+            .iter()
+            .map(|(phase, duration)| {
+                let ms = duration.as_secs_f64() as f32 * 1000.0 / self.steps_recorded.max(1) as f32;
+                (format!("{}", phase), ms)
+            })
+            .collect();
+
+        // Convert layer breakdown
+        let layer_breakdown: Vec<LayerTimingRecord> = self
+            .layer_breakdown
+            .iter()
+            .enumerate()
+            .map(|(i, timing)| {
+                let fwd_ms = timing.forward.as_secs_f64() as f32 * 1000.0
+                    / self.steps_recorded.max(1) as f32;
+                let bwd_ms = timing.backward.as_secs_f64() as f32 * 1000.0
+                    / self.steps_recorded.max(1) as f32;
+                LayerTimingRecord {
+                    layer: i,
+                    forward_ms: fwd_ms,
+                    backward_ms: bwd_ms,
+                    total_ms: fwd_ms + bwd_ms,
+                }
+            })
+            .collect();
+
+        // Convert top operations (sorted by time, top 15)
+        let mut sorted_ops: Vec<_> = self.op_stats.iter().collect();
+        sorted_ops.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+
+        let top_operations: Vec<OpTimingRecord> = sorted_ops
+            .iter()
+            .take(15)
+            .map(|op| OpTimingRecord {
+                op: op.category.short_name().to_string(),
+                time_ms: op.total_time.as_secs_f64() as f32 * 1000.0,
+                count: op.count,
+                avg_ms: op.avg_time().as_secs_f64() as f32 * 1000.0,
+            })
+            .collect();
+
+        ProfileReportRecord {
+            total_time_ms,
+            steps_recorded: self.steps_recorded,
+            avg_step_ms,
+            phase_breakdown,
+            layer_breakdown,
+            top_operations,
+        }
     }
 
     /// Convert the report to a JSON string.
