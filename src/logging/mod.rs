@@ -269,6 +269,7 @@ impl Logger {
 
     /// Finalize training summary.
     pub fn finalize_training(
+        total_steps: usize,
         final_loss: f32,
         best_val_loss: Option<f32>,
         epochs_completed: usize,
@@ -292,7 +293,7 @@ impl Logger {
                 };
 
                 s.run_log.training.total_time_sec = total_time_sec;
-                s.run_log.training.total_steps = s.run_log.training.steps.len();
+                s.run_log.training.total_steps = total_steps;
                 s.run_log.training.epochs_completed = epochs_completed;
                 s.run_log.training.final_loss = final_loss;
                 s.run_log.training.best_val_loss = best_val_loss;

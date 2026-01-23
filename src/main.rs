@@ -22,16 +22,15 @@ fn main() {
     println!("==============================================");
     println!("Device: {}\n", ctx.device().name());
 
-    // Initialize profiler (opt-in, enable via environment variable)
-    let profiling_enabled = std::env::var("IRONTENSOR_PROFILE").is_ok();
+    // Check if logging is enabled (profiler is enabled when logging is enabled)
+    let logging_enabled = std::env::var("IRONTENSOR_LOG").is_ok();
+
+    // Initialize profiler (enabled when logging is enabled)
     Profiler::init(ProfilerConfig {
-        enabled: profiling_enabled,
+        enabled: logging_enabled,
         warmup_steps: 5,
-        report_interval: 0, // Print at end only
+        report_interval: 0,
     });
-    if profiling_enabled {
-        println!("Profiling enabled (set IRONTENSOR_PROFILE=0 to disable)\n");
-    }
 
     // Create data directory if it doesn't exist
     fs::create_dir_all("data").expect("Failed to create data directory");
@@ -179,7 +178,7 @@ fn main() {
         warmup_steps: 50,
         total_steps: 100,  // Reduced for testing
         log_interval: 10,  // More frequent logging
-        save_interval: 100,
+        save_interval: usize::MAX,  // Disable checkpoints during testing
         eval_interval: 50,
         checkpoint_dir: "checkpoints".to_string(),
         use_bf16,
@@ -196,8 +195,7 @@ fn main() {
     println!("  async_gpu: {}", train_config.async_gpu);
     println!();
 
-    // Initialize logger (opt-in, enable via environment variable)
-    let logging_enabled = std::env::var("IRONTENSOR_LOG").is_ok();
+    // Initialize logger
     Logger::init(LogConfig {
         enabled: logging_enabled,
         log_dir: std::env::var("IRONTENSOR_LOG_DIR").unwrap_or_else(|_| "logs".to_string()),
@@ -240,11 +238,9 @@ fn main() {
     println!("{}", "-".repeat(60));
     println!("Training complete in {:.1}s!\n", total_time_sec);
 
-    // Print profiling report if enabled
-    let profiler_report = if profiling_enabled {
-        let report = Profiler::report();
-        report.print();
-        Some(report.to_record())
+    // Get profiler report (included in JSON log if logging enabled)
+    let profiler_report = if logging_enabled {
+        Some(Profiler::report().to_record())
     } else {
         None
     };
@@ -252,6 +248,7 @@ fn main() {
     // Finalize training log
     if logging_enabled {
         Logger::finalize_training(
+            trainer.step,  // Actual total steps completed
             callback.last_loss,
             callback.best_val_loss,
             trainer.epoch,
