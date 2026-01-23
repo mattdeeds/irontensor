@@ -35,6 +35,7 @@ pub enum OpCategory {
     FusedRMSNormLinear,
     Elementwise(String),
     Transpose,
+    RepeatKV,
 
     // Backward operations
     EmbeddingBackward,
@@ -45,6 +46,7 @@ pub enum OpCategory {
     ElementwiseBackward(String),
     CrossEntropyBackward,
     TransposeBackward,
+    RepeatKVBackward,
 
     // Optimizer operations
     LionStep,
@@ -67,6 +69,7 @@ impl fmt::Display for OpCategory {
             OpCategory::FusedRMSNormLinear => write!(f, "FusedRMSNormLinear"),
             OpCategory::Elementwise(name) => write!(f, "Elementwise({})", name),
             OpCategory::Transpose => write!(f, "Transpose"),
+            OpCategory::RepeatKV => write!(f, "RepeatKV"),
 
             OpCategory::EmbeddingBackward => write!(f, "EmbeddingBackward"),
             OpCategory::MatmulBackward => write!(f, "MatmulBackward"),
@@ -76,6 +79,7 @@ impl fmt::Display for OpCategory {
             OpCategory::ElementwiseBackward(name) => write!(f, "ElementwiseBackward({})", name),
             OpCategory::CrossEntropyBackward => write!(f, "CrossEntropyBackward"),
             OpCategory::TransposeBackward => write!(f, "TransposeBackward"),
+            OpCategory::RepeatKVBackward => write!(f, "RepeatKVBackward"),
 
             OpCategory::LionStep => write!(f, "LionStep"),
             OpCategory::GradientClip => write!(f, "GradientClip"),

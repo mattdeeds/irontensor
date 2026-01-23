@@ -142,7 +142,7 @@ fn main() {
     println!("  max_seq_len: {}", config.max_seq_len);
     println!("  tie_weights: {}", config.tie_weights);
 
-    let model = GPTModel::new(config.clone());
+    let model = GPTModel::new(&config);
     println!("\n{}", model.summary());
 
     let expected_initial_loss = (vocab_size as f64).ln();
@@ -197,7 +197,7 @@ fn main() {
     println!();
 
     // Create trainer
-    let mut trainer = Trainer::new(config.clone(), train_config.clone());
+    let mut trainer = Trainer::new(&config, &train_config);
 
     // Training loop
     let num_batches = train_dataset.num_sequences() / batch_size;

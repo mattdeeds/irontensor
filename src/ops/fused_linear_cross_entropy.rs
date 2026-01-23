@@ -419,14 +419,14 @@ mod tests {
             }
             Tensor::from_f32_slice(&t, &[hidden_dim, vocab_size])
         };
-        let logits = matmul(&hidden, &weight_t);
+        let logits = matmul(&hidden, &weight_t).unwrap();
 
         // Compute cross-entropy
         let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
         let (separate_loss, _probs, grad_logits) = cross_entropy_fused(&logits, &targets_u32);
 
         // Compute grad_hidden = grad_logits @ weight
-        let grad_hidden_separate = matmul(&grad_logits, &weight);
+        let grad_hidden_separate = matmul(&grad_logits, &weight).unwrap();
 
         // Compare loss
         let loss_diff = (fused_loss - separate_loss).abs();

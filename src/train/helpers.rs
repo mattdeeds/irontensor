@@ -1,6 +1,7 @@
 use crate::ops::{
-    add as gpu_add, causal_mask_3d_gpu, matmul, matmul_mps_nt, matmul_mps_tn, scale as gpu_scale,
-    softmax, softmax_backward, to_f32_gpu, transpose_3d_gpu,
+    add as gpu_add, causal_mask_3d_gpu, matmul, matmul_mps_nt, matmul_mps_tn,
+    repeat_kv_backward_gpu, repeat_kv_gpu, scale as gpu_scale, softmax, softmax_backward,
+    to_f32_gpu, transpose_3d_gpu,
 };
 use crate::precision::Precision;
 use crate::tensor::Tensor;
@@ -17,12 +18,12 @@ pub fn ensure_fp32(t: &Tensor) -> Tensor {
 
 /// Scale tensor by a scalar (GPU-accelerated)
 pub(crate) fn scale_tensor(t: &Tensor, scale: f32) -> Tensor {
-    gpu_scale(t, scale)
+    gpu_scale(t, scale).unwrap()
 }
 
 /// Add two tensors element-wise (GPU-accelerated)
 pub(crate) fn add_tensors(a: &Tensor, b: &Tensor) -> Tensor {
-    gpu_add(a, b)
+    gpu_add(a, b).unwrap()
 }
 
 /// Compute total L2 norm of multiple gradient tensors
@@ -68,7 +69,7 @@ pub(crate) fn linear_backward(
     let weight_fp32 = ensure_fp32(weight);
 
     // grad_input = grad_output @ weight
-    let grad_input = matmul(grad_output, &weight_fp32);
+    let grad_input = matmul(grad_output, &weight_fp32).unwrap();
 
     // grad_weight = grad_output.T @ input
     let grad_weight = matmul_tn(grad_output, input);
@@ -83,7 +84,7 @@ pub(crate) fn matmul_tn(a: &Tensor, b: &Tensor) -> Tensor {
     matmul_mps_tn(a, b)
 }
 
-/// Repeat KV heads for GQA (Grouped Query Attention)
+/// Repeat KV heads for GQA (Grouped Query Attention) - GPU accelerated
 pub(crate) fn repeat_kv(
     x: &Tensor,
     batch: usize,
@@ -92,30 +93,7 @@ pub(crate) fn repeat_kv(
     num_kv_heads: usize,
     head_dim: usize,
 ) -> Tensor {
-    let repeats = num_heads / num_kv_heads;
-    let data = x.as_f32_slice();
-    let mut expanded = vec![0.0f32; batch * seq_len * num_heads * head_dim];
-    for b in 0..batch {
-        for s in 0..seq_len {
-            for kv_h in 0..num_kv_heads {
-                for r in 0..repeats {
-                    let h = kv_h * repeats + r;
-                    for d in 0..head_dim {
-                        let src = b * seq_len * num_kv_heads * head_dim
-                            + s * num_kv_heads * head_dim
-                            + kv_h * head_dim
-                            + d;
-                        let dst = b * seq_len * num_heads * head_dim
-                            + s * num_heads * head_dim
-                            + h * head_dim
-                            + d;
-                        expanded[dst] = data[src];
-                    }
-                }
-            }
-        }
-    }
-    Tensor::from_f32_slice(&expanded, &[batch, seq_len, num_heads, head_dim])
+    repeat_kv_gpu(x, batch, seq_len, num_heads, num_kv_heads, head_dim)
 }
 
 /// Transpose last two dimensions of a 3D tensor: [batch, m, n] -> [batch, n, m] (GPU-accelerated)
@@ -166,34 +144,34 @@ pub(crate) fn attention_backward_recompute(
     let k_t = transpose_last_two_dims_3d(&k_flat, batch_heads, seq_len, head_dim);
 
     // scores = Q @ K^T: [batch*heads, seq, seq]
-    let scores = matmul(&q_flat, &k_t);
+    let scores = matmul(&q_flat, &k_t).unwrap();
 
     // Scale and apply causal mask
     let scores_scaled = scale_tensor(&scores, scale);
     let scores_masked = apply_causal_mask_3d(&scores_scaled, batch_heads, seq_len);
 
     // Softmax to get attention weights
-    let p_flat = softmax(&scores_masked);
+    let p_flat = softmax(&scores_masked).unwrap();
 
     // Now compute gradients using the recomputed P
     // grad_V = P^T @ grad_O
     let p_t = transpose_last_two_dims_3d(&p_flat, batch_heads, seq_len, seq_len);
-    let grad_v_flat = matmul(&p_t, &grad_o_flat);
+    let grad_v_flat = matmul(&p_t, &grad_o_flat).unwrap();
 
     // grad_P = grad_O @ V^T
     let v_t = transpose_last_two_dims_3d(&v_flat, batch_heads, seq_len, head_dim);
-    let grad_p_flat = matmul(&grad_o_flat, &v_t);
+    let grad_p_flat = matmul(&grad_o_flat, &v_t).unwrap();
 
     // grad_S = softmax_backward(grad_P, P)
     let grad_s_flat = softmax_backward(&grad_p_flat, &p_flat);
 
     // grad_Q = grad_S @ K / sqrt(d)
-    let grad_q_unscaled = matmul(&grad_s_flat, &k_flat);
+    let grad_q_unscaled = matmul(&grad_s_flat, &k_flat).unwrap();
     let grad_q_flat = scale_tensor(&grad_q_unscaled, scale);
 
     // grad_K = grad_S^T @ Q / sqrt(d)
     let grad_s_t = transpose_last_two_dims_3d(&grad_s_flat, batch_heads, seq_len, seq_len);
-    let grad_k_unscaled = matmul(&grad_s_t, &q_flat);
+    let grad_k_unscaled = matmul(&grad_s_t, &q_flat).unwrap();
     let grad_k_flat = scale_tensor(&grad_k_unscaled, scale);
 
     // Reshape back to 4D
@@ -204,7 +182,7 @@ pub(crate) fn attention_backward_recompute(
     (grad_q, grad_k, grad_v)
 }
 
-/// Backward for repeat_kv - sums gradients from expanded heads back to KV heads
+/// Backward for repeat_kv - sums gradients from expanded heads back to KV heads (GPU accelerated)
 ///
 /// Forward: [batch, seq, kv_heads, head_dim] -> [batch, seq, num_heads, head_dim]
 /// Backward: [batch, seq, num_heads, head_dim] -> [batch, seq, kv_heads, head_dim]
@@ -216,30 +194,5 @@ pub(crate) fn repeat_kv_backward(
     num_kv_heads: usize,
     head_dim: usize,
 ) -> Tensor {
-    let repeats = num_heads / num_kv_heads;
-    let data = grad_expanded.as_f32_slice();
-    let mut grad_kv = vec![0.0f32; batch * seq_len * num_kv_heads * head_dim];
-
-    for b in 0..batch {
-        for s in 0..seq_len {
-            for kv_h in 0..num_kv_heads {
-                for d in 0..head_dim {
-                    let dst = b * seq_len * num_kv_heads * head_dim
-                        + s * num_kv_heads * head_dim
-                        + kv_h * head_dim
-                        + d;
-                    // Sum gradients from all repeated heads
-                    for r in 0..repeats {
-                        let h = kv_h * repeats + r;
-                        let src = b * seq_len * num_heads * head_dim
-                            + s * num_heads * head_dim
-                            + h * head_dim
-                            + d;
-                        grad_kv[dst] += data[src];
-                    }
-                }
-            }
-        }
-    }
-    Tensor::from_f32_slice(&grad_kv, &[batch, seq_len, num_kv_heads, head_dim])
+    repeat_kv_backward_gpu(grad_expanded, batch, seq_len, num_heads, num_kv_heads, head_dim)
 }

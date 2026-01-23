@@ -334,7 +334,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
     let k_t_flat = transpose_last_two_dims(&k_flat, batch_size * num_heads, kv_seq_len, head_dim);
 
     // scores = Q @ K^T: [batch*heads, q_seq, kv_seq]
-    let scores_flat = super::matmul(&q_flat, &k_t_flat);
+    let scores_flat = super::matmul(&q_flat, &k_t_flat).unwrap();
 
     // Reshape scores to [batch, heads, q_seq, kv_seq]
     let mut scores = scores_flat;
@@ -342,10 +342,10 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
 
     // Step 3: Scale by 1/sqrt(d_k)
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let scores_scaled = super::scale(&scores, scale);
+    let scores_scaled = super::scale(&scores, scale).unwrap();
 
     // Step 4: Apply causal mask if needed
-    let scores_masked = if causal {
+    let scores_masked: Tensor = if causal {
         assert_eq!(
             q_seq_len, kv_seq_len,
             "Causal attention requires Q and K to have same seq_len"
@@ -366,7 +366,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
     let attn_flat = reshape_for_batched_matmul(&attn_weights, batch_size * num_heads, q_seq_len, kv_seq_len);
     let v_flat = reshape_for_batched_matmul(&v_t, batch_size * num_heads, kv_seq_len, head_dim);
 
-    let output_flat = super::matmul(&attn_flat, &v_flat);
+    let output_flat = super::matmul(&attn_flat, &v_flat).unwrap();
 
     // Reshape back to [batch, heads, q_seq, dim]
     let mut output_heads = output_flat;
@@ -529,7 +529,7 @@ fn softmax_4d(t: &Tensor) -> Tensor {
     let flat = Tensor::from_f32_slice(data, &[total_rows, dim]);
 
     // Apply softmax
-    let result = super::softmax(&flat);
+    let result = super::softmax(&flat).unwrap();
 
     // Reshape back
     let result_data = result.as_f32_slice();

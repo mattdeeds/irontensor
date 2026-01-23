@@ -397,7 +397,7 @@ mod tests {
         // Without batching, operations should still work
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
-        let c = add(&a, &b);
+        let c = add(&a, &b).unwrap();
         let result = c.as_f32_slice();
         assert_eq!(result, &[6.0, 8.0, 10.0, 12.0]);
     }
@@ -408,7 +408,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
-        let c = add(&a, &b);
+        let c = add(&a, &b).unwrap();
 
         // Must sync before reading results
         CommandBatch::sync();
@@ -425,7 +425,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
-        let c = add(&a, &b);
+        let c = add(&a, &b).unwrap();
 
         // Commit async - returns immediately
         CommandBatch::commit_async();
@@ -448,7 +448,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
-        let _c = add(&a, &b);
+        let _c = add(&a, &b).unwrap();
 
         CommandBatch::commit_async();
 
@@ -467,13 +467,13 @@ mod tests {
         CommandBatch::begin();
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
-        let c1 = add(&a, &b);
+        let c1 = add(&a, &b).unwrap();
         CommandBatch::commit_async();
 
         // Second batch (starts immediately, waits for first internally)
         let d = Tensor::from_f32_slice(&[10.0, 20.0, 30.0, 40.0], &[4]);
         let e = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-        let c2 = add(&d, &e);
+        let c2 = add(&d, &e).unwrap();
         CommandBatch::commit_async();
 
         // Wait for all

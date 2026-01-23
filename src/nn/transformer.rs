@@ -66,14 +66,14 @@ impl TransformerBlock {
     /// Output shape: [batch, seq_len, hidden_dim]
     pub fn forward(&self, x: &Tensor, position_offset: usize, causal: bool) -> Tensor {
         // Pre-attention norm + attention + residual
-        let normed = rmsnorm(x, &self.attn_norm, self.norm_eps);
+        let normed = rmsnorm(x, &self.attn_norm, self.norm_eps).unwrap();
         let attn_out = self.attention.forward(&normed, position_offset, causal);
-        let x = add(x, &attn_out);
+        let x = add(x, &attn_out).unwrap();
 
         // Pre-FFN norm + FFN + residual
-        let normed = rmsnorm(&x, &self.ffn_norm, self.norm_eps);
+        let normed = rmsnorm(&x, &self.ffn_norm, self.norm_eps).unwrap();
         let ffn_out = self.ffn.forward(&normed);
-        add(&x, &ffn_out)
+        add(&x, &ffn_out).unwrap()
     }
 
     /// Get total parameter count

@@ -1,6 +1,7 @@
 pub mod command_batch;
 pub mod data;
 pub mod device;
+pub mod error;
 pub mod nn;
 pub mod ops;
 pub mod optim;
@@ -16,7 +17,7 @@ pub use nn::{
     MultiHeadAttention, MultiHeadAttentionState, TransformerBlock, TransformerBlockState,
 };
 pub use ops::{
-    // Forward ops
+    // Forward ops (all return TensorResult<Tensor>)
     add, add_scalar, attention, embedding, gelu, matmul, mul, relu, rmsnorm, rope, rope_default,
     scale, silu, softmax, swiglu,
     // Optimized ops (Phase 5)
@@ -42,3 +43,4 @@ pub use profile::{
     OpCategory, Phase, ProfileReport, Profiler, ProfilerConfig,
 };
 pub use command_batch::CommandBatch;
+pub use error::{TensorError, TensorResult};

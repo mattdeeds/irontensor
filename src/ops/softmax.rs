@@ -13,6 +13,7 @@ use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescripto
 
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
+use crate::error::{TensorError, TensorResult};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
@@ -58,19 +59,38 @@ fn get_pipelines() -> &'static SoftmaxPipelines {
     })
 }
 
-/// Softmax: output_i = exp(input_i - max) / sum(exp(input - max))
+/// Softmax: output_i = exp(input_i - max) / sum(exp(input - max)) (fallible version)
 ///
 /// Applies softmax along the last dimension.
-///
-/// Note: MPS softmax is 1.8-5.4x faster in isolation benchmarks, but requires CommandBatch::sync()
-/// which breaks GPU pipelining. Custom shader is faster in practice during training.
 ///
 /// Input shapes:
 /// - input: [..., dim] - softmax is applied over the last dimension
 ///
 /// Returns tensor with same shape as input
-pub fn softmax(input: &Tensor) -> Tensor {
-    softmax_custom(input)
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if input is not FP32
+/// - `TensorError::EmptyTensor` if input has no dimensions
+pub fn softmax(input: &Tensor) -> TensorResult<Tensor> {
+    let _timer = timed(OpCategory::Softmax, input.numel());
+
+    if input.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "softmax",
+            expected: "FP32",
+            got: if input.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+
+    let shape = input.shape();
+    if shape.is_empty() {
+        return Err(TensorError::EmptyTensor {
+            operation: "softmax",
+        });
+    }
+
+    // Use custom shader (avoids CommandBatch::sync overhead)
+    Ok(softmax_custom_inner(input, shape))
 }
 
 /// MPS-based softmax using MPSMatrixSoftMax.
@@ -145,6 +165,11 @@ fn softmax_custom(input: &Tensor) -> Tensor {
     let shape = input.shape();
     assert!(!shape.is_empty(), "Input must have at least 1 dimension");
 
+    softmax_custom_inner(input, shape)
+}
+
+/// Inner implementation of softmax custom shader (no validation)
+fn softmax_custom_inner(input: &Tensor, shape: &[usize]) -> Tensor {
     let dim = shape[shape.len() - 1];
     let batch_seq: usize = shape[..shape.len() - 1].iter().product::<usize>().max(1);
 
@@ -254,7 +279,7 @@ mod tests {
         let input_data = vec![1.0f32, 2.0, 3.0, 4.0];
         let input = Tensor::from_f32_slice(&input_data, &[4]);
 
-        let output = softmax(&input);
+        let output = softmax(&input).unwrap();
         let result = output.as_f32_slice();
 
         let expected = reference_softmax(&input_data, 4);
@@ -282,7 +307,7 @@ mod tests {
 
         let input = Tensor::from_f32_slice(&input_data, &[batch, dim]);
 
-        let output = softmax(&input);
+        let output = softmax(&input).unwrap();
         let result = output.as_f32_slice();
 
         let expected = reference_softmax(&input_data, dim);
@@ -318,7 +343,7 @@ mod tests {
 
         let input = Tensor::from_f32_slice(&input_data, &[batch, seq_len, dim]);
 
-        let output = softmax(&input);
+        let output = softmax(&input).unwrap();
         let result = output.as_f32_slice();
 
         let expected = reference_softmax(&input_data, dim);
@@ -338,7 +363,7 @@ mod tests {
         let input_data = vec![1000.0f32, 1001.0, 1002.0, 1003.0];
         let input = Tensor::from_f32_slice(&input_data, &[4]);
 
-        let output = softmax(&input);
+        let output = softmax(&input).unwrap();
         let result = output.as_f32_slice();
 
         // Should not have NaN or Inf
@@ -398,7 +423,7 @@ mod tests {
             // Benchmark custom shader
             let start = Instant::now();
             for _ in 0..bench_iters {
-                let _ = softmax(&input);
+                let _ = softmax(&input).unwrap();
             }
             CommandBatch::sync();
             let custom_time = start.elapsed().as_secs_f64() / bench_iters as f64 * 1000.0;
@@ -495,7 +520,7 @@ mod tests {
             let mps_time = start.elapsed().as_secs_f64() / bench_iters as f64 * 1000.0;
 
             // Verify correctness (spot check)
-            let custom_result = softmax(&input);
+            let custom_result = softmax(&input).unwrap();
             CommandBatch::sync();
             let custom_slice = custom_result.as_f32_slice();
             let mps_slice = output_mps.as_f32_slice();

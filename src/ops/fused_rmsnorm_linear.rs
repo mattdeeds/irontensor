@@ -300,7 +300,7 @@ mod tests {
         let fused_output = fused_rmsnorm_linear(&input, &gamma, &weight, eps);
 
         // Separate ops version
-        let normed = rmsnorm(&input, &gamma, eps);
+        let normed = rmsnorm(&input, &gamma, eps).unwrap();
         let separate_output = matmul_mps_nt(&normed, &weight);
 
         let fused_result = fused_output.as_f32_slice();
@@ -391,7 +391,7 @@ mod tests {
             // Warmup
             for _ in 0..10 {
                 let _ = fused_rmsnorm_linear(&input, &gamma, &weight, eps);
-                let normed = rmsnorm(&input, &gamma, eps);
+                let normed = rmsnorm(&input, &gamma, eps).unwrap();
                 let _ = matmul_mps_nt(&normed, &weight);
             }
 
@@ -399,7 +399,7 @@ mod tests {
             CommandBatch::sync();
             let start = Instant::now();
             for _ in 0..iterations {
-                let normed = rmsnorm(&input, &gamma, eps);
+                let normed = rmsnorm(&input, &gamma, eps).unwrap();
                 let _ = matmul_mps_nt(&normed, &weight);
             }
             CommandBatch::sync();

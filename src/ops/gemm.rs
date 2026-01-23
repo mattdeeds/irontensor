@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
+use crate::error::TensorResult;
 use crate::ops::mps_gemm::matmul_mps;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
@@ -79,7 +80,12 @@ fn get_pipelines() -> &'static GemmPipelines {
 /// Supports:
 /// - 2D tensors: [M, K] @ [K, N] -> [M, N]
 /// - 3D tensors (batched): [B, M, K] @ [B, K, N] -> [B, M, N]
-pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensors are not FP32
+/// - `TensorError::UnsupportedDimensions` if tensors are not 2D or 3D
+/// - `TensorError::InnerDimensionMismatch` if inner dimensions don't match
+pub fn matmul(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     // Delegate to MPS implementation for FP32 (2-4x faster than custom kernel)
     matmul_mps(a, b)
 }
@@ -282,7 +288,7 @@ mod tests {
         // C = [[19, 22], [43, 50]]
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
-        let c = matmul(&a, &b);
+        let c = matmul(&a, &b).unwrap();
 
         let result = c.as_f32_slice();
         assert_eq!(result.len(), 4);
@@ -317,7 +323,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&a_data, &[m, k]);
         let b = Tensor::from_f32_slice(&b_data, &[k, n]);
-        let c = matmul(&a, &b);
+        let c = matmul(&a, &b).unwrap();
 
         // Verify against CPU computation
         let result = c.as_f32_slice();
@@ -350,7 +356,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&a_data, &[batch, m, k]);
         let b = Tensor::from_f32_slice(&b_data, &[batch, k, n]);
-        let c = matmul(&a, &b);
+        let c = matmul(&a, &b).unwrap();
 
         // Verify against CPU computation
         let result = c.as_f32_slice();

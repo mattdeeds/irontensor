@@ -169,7 +169,7 @@ mod tests {
         // First compute forward softmax
         let input_data: Vec<f32> = (0..(batch * dim)).map(|i| i as f32 * 0.5 - 2.0).collect();
         let input = Tensor::from_f32_slice(&input_data, &[batch, dim]);
-        let output = softmax(&input);
+        let output = softmax(&input).unwrap();
 
         // Then backward
         let grad_out_data = vec![1.0f32; batch * dim];
@@ -199,7 +199,7 @@ mod tests {
             .map(|i| ((i % 100) as f32 - 50.0) * 0.1)
             .collect();
         let input = Tensor::from_f32_slice(&input_data, &[batch, dim]);
-        let output = softmax(&input);
+        let output = softmax(&input).unwrap();
 
         let grad_out_data: Vec<f32> = (0..(batch * dim))
             .map(|i| ((i % 50) as f32 - 25.0) * 0.01)

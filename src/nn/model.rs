@@ -155,7 +155,7 @@ pub struct GPTModel {
 
 impl GPTModel {
     /// Create a new GPT model
-    pub fn new(config: ModelConfig) -> Self {
+    pub fn new(config: &ModelConfig) -> Self {
         // Initialize embedding with small random values
         let embed_data: Vec<f32> = (0..config.vocab_size * config.hidden_dim)
             .map(|i| {
@@ -196,7 +196,7 @@ impl GPTModel {
         };
 
         Self {
-            config,
+            config: config.clone(),
             embed_tokens,
             layers,
             final_norm,
@@ -235,7 +235,7 @@ impl GPTModel {
         }
 
         // Final norm
-        hidden = rmsnorm(&hidden, &self.final_norm, self.config.norm_eps);
+        hidden = rmsnorm(&hidden, &self.final_norm, self.config.norm_eps).unwrap();
 
         // Save hidden states for backward pass (reshape to 2D)
         let final_hidden = Tensor::from_f32_slice(
@@ -282,7 +282,7 @@ impl GPTModel {
         let weight_t = Tensor::from_f32_slice(&wt, &[self.config.hidden_dim, self.config.vocab_size]);
 
         // Compute logits: [batch * seq_len, vocab_size]
-        let logits = matmul(&hidden_2d, &weight_t);
+        let logits = matmul(&hidden_2d, &weight_t).unwrap();
 
         // Reshape to [batch, seq_len, vocab_size]
         let logits_data = logits.as_f32_slice().to_vec();
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn test_model_tiny_forward() {
         let config = ModelConfig::tiny();
-        let model = GPTModel::new(config.clone());
+        let model = GPTModel::new(&config);
 
         let batch = 2;
         let seq_len = 8;
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn test_model_summary() {
         let config = ModelConfig::tiny();
-        let model = GPTModel::new(config);
+        let model = GPTModel::new(&config);
         let summary = model.summary();
         assert!(summary.contains("GPTModel"));
         assert!(summary.contains("vocab_size=32000"));
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn test_model_state() {
         let config = ModelConfig::tiny();
-        let model = GPTModel::new(config);
+        let model = GPTModel::new(&config);
         let state = GPTModelState::new(&model);
 
         assert_eq!(state.layer_states.len(), model.layers.len());
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_model_bf16_conversion() {
         let config = ModelConfig::tiny();
-        let mut model = GPTModel::new(config);
+        let mut model = GPTModel::new(&config);
 
         // Start as FP32
         assert!(!model.is_bf16());

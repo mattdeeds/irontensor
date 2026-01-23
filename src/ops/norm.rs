@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
+use crate::error::{TensorError, TensorResult};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
@@ -64,9 +65,21 @@ fn get_pipelines() -> &'static NormPipelines {
 /// - gamma: [hidden_dim] - learnable scale parameter (FP32 or BF16 - BF16 is converted)
 ///
 /// Returns tensor with same shape as input (always FP32)
-pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if input is not FP32
+/// - `TensorError::EmptyTensor` if input has no dimensions
+/// - `TensorError::ShapeMismatch` if gamma shape doesn't match hidden_dim
+pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::RmsNorm, input.numel());
-    assert_eq!(input.precision(), Precision::FP32);
+
+    if input.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "rmsnorm",
+            expected: "FP32",
+            got: if input.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
 
     // Convert BF16 gamma to FP32 if needed (mixed precision support)
     let gamma = if gamma.precision() == Precision::BF16 {
@@ -77,14 +90,20 @@ pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> Tensor {
     let gamma = &gamma;
 
     let shape = input.shape();
-    assert!(shape.len() >= 1, "Input must have at least 1 dimension");
+    if shape.is_empty() {
+        return Err(TensorError::EmptyTensor {
+            operation: "rmsnorm",
+        });
+    }
 
     let hidden_dim = shape[shape.len() - 1];
-    assert_eq!(
-        gamma.shape(),
-        &[hidden_dim],
-        "Gamma must have shape [hidden_dim]"
-    );
+    if gamma.shape() != &[hidden_dim] {
+        return Err(TensorError::ShapeMismatch {
+            operation: "rmsnorm",
+            expected: format!("[{}]", hidden_dim),
+            got: format!("{:?}", gamma.shape()),
+        });
+    }
 
     // Compute batch_seq (product of all dims except last)
     let batch_seq: usize = shape[..shape.len() - 1].iter().product::<usize>().max(1);
@@ -164,7 +183,7 @@ pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> Tensor {
         );
     }
 
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -204,7 +223,7 @@ mod tests {
         let input = Tensor::from_f32_slice(&input_data, &[hidden_dim]);
         let gamma = Tensor::from_f32_slice(&gamma_data, &[hidden_dim]);
 
-        let output = rmsnorm(&input, &gamma, eps);
+        let output = rmsnorm(&input, &gamma, eps).unwrap();
         let result = output.as_f32_slice();
 
         let expected = reference_rmsnorm(&input_data, &gamma_data, eps);
@@ -231,7 +250,7 @@ mod tests {
         let input = Tensor::from_f32_slice(&input_data, &[batch, hidden_dim]);
         let gamma = Tensor::from_f32_slice(&gamma_data, &[hidden_dim]);
 
-        let output = rmsnorm(&input, &gamma, eps);
+        let output = rmsnorm(&input, &gamma, eps).unwrap();
         let result = output.as_f32_slice();
 
         let expected = reference_rmsnorm(&input_data, &gamma_data, eps);
@@ -260,7 +279,7 @@ mod tests {
         let input = Tensor::from_f32_slice(&input_data, &[batch, seq_len, hidden_dim]);
         let gamma = Tensor::from_f32_slice(&gamma_data, &[hidden_dim]);
 
-        let output = rmsnorm(&input, &gamma, eps);
+        let output = rmsnorm(&input, &gamma, eps).unwrap();
         let result = output.as_f32_slice();
 
         let expected = reference_rmsnorm(&input_data, &gamma_data, eps);

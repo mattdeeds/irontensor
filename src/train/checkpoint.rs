@@ -192,7 +192,7 @@ pub fn load_model_weights<P: AsRef<Path>>(path: P) -> std::io::Result<(GPTModel,
     let config = read_model_config(&mut reader)?;
 
     // Create model with the loaded config
-    let mut model = GPTModel::new(config.clone());
+    let mut model = GPTModel::new(&config);
 
     // Load model weights
     // Embedding
@@ -347,7 +347,7 @@ mod tests {
             precision: Precision::FP32,
         };
 
-        let model = GPTModel::new(config.clone());
+        let model = GPTModel::new(&config);
         let checkpoint = Checkpoint {
             config: config.clone(),
             step: 100,

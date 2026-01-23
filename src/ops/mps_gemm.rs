@@ -10,6 +10,7 @@ use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescripto
 
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
+use crate::error::{TensorError, TensorResult};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
@@ -17,14 +18,30 @@ use crate::tensor::Tensor;
 /// MPS-based matrix multiplication: C = A @ B
 ///
 /// Uses Apple's Metal Performance Shaders for optimized GEMM.
-/// Falls back to custom kernel for unsupported cases.
 ///
 /// Supports:
 /// - 2D tensors: [M, K] @ [K, N] -> [M, N]
 /// - 3D tensors (batched): [B, M, K] @ [B, K, N] -> [B, M, N]
-pub fn matmul_mps(a: &Tensor, b: &Tensor) -> Tensor {
-    assert_eq!(a.precision(), Precision::FP32, "MPS matmul currently only supports FP32");
-    assert_eq!(b.precision(), Precision::FP32, "MPS matmul currently only supports FP32");
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensors are not FP32
+/// - `TensorError::UnsupportedDimensions` if tensors are not 2D or 3D
+/// - `TensorError::InnerDimensionMismatch` if inner dimensions don't match
+pub fn matmul_mps(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
+    if a.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "matmul",
+            expected: "FP32",
+            got: if a.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+    if b.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "matmul",
+            expected: "FP32",
+            got: if b.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
 
     let a_shape = a.shape();
     let b_shape = b.shape();
@@ -40,14 +57,15 @@ pub fn matmul_mps(a: &Tensor, b: &Tensor) -> Tensor {
     match (a_shape.len(), b_shape.len()) {
         (2, 2) => matmul_mps_2d(a, b),
         (3, 3) => matmul_mps_batched(a, b),
-        _ => panic!(
-            "MPS matmul requires 2D or 3D tensors, got shapes {:?} and {:?}",
-            a_shape, b_shape
-        ),
+        _ => Err(TensorError::UnsupportedDimensions {
+            operation: "matmul",
+            expected: "2D or 3D tensors",
+            got: vec![a_shape.len(), b_shape.len()],
+        }),
     }
 }
 
-fn matmul_mps_2d(a: &Tensor, b: &Tensor) -> Tensor {
+fn matmul_mps_2d(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     let a_shape = a.shape();
     let b_shape = b.shape();
 
@@ -56,7 +74,13 @@ fn matmul_mps_2d(a: &Tensor, b: &Tensor) -> Tensor {
     let k2 = b_shape[0];
     let n = b_shape[1];
 
-    assert_eq!(k, k2, "Inner dimensions must match: A[{}, {}] @ B[{}, {}]", m, k, k2, n);
+    if k != k2 {
+        return Err(TensorError::InnerDimensionMismatch {
+            operation: "matmul",
+            a_shape: a_shape.to_vec(),
+            b_shape: b_shape.to_vec(),
+        });
+    }
 
     let c = Tensor::zeros(&[m, n], Precision::FP32);
 
@@ -149,7 +173,7 @@ fn matmul_mps_2d(a: &Tensor, b: &Tensor) -> Tensor {
         command_buffer.waitUntilCompleted();
     });
 
-    c
+    Ok(c)
 }
 
 /// MPS-based matrix multiplication with B transposed: C = A @ B^T
@@ -366,7 +390,7 @@ pub fn matmul_mps_tn(a: &Tensor, b: &Tensor) -> Tensor {
     c
 }
 
-fn matmul_mps_batched(a: &Tensor, b: &Tensor) -> Tensor {
+fn matmul_mps_batched(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     let a_shape = a.shape();
     let b_shape = b.shape();
 
@@ -377,8 +401,20 @@ fn matmul_mps_batched(a: &Tensor, b: &Tensor) -> Tensor {
     let k2 = b_shape[1];
     let n = b_shape[2];
 
-    assert_eq!(batch, batch2, "Batch sizes must match: {} vs {}", batch, batch2);
-    assert_eq!(k, k2, "Inner dimensions must match");
+    if batch != batch2 {
+        return Err(TensorError::ShapeMismatch {
+            operation: "matmul_batched",
+            expected: format!("batch size {}", batch),
+            got: format!("batch size {}", batch2),
+        });
+    }
+    if k != k2 {
+        return Err(TensorError::InnerDimensionMismatch {
+            operation: "matmul_batched",
+            a_shape: a_shape.to_vec(),
+            b_shape: b_shape.to_vec(),
+        });
+    }
 
     let c = Tensor::zeros(&[batch, m, n], Precision::FP32);
 
@@ -482,7 +518,7 @@ fn matmul_mps_batched(a: &Tensor, b: &Tensor) -> Tensor {
         command_buffer.waitUntilCompleted();
     });
 
-    c
+    Ok(c)
 }
 
 // Note: MPS MPSMatrixMultiplication does NOT support BFloat16 as input.
@@ -502,7 +538,7 @@ mod tests {
         // C = A @ B = [[19, 22], [43, 50]]
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
-        let c = matmul_mps(&a, &b);
+        let c = matmul_mps(&a, &b).unwrap();
 
         let result = c.as_f32_slice();
         assert_eq!(result.len(), 4);
@@ -523,7 +559,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&a_data, &[m, k]);
         let b = Tensor::from_f32_slice(&b_data, &[k, n]);
-        let c = matmul_mps(&a, &b);
+        let c = matmul_mps(&a, &b).unwrap();
 
         assert_eq!(c.shape(), &[m, n]);
 
@@ -550,7 +586,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&a_data, &[batch, m, k]);
         let b = Tensor::from_f32_slice(&b_data, &[batch, k, n]);
-        let c = matmul_mps(&a, &b);
+        let c = matmul_mps(&a, &b).unwrap();
 
         assert_eq!(c.shape(), &[batch, m, n]);
 
@@ -575,7 +611,7 @@ mod tests {
 
         let a = Tensor::from_f32_slice(&a_data, &[m, k]);
         let b = Tensor::from_f32_slice(&b_data, &[k, n]);
-        let c = matmul_mps(&a, &b);
+        let c = matmul_mps(&a, &b).unwrap();
 
         let result = c.as_f32_slice();
 
@@ -652,13 +688,13 @@ mod tests {
 
             // Warmup MPS kernel
             for _ in 0..warmup_iters {
-                let _ = matmul_mps(&a, &b);
+                let _ = matmul_mps(&a, &b).ok();
             }
 
             // Benchmark MPS kernel
             let start = Instant::now();
             for _ in 0..bench_iters {
-                let _ = matmul_mps(&a, &b);
+                let _ = matmul_mps(&a, &b).ok();
             }
             let mps_time = start.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
 
@@ -708,12 +744,12 @@ mod tests {
 
             // Warmup and benchmark MPS
             for _ in 0..warmup_iters {
-                let _ = matmul_mps(&a, &b);
+                let _ = matmul_mps(&a, &b).ok();
             }
 
             let start = Instant::now();
             for _ in 0..bench_iters {
-                let _ = matmul_mps(&a, &b);
+                let _ = matmul_mps(&a, &b).ok();
             }
             let mps_time = start.elapsed().as_secs_f64() * 1000.0 / bench_iters as f64;
 

@@ -47,7 +47,7 @@ impl Trainer {
 
         // Final norm (convert BF16 gamma to FP32 if needed)
         let final_norm_fp32 = ensure_fp32(&self.model.final_norm);
-        let final_hidden = rmsnorm(&hidden, &final_norm_fp32, self.model.config.norm_eps);
+        let final_hidden = rmsnorm(&hidden, &final_norm_fp32, self.model.config.norm_eps).unwrap();
         let final_hidden_2d = final_hidden.view(&[n, hidden_dim]);
 
         ForwardCache {
@@ -80,7 +80,7 @@ impl Trainer {
 
         // Attention norm (convert BF16 gamma to FP32 if needed)
         let attn_norm_fp32 = ensure_fp32(&layer.attn_norm);
-        let normed_attn = rmsnorm(x, &attn_norm_fp32, layer.norm_eps);
+        let normed_attn = rmsnorm(x, &attn_norm_fp32, layer.norm_eps).unwrap();
 
         // Q, K, V projections
         let normed_2d = normed_attn.view(&[n, hidden_dim]);
@@ -133,11 +133,11 @@ impl Trainer {
         let attn_projected = attn_projected.view(&[batch_size, seq_len, hidden_dim]);
 
         // Residual connection
-        let post_attn = crate::ops::add(x, &attn_projected);
+        let post_attn = crate::ops::add(x, &attn_projected).unwrap();
 
         // FFN norm (convert BF16 gamma to FP32 if needed)
         let ffn_norm_fp32 = ensure_fp32(&layer.ffn_norm);
-        let normed_ffn = rmsnorm(&post_attn, &ffn_norm_fp32, layer.norm_eps);
+        let normed_ffn = rmsnorm(&post_attn, &ffn_norm_fp32, layer.norm_eps).unwrap();
 
         // FFN: gate and up projections
         let normed_ffn_2d = normed_ffn.view(&[n, hidden_dim]);
@@ -145,14 +145,14 @@ impl Trainer {
         let up = linear_forward(&normed_ffn_2d, &layer.ffn.w_up.weight);
 
         // SwiGLU
-        let swiglu_out = swiglu(&gate, &up);
+        let swiglu_out = swiglu(&gate, &up).unwrap();
 
         // Down projection
         let ffn_out = linear_forward(&swiglu_out, &layer.ffn.w_down.weight);
         let ffn_out = ffn_out.view(&[batch_size, seq_len, hidden_dim]);
 
         // Residual connection
-        let output = crate::ops::add(&post_attn, &ffn_out);
+        let output = crate::ops::add(&post_attn, &ffn_out).unwrap();
 
         let cache = LayerCache {
             input,

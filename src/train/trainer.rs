@@ -38,8 +38,8 @@ pub struct Trainer {
 
 impl Trainer {
     /// Create a new trainer.
-    pub fn new(model_config: ModelConfig, train_config: TrainingConfig) -> Self {
-        let mut model = GPTModel::new(model_config.clone());
+    pub fn new(model_config: &ModelConfig, train_config: &TrainingConfig) -> Self {
+        let mut model = GPTModel::new(model_config);
 
         // Convert model to BF16 for mixed precision training if enabled
         if train_config.use_bf16 {
@@ -62,7 +62,7 @@ impl Trainer {
         ));
 
         Self {
-            config: train_config,
+            config: train_config.clone(),
             model,
             optimizer,
             model_state,
@@ -186,7 +186,7 @@ impl Trainer {
         // Gradient flowing back through output projection
         // grad_final_hidden = grad_logits @ embed (convert BF16 weights to FP32 if needed)
         let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
-        let grad_hidden_2d = matmul(&grad_logits, &embed_fp32);
+        let grad_hidden_2d = matmul(&grad_logits, &embed_fp32).unwrap();
         // Reshape to 3D for norm backward
         let hidden_dim = self.model.config.hidden_dim;
         let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
@@ -383,7 +383,7 @@ mod tests {
         };
 
         let train_config = TrainingConfig::default();
-        let trainer = Trainer::new(model_config, train_config);
+        let trainer = Trainer::new(&model_config, &train_config);
 
         assert_eq!(trainer.step, 0);
         assert_eq!(trainer.epoch, 0);
@@ -406,7 +406,7 @@ mod tests {
         };
 
         let train_config = TrainingConfig::default();
-        let trainer = Trainer::new(model_config, train_config);
+        let trainer = Trainer::new(&model_config, &train_config);
 
         let batch_size = 2;
         let seq_len = 8;

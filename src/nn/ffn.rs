@@ -65,7 +65,7 @@ impl FeedForward {
         let up = self.w_up.forward(x); // [batch, seq, intermediate]
 
         // SwiGLU activation: silu(gate) * up
-        let hidden = swiglu(&gate, &up);
+        let hidden = swiglu(&gate, &up).unwrap();
 
         // Down projection
         self.w_down.forward(&hidden)

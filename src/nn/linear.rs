@@ -1,7 +1,21 @@
-use crate::ops::{matmul, to_f32_gpu};
+use crate::ops::{matmul_mps_nt, to_f32_gpu};
 use crate::optim::ParamState;
 use crate::precision::Precision;
 use crate::tensor::Tensor;
+
+/// Add bias to output with broadcasting: output[b, o] += bias[o]
+/// This is a relatively small operation compared to matmul, so CPU is acceptable.
+fn add_bias_broadcast(output: &Tensor, bias: &Tensor, batch_size: usize, out_features: usize) -> Tensor {
+    let output_data = output.as_f32_slice();
+    let bias_data = bias.as_f32_slice();
+    let mut result = output_data.to_vec();
+    for b in 0..batch_size {
+        for o in 0..out_features {
+            result[b * out_features + o] += bias_data[o];
+        }
+    }
+    Tensor::from_f32_slice(&result, &[batch_size, out_features])
+}
 
 /// Linear layer: y = xW^T + b
 ///
@@ -68,6 +82,8 @@ impl Linear {
     /// Input shape: [..., in_features]
     /// Output shape: [..., out_features]
     /// Supports mixed precision: BF16 weights/inputs are converted to FP32.
+    ///
+    /// Uses MPS native transpose for efficient GPU computation.
     pub fn forward(&self, input: &Tensor) -> Tensor {
         let input_shape = input.shape();
         assert!(
@@ -90,19 +106,21 @@ impl Linear {
         };
         let input_shape = input.shape().to_vec();
 
-        // Reshape input to 2D: [batch, in_features]
+        // Reshape input to 2D using zero-copy view: [batch, in_features]
         let batch_size: usize = input_shape[..input_shape.len() - 1].iter().product();
         let batch_size = batch_size.max(1);
+        let input_2d = input.view(&[batch_size, self.in_features]);
 
-        // Always reshape to ensure consistent 2D format
-        let data = input.as_f32_slice().to_vec();
-        let input_2d = Tensor::from_f32_slice(&data, &[batch_size, self.in_features]);
+        // Convert BF16 weight to FP32 if needed
+        let weight = if self.weight.precision() == Precision::BF16 {
+            to_f32_gpu(&self.weight)
+        } else {
+            self.weight.clone()
+        };
 
-        // Compute xW^T: [batch, in] @ [in, out] = [batch, out]
-        // We need to transpose W, but we can compute x @ W^T as (W @ x^T)^T
-        // Or more simply: create W transposed
-        let weight_t = self.transpose_weight();
-        let mut output = matmul(&input_2d, &weight_t);
+        // Compute xW^T using MPS native transpose: [batch, in] @ [out, in]^T = [batch, out]
+        // matmul_mps_nt handles the transpose natively without materializing W^T
+        let mut output = matmul_mps_nt(&input_2d, &weight);
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
@@ -113,45 +131,17 @@ impl Linear {
                 bias.clone()
             };
             // Broadcast bias across batch dimension
-            let bias_data = bias.as_f32_slice();
-            let output_data = output.as_f32_slice();
-            let mut result = vec![0.0f32; batch_size * self.out_features];
-            for b in 0..batch_size {
-                for o in 0..self.out_features {
-                    result[b * self.out_features + o] =
-                        output_data[b * self.out_features + o] + bias_data[o];
-                }
-            }
-            output = Tensor::from_f32_slice(&result, &[batch_size, self.out_features]);
+            output = add_bias_broadcast(&output, &bias, batch_size, self.out_features);
         }
 
-        // Reshape back to original batch dimensions
+        // Reshape back to original batch dimensions using zero-copy view
         if input_shape.len() > 2 {
             let mut output_shape = input_shape[..input_shape.len() - 1].to_vec();
             output_shape.push(self.out_features);
-            let data = output.as_f32_slice().to_vec();
-            Tensor::from_f32_slice(&data, &output_shape)
+            output.view(&output_shape)
         } else {
             output
         }
-    }
-
-    /// Transpose weight matrix for efficient matmul
-    fn transpose_weight(&self) -> Tensor {
-        // Convert BF16 weight to FP32 if needed
-        let weight = if self.weight.precision() == Precision::BF16 {
-            to_f32_gpu(&self.weight)
-        } else {
-            self.weight.clone()
-        };
-        let w = weight.as_f32_slice();
-        let mut wt = vec![0.0f32; self.in_features * self.out_features];
-        for i in 0..self.out_features {
-            for j in 0..self.in_features {
-                wt[j * self.out_features + i] = w[i * self.in_features + j];
-            }
-        }
-        Tensor::from_f32_slice(&wt, &[self.in_features, self.out_features])
     }
 
     /// Get parameter count

@@ -11,6 +11,7 @@ use objc2_metal::{
 
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
+use crate::error::{TensorError, TensorResult};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
@@ -61,6 +62,37 @@ fn get_pipelines() -> &'static ElementwisePipelines {
     })
 }
 
+fn try_dispatch_binary_op(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &Tensor,
+    b: &Tensor,
+    op_name: &'static str,
+) -> TensorResult<Tensor> {
+    if a.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: op_name,
+            expected: "FP32",
+            got: if a.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+    if b.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: op_name,
+            expected: "FP32",
+            got: if b.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+    if a.shape() != b.shape() {
+        return Err(TensorError::ShapeMismatch {
+            operation: op_name,
+            expected: format!("{:?}", a.shape()),
+            got: format!("{:?}", b.shape()),
+        });
+    }
+
+    Ok(dispatch_binary_op_inner(pipeline, a, b))
+}
+
 fn dispatch_binary_op(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     a: &Tensor,
@@ -70,6 +102,14 @@ fn dispatch_binary_op(
     assert_eq!(b.precision(), Precision::FP32);
     assert_eq!(a.shape(), b.shape(), "Tensors must have the same shape");
 
+    dispatch_binary_op_inner(pipeline, a, b)
+}
+
+fn dispatch_binary_op_inner(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &Tensor,
+    b: &Tensor,
+) -> Tensor {
     let count = a.numel();
     let c = Tensor::zeros(a.shape(), Precision::FP32);
 
@@ -108,12 +148,35 @@ fn dispatch_binary_op(
     c
 }
 
+fn try_dispatch_unary_op(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    input: &Tensor,
+    op_name: &'static str,
+) -> TensorResult<Tensor> {
+    if input.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: op_name,
+            expected: "FP32",
+            got: if input.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+
+    Ok(dispatch_unary_op_inner(pipeline, input))
+}
+
 fn dispatch_unary_op(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     input: &Tensor,
 ) -> Tensor {
     assert_eq!(input.precision(), Precision::FP32);
 
+    dispatch_unary_op_inner(pipeline, input)
+}
+
+fn dispatch_unary_op_inner(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    input: &Tensor,
+) -> Tensor {
     let count = input.numel();
     let output = Tensor::zeros(input.shape(), Precision::FP32);
 
@@ -150,6 +213,23 @@ fn dispatch_unary_op(
     output
 }
 
+fn try_dispatch_scalar_op(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    input: &Tensor,
+    scalar: f32,
+    op_name: &'static str,
+) -> TensorResult<Tensor> {
+    if input.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: op_name,
+            expected: "FP32",
+            got: if input.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+
+    Ok(dispatch_scalar_op_inner(pipeline, input, scalar))
+}
+
 fn dispatch_scalar_op(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     input: &Tensor,
@@ -157,6 +237,14 @@ fn dispatch_scalar_op(
 ) -> Tensor {
     assert_eq!(input.precision(), Precision::FP32);
 
+    dispatch_scalar_op_inner(pipeline, input, scalar)
+}
+
+fn dispatch_scalar_op_inner(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    input: &Tensor,
+    scalar: f32,
+) -> Tensor {
     let count = input.numel();
     let output = Tensor::zeros(input.shape(), Precision::FP32);
 
@@ -204,33 +292,50 @@ fn dispatch_scalar_op(
 }
 
 /// Element-wise addition: C = A + B
-pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensors are not FP32
+/// - `TensorError::ShapeMismatch` if tensor shapes don't match
+pub fn add(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("add".to_string()), a.numel());
-    dispatch_binary_op(&get_pipelines().add, a, b)
+    try_dispatch_binary_op(&get_pipelines().add, a, b, "add")
 }
 
 /// Element-wise multiplication: C = A * B
-pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensors are not FP32
+/// - `TensorError::ShapeMismatch` if tensor shapes don't match
+pub fn mul(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("mul".to_string()), a.numel());
-    dispatch_binary_op(&get_pipelines().mul, a, b)
+    try_dispatch_binary_op(&get_pipelines().mul, a, b, "mul")
 }
 
 /// Scale tensor by scalar: B = A * scalar
-pub fn scale(a: &Tensor, scalar: f32) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensor is not FP32
+pub fn scale(a: &Tensor, scalar: f32) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("scale".to_string()), a.numel());
-    dispatch_scalar_op(&get_pipelines().scale, a, scalar)
+    try_dispatch_scalar_op(&get_pipelines().scale, a, scalar, "scale")
 }
 
 /// Add scalar to tensor: B = A + scalar
-pub fn add_scalar(a: &Tensor, scalar: f32) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensor is not FP32
+pub fn add_scalar(a: &Tensor, scalar: f32) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("add_scalar".to_string()), a.numel());
-    dispatch_scalar_op(&get_pipelines().add_scalar, a, scalar)
+    try_dispatch_scalar_op(&get_pipelines().add_scalar, a, scalar, "add_scalar")
 }
 
 /// SiLU (Swish) activation: y = x * sigmoid(x)
-pub fn silu(input: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensor is not FP32
+pub fn silu(input: &Tensor) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("silu".to_string()), input.numel());
-    dispatch_unary_op(&get_pipelines().silu, input)
+    try_dispatch_unary_op(&get_pipelines().silu, input, "silu")
 }
 
 /// GELU (Gaussian Error Linear Unit) activation using tanh approximation.
@@ -243,22 +348,32 @@ pub fn silu(input: &Tensor) -> Tensor {
 /// This approximation is commonly used in transformer models (GPT-2, BERT)
 /// as it is faster to compute than the exact GELU while maintaining
 /// similar accuracy. The maximum error vs exact GELU is ~0.004.
-pub fn gelu(input: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensor is not FP32
+pub fn gelu(input: &Tensor) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("gelu".to_string()), input.numel());
-    dispatch_unary_op(&get_pipelines().gelu, input)
+    try_dispatch_unary_op(&get_pipelines().gelu, input, "gelu")
 }
 
 /// ReLU activation: y = max(0, x)
-pub fn relu(input: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensor is not FP32
+pub fn relu(input: &Tensor) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("relu".to_string()), input.numel());
-    dispatch_unary_op(&get_pipelines().relu, input)
+    try_dispatch_unary_op(&get_pipelines().relu, input, "relu")
 }
 
 /// SwiGLU: output = silu(gate) * up
 /// Used in Llama-style FFN
-pub fn swiglu(gate: &Tensor, up: &Tensor) -> Tensor {
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensors are not FP32
+/// - `TensorError::ShapeMismatch` if tensor shapes don't match
+pub fn swiglu(gate: &Tensor, up: &Tensor) -> TensorResult<Tensor> {
     let _timer = timed(OpCategory::Elementwise("swiglu".to_string()), gate.numel());
-    dispatch_binary_op(&get_pipelines().swiglu, gate, up)
+    try_dispatch_binary_op(&get_pipelines().swiglu, gate, up, "swiglu")
 }
 
 #[cfg(test)]
@@ -269,7 +384,7 @@ mod tests {
     fn test_add() {
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[4]);
-        let c = add(&a, &b);
+        let c = add(&a, &b).unwrap();
         let result = c.as_f32_slice();
         assert_eq!(result, &[6.0, 8.0, 10.0, 12.0]);
     }
@@ -278,7 +393,7 @@ mod tests {
     fn test_mul() {
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
         let b = Tensor::from_f32_slice(&[2.0, 3.0, 4.0, 5.0], &[4]);
-        let c = mul(&a, &b);
+        let c = mul(&a, &b).unwrap();
         let result = c.as_f32_slice();
         assert_eq!(result, &[2.0, 6.0, 12.0, 20.0]);
     }
@@ -286,7 +401,7 @@ mod tests {
     #[test]
     fn test_scale() {
         let a = Tensor::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-        let b = scale(&a, 2.5);
+        let b = scale(&a, 2.5).unwrap();
         let result = b.as_f32_slice();
         assert_eq!(result, &[2.5, 5.0, 7.5, 10.0]);
     }
@@ -294,7 +409,7 @@ mod tests {
     #[test]
     fn test_silu() {
         let input = Tensor::from_f32_slice(&[0.0, 1.0, -1.0, 2.0], &[4]);
-        let output = silu(&input);
+        let output = silu(&input).unwrap();
         let result = output.as_f32_slice();
 
         // silu(0) = 0 * sigmoid(0) = 0 * 0.5 = 0
@@ -308,7 +423,7 @@ mod tests {
     #[test]
     fn test_relu() {
         let input = Tensor::from_f32_slice(&[-1.0, 0.0, 1.0, 2.0], &[4]);
-        let output = relu(&input);
+        let output = relu(&input).unwrap();
         let result = output.as_f32_slice();
         assert_eq!(result, &[0.0, 0.0, 1.0, 2.0]);
     }
@@ -317,7 +432,7 @@ mod tests {
     fn test_swiglu() {
         let gate = Tensor::from_f32_slice(&[0.0, 1.0, 2.0], &[3]);
         let up = Tensor::from_f32_slice(&[1.0, 2.0, 3.0], &[3]);
-        let output = swiglu(&gate, &up);
+        let output = swiglu(&gate, &up).unwrap();
         let result = output.as_f32_slice();
 
         // swiglu(0, 1) = silu(0) * 1 = 0
