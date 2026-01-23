@@ -1,9 +1,10 @@
 use crate::ops::{
-    add as gpu_add, causal_mask_3d_gpu, matmul, matmul_mps_nt, matmul_mps_tn,
-    repeat_kv_backward_gpu, repeat_kv_gpu, scale as gpu_scale, softmax, softmax_backward,
-    to_f32_gpu, transpose_3d_gpu,
+    add as gpu_add, add3 as gpu_add3, causal_mask_3d_gpu, matmul, matmul_mps_nt, matmul_mps_tn,
+    repeat_kv_backward_gpu, repeat_kv_gpu, scale as gpu_scale, scale_tensors_inplace,
+    softmax, softmax_backward, to_f32_gpu, transpose_3d_gpu,
 };
 use crate::precision::Precision;
+use crate::profile::Profiler;
 use crate::tensor::Tensor;
 
 /// Ensure tensor is FP32 for compute. If BF16, converts to FP32.
@@ -24,6 +25,18 @@ pub(crate) fn scale_tensor(t: &Tensor, scale: f32) -> Tensor {
 /// Add two tensors element-wise (GPU-accelerated)
 pub(crate) fn add_tensors(a: &Tensor, b: &Tensor) -> Tensor {
     gpu_add(a, b).unwrap()
+}
+
+/// Add three tensors element-wise (GPU-accelerated, fused kernel)
+/// More efficient than chaining two add_tensors calls
+pub(crate) fn add3_tensors(a: &Tensor, b: &Tensor, c: &Tensor) -> Tensor {
+    gpu_add3(a, b, c).unwrap()
+}
+
+/// Scale multiple gradients in-place with the same scalar
+/// Useful for gradient clipping to avoid allocating new tensors
+pub(crate) fn scale_gradients_inplace(grads: &[&Tensor], scale: f32) {
+    scale_tensors_inplace(grads, scale).unwrap()
 }
 
 /// Compute total L2 norm of multiple gradient tensors
@@ -125,6 +138,8 @@ pub(crate) fn attention_backward_recompute(
     k: &Tensor,
     v: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
+    Profiler::push_tag("attn_bwd");
+
     let q_shape = q.shape();
     let batch = q_shape[0];
     let heads = q_shape[1];
@@ -140,6 +155,7 @@ pub(crate) fn attention_backward_recompute(
     let grad_o_flat = grad_output.view(&[batch_heads, seq_len, head_dim]);
 
     // Recompute attention weights: P = softmax(causal_mask(Q @ K^T / sqrt(d)))
+    Profiler::push_tag("recompute");
     // K^T: [batch*heads, head_dim, seq]
     let k_t = transpose_last_two_dims_3d(&k_flat, batch_heads, seq_len, head_dim);
 
@@ -152,20 +168,26 @@ pub(crate) fn attention_backward_recompute(
 
     // Softmax to get attention weights
     let p_flat = softmax(&scores_masked).unwrap();
+    Profiler::pop_tag();
 
     // Now compute gradients using the recomputed P
     // grad_V = P^T @ grad_O
+    Profiler::push_tag("grad_v");
     let p_t = transpose_last_two_dims_3d(&p_flat, batch_heads, seq_len, seq_len);
     let grad_v_flat = matmul(&p_t, &grad_o_flat).unwrap();
+    Profiler::pop_tag();
 
     // grad_P = grad_O @ V^T
+    Profiler::push_tag("grad_p");
     let v_t = transpose_last_two_dims_3d(&v_flat, batch_heads, seq_len, head_dim);
     let grad_p_flat = matmul(&grad_o_flat, &v_t).unwrap();
 
     // grad_S = softmax_backward(grad_P, P)
     let grad_s_flat = softmax_backward(&grad_p_flat, &p_flat);
+    Profiler::pop_tag();
 
     // grad_Q = grad_S @ K / sqrt(d)
+    Profiler::push_tag("grad_qk");
     let grad_q_unscaled = matmul(&grad_s_flat, &k_flat).unwrap();
     let grad_q_flat = scale_tensor(&grad_q_unscaled, scale);
 
@@ -173,11 +195,14 @@ pub(crate) fn attention_backward_recompute(
     let grad_s_t = transpose_last_two_dims_3d(&grad_s_flat, batch_heads, seq_len, seq_len);
     let grad_k_unscaled = matmul(&grad_s_t, &q_flat).unwrap();
     let grad_k_flat = scale_tensor(&grad_k_unscaled, scale);
+    Profiler::pop_tag();
 
     // Reshape back to 4D
     let grad_q = grad_q_flat.view(&[batch, heads, seq_len, head_dim]);
     let grad_k = grad_k_flat.view(&[batch, heads, seq_len, head_dim]);
     let grad_v = grad_v_flat.view(&[batch, heads, seq_len, head_dim]);
+
+    Profiler::pop_tag();
 
     (grad_q, grad_k, grad_v)
 }

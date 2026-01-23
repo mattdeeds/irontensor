@@ -8,7 +8,7 @@ use crate::tensor::Tensor;
 
 use super::cache::{LayerCache, LayerGradients};
 use super::helpers::{
-    add_tensors, attention_backward_recompute, ensure_fp32, linear_backward, repeat_kv_backward,
+    add_tensors, add3_tensors, attention_backward_recompute, ensure_fp32, linear_backward, repeat_kv_backward,
 };
 use super::trainer::Trainer;
 
@@ -132,9 +132,10 @@ impl Trainer {
         let (grad_normed_attn_from_v, grad_wv) =
             linear_backward(&grad_v_proj, &normed_attn_2d, &layer.attention.wv.weight);
 
-        // Sum gradients from Q, K, V paths
-        let grad_normed_attn = add_tensors(
-            &add_tensors(&grad_normed_attn_from_q, &grad_normed_attn_from_k),
+        // Sum gradients from Q, K, V paths (fused 3-way add)
+        let grad_normed_attn = add3_tensors(
+            &grad_normed_attn_from_q,
+            &grad_normed_attn_from_k,
             &grad_normed_attn_from_v,
         );
 

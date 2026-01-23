@@ -111,3 +111,31 @@ kernel void swiglu_f32(
         output[gid] = silu_g * up[gid];
     }
 }
+
+// Element-wise addition of three tensors: D = A + B + C
+// Fused to reduce kernel launch overhead when combining gradients
+kernel void add3_f32(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device const float* C [[buffer(2)]],
+    device float* D [[buffer(3)]],
+    constant uint& count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        D[gid] = A[gid] + B[gid] + C[gid];
+    }
+}
+
+// In-place scale: A = A * scalar
+// Useful for gradient clipping without allocating new tensors
+kernel void scale_inplace_f32(
+    device float* A [[buffer(0)]],
+    constant float& scalar [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        A[gid] = A[gid] * scalar;
+    }
+}

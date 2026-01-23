@@ -18,7 +18,7 @@ use super::cache::ForwardCache;
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::TrainingConfig;
 use super::helpers::{
-    add_tensors, compute_total_grad_norm, ensure_fp32, scale_tensor,
+    add_tensors, compute_total_grad_norm, ensure_fp32, scale_gradients_inplace,
 };
 use super::scheduler::{CosineAnnealingLR, LRScheduler};
 
@@ -250,6 +250,12 @@ impl Trainer {
             1.0
         };
 
+        // Scale all gradients in-place with a single batched operation
+        // This avoids allocating 56 new tensors and reduces kernel launch overhead
+        if clip_scale != 1.0 {
+            scale_gradients_inplace(&all_grads, clip_scale);
+        }
+
         // ========== Apply optimizer to all parameters ==========
         Profiler::set_phase(Phase::Optimizer);
         let use_bf16 = self.config.use_bf16;
@@ -265,19 +271,17 @@ impl Trainer {
             };
         }
 
-        // Embedding
-        let grad_embed_clipped = scale_tensor(&grad_embed, clip_scale);
+        // Embedding (gradients are already scaled in-place)
         opt_step!(
             &self.model.embed_tokens,
-            &grad_embed_clipped,
+            &grad_embed,
             &mut self.model_state.embed_state
         );
 
         // Final norm
-        let grad_final_norm_clipped = scale_tensor(&grad_final_norm, clip_scale);
         opt_step!(
             &self.model.final_norm,
-            &grad_final_norm_clipped,
+            &grad_final_norm,
             &mut self.model_state.final_norm_state
         );
 
@@ -287,34 +291,19 @@ impl Trainer {
             let state = &mut self.model_state.layer_states[layer_idx];
 
             // Attention norms
-            let g = scale_tensor(&grads.grad_attn_norm, clip_scale);
-            opt_step!(&layer.attn_norm, &g, &mut state.attn_norm_state);
-
-            let g = scale_tensor(&grads.grad_ffn_norm, clip_scale);
-            opt_step!(&layer.ffn_norm, &g, &mut state.ffn_norm_state);
+            opt_step!(&layer.attn_norm, &grads.grad_attn_norm, &mut state.attn_norm_state);
+            opt_step!(&layer.ffn_norm, &grads.grad_ffn_norm, &mut state.ffn_norm_state);
 
             // Attention weights
-            let g = scale_tensor(&grads.grad_wq, clip_scale);
-            opt_step!(&layer.attention.wq.weight, &g, &mut state.attention_state.wq_state);
-
-            let g = scale_tensor(&grads.grad_wk, clip_scale);
-            opt_step!(&layer.attention.wk.weight, &g, &mut state.attention_state.wk_state);
-
-            let g = scale_tensor(&grads.grad_wv, clip_scale);
-            opt_step!(&layer.attention.wv.weight, &g, &mut state.attention_state.wv_state);
-
-            let g = scale_tensor(&grads.grad_wo, clip_scale);
-            opt_step!(&layer.attention.wo.weight, &g, &mut state.attention_state.wo_state);
+            opt_step!(&layer.attention.wq.weight, &grads.grad_wq, &mut state.attention_state.wq_state);
+            opt_step!(&layer.attention.wk.weight, &grads.grad_wk, &mut state.attention_state.wk_state);
+            opt_step!(&layer.attention.wv.weight, &grads.grad_wv, &mut state.attention_state.wv_state);
+            opt_step!(&layer.attention.wo.weight, &grads.grad_wo, &mut state.attention_state.wo_state);
 
             // FFN weights
-            let g = scale_tensor(&grads.grad_w_gate, clip_scale);
-            opt_step!(&layer.ffn.w_gate.weight, &g, &mut state.ffn_state.w_gate_state);
-
-            let g = scale_tensor(&grads.grad_w_up, clip_scale);
-            opt_step!(&layer.ffn.w_up.weight, &g, &mut state.ffn_state.w_up_state);
-
-            let g = scale_tensor(&grads.grad_w_down, clip_scale);
-            opt_step!(&layer.ffn.w_down.weight, &g, &mut state.ffn_state.w_down_state);
+            opt_step!(&layer.ffn.w_gate.weight, &grads.grad_w_gate, &mut state.ffn_state.w_gate_state);
+            opt_step!(&layer.ffn.w_up.weight, &grads.grad_w_up, &mut state.ffn_state.w_up_state);
+            opt_step!(&layer.ffn.w_down.weight, &grads.grad_w_down, &mut state.ffn_state.w_down_state);
         }
 
         self.step += 1;
