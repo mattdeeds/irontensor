@@ -90,8 +90,15 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     matmul_mps(a, b)
 }
 
-/// Custom GEMM kernel (kept for reference and edge cases)
-#[allow(dead_code)]
+/// Custom GEMM kernel using Metal compute shaders.
+///
+/// Unlike `matmul` (which uses MPS), this function integrates with CommandBatch
+/// for pipelining multiple operations without intermediate GPU syncs.
+/// Use this when batching independent matmuls to reduce sync overhead.
+///
+/// Supports:
+/// - 2D tensors: [M, K] @ [K, N] -> [M, N]
+/// - 3D tensors (batched): [B, M, K] @ [B, K, N] -> [B, M, N]
 pub fn matmul_custom(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(a.precision(), Precision::FP32, "matmul currently only supports FP32");
     assert_eq!(b.precision(), Precision::FP32, "matmul currently only supports FP32");
