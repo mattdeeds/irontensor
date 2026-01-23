@@ -16,6 +16,9 @@ use tokenizers::{DecoderWrapper, PreTokenizerWrapper, Tokenizer};
 const TINY_SHAKESPEARE_URL: &str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
 fn main() {
+    // Load environment variables from .env file (if it exists)
+    dotenvy::dotenv().ok();
+
     // Initialize the Metal context
     let ctx = MetalContext::global();
     println!("IronTensor - GPT Training on Tiny Shakespeare");
@@ -31,6 +34,23 @@ fn main() {
         warmup_steps: 5,
         report_interval: 0,
     });
+
+    // Parse configuration from environment variables
+    let model_name = std::env::var("IRONTENSOR_MODEL").unwrap_or_else(|_| "shakespeare".to_string());
+    let total_steps: usize = std::env::var("IRONTENSOR_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let batch_size: usize = std::env::var("IRONTENSOR_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
+    println!("Configuration:");
+    println!("  Model: {}", model_name);
+    println!("  Steps: {}", total_steps);
+    println!("  Batch size: {}", batch_size);
+    println!();
 
     // Create data directory if it doesn't exist
     fs::create_dir_all("data").expect("Failed to create data directory");
@@ -129,7 +149,12 @@ fn main() {
     println!("=== Step 4: Initializing Model ===\n");
 
     // Create model config matching tokenizer vocab size
-    let mut config = ModelConfig::shakespeare();
+    let mut config = match model_name.as_str() {
+        "tiny" => ModelConfig::tiny(),
+        "small" => ModelConfig::small(),
+        "medium" => ModelConfig::medium(),
+        _ => ModelConfig::shakespeare(),
+    };
     config.vocab_size = vocab_size; // Match actual tokenizer vocab
 
     println!("Model Configuration:");
@@ -153,7 +178,6 @@ fn main() {
     println!("=== Step 5: Training ===\n");
 
     let seq_len = 256; // Sequence length for training
-    let batch_size = 16; // Batch size
 
     let train_dataset = TokenDataset::open(train_path, seq_len).expect("Failed to open train dataset");
     let val_dataset = TokenDataset::open(val_path, seq_len).expect("Failed to open val dataset");
@@ -171,12 +195,12 @@ fn main() {
     // Training configuration
     let train_config = TrainingConfig {
         learning_rate: 3e-4,
-        weight_decay: 0.1,
+        weight_decay: 0.25,
         beta1: 0.9,
         beta2: 0.99,
         max_grad_norm: 1.0,
         warmup_steps: 50,
-        total_steps: 100,  // Reduced for testing
+        total_steps,
         log_interval: 10,  // More frequent logging
         save_interval: usize::MAX,  // Disable checkpoints during testing
         eval_interval: 50,
@@ -199,7 +223,7 @@ fn main() {
     Logger::init(LogConfig {
         enabled: logging_enabled,
         log_dir: std::env::var("IRONTENSOR_LOG_DIR").unwrap_or_else(|_| "logs".to_string()),
-        model_name: "shakespeare".to_string(),
+        model_name: model_name.clone(),
         config: TrainConfigSnapshot {
             learning_rate: train_config.learning_rate,
             weight_decay: train_config.weight_decay,
