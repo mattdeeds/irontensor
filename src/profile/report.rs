@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::categories::{OpCategory, Phase};
-use crate::logging::{LayerTimingRecord, OpTimingRecord, ProfileReportRecord};
+use crate::logging::{LayerTimingRecord, MatmulShapeRecord, OpTimingRecord, ProfileReportRecord};
 
 /// Statistics for a single operation type.
 #[derive(Clone, Debug)]
 pub struct OpStat {
-    pub category: OpCategory,
+    /// Operation name (may include context prefix, e.g., "attn.qkv.Matmul")
+    pub name: String,
     pub total_time: Duration,
     pub count: usize,
     pub total_elements: usize,
@@ -18,7 +19,16 @@ pub struct OpStat {
 impl OpStat {
     pub fn new(category: OpCategory) -> Self {
         Self {
-            category,
+            name: category.short_name(),
+            total_time: Duration::ZERO,
+            count: 0,
+            total_elements: 0,
+        }
+    }
+
+    pub fn new_with_name(name: String) -> Self {
+        Self {
+            name,
             total_time: Duration::ZERO,
             count: 0,
             total_elements: 0,
@@ -53,6 +63,23 @@ impl LayerTiming {
     }
 }
 
+/// Statistics for matmul operations grouped by shape.
+#[derive(Clone, Debug, Default)]
+pub struct MatmulShapeStat {
+    pub total_time: Duration,
+    pub count: usize,
+}
+
+impl MatmulShapeStat {
+    pub fn avg_time(&self) -> Duration {
+        if self.count > 0 {
+            self.total_time / self.count as u32
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
 /// Complete profiling report.
 #[derive(Clone, Debug)]
 pub struct ProfileReport {
@@ -61,6 +88,8 @@ pub struct ProfileReport {
     pub phase_breakdown: HashMap<Phase, Duration>,
     pub layer_breakdown: Vec<LayerTiming>,
     pub op_stats: Vec<OpStat>,
+    /// Matmul statistics grouped by shape (e.g., "[4096,256]x[256,512]")
+    pub matmul_by_shape: HashMap<String, MatmulShapeStat>,
 }
 
 impl ProfileReport {
@@ -157,7 +186,7 @@ impl ProfileReport {
             println!(
                 "  {:>4} | {:20} | {:>10} | {:>8} | {:>8.3}ms | {:>7.1}%",
                 rank + 1,
-                op.category.short_name(),
+                &op.name,
                 time_str,
                 op.count,
                 avg_ms,
@@ -165,6 +194,41 @@ impl ProfileReport {
             );
         }
         println!("{}", divider);
+
+        // Print matmul shape breakdown if available
+        if !self.matmul_by_shape.is_empty() {
+            println!();
+            println!("Matmul by Shape:");
+            println!(
+                "  {:>4} | {:40} | {:>10} | {:>8} | {:>10}",
+                "Rank", "Shape", "Total", "Count", "Avg"
+            );
+            println!("{}", thin_divider);
+
+            let mut sorted_shapes: Vec<_> = self.matmul_by_shape.iter().collect();
+            sorted_shapes.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+
+            for (rank, (shape, stat)) in sorted_shapes.iter().take(10).enumerate() {
+                let total_secs = stat.total_time.as_secs_f64();
+                let avg_ms = stat.avg_time().as_secs_f64() * 1000.0;
+
+                let time_str = if total_secs >= 1.0 {
+                    format!("{:.2}s", total_secs)
+                } else {
+                    format!("{:.1}ms", total_secs * 1000.0)
+                };
+
+                println!(
+                    "  {:>4} | {:40} | {:>10} | {:>8} | {:>8.3}ms",
+                    rank + 1,
+                    shape,
+                    time_str,
+                    stat.count,
+                    avg_ms
+                );
+            }
+            println!("{}", divider);
+        }
     }
 
     /// Convert to a serializable record for logging.
@@ -213,12 +277,33 @@ impl ProfileReport {
             .iter()
             .take(15)
             .map(|op| OpTimingRecord {
-                op: op.category.short_name().to_string(),
+                op: op.name.clone(),
                 time_ms: op.total_time.as_secs_f64() as f32 * 1000.0,
                 count: op.count,
                 avg_ms: op.avg_time().as_secs_f64() as f32 * 1000.0,
             })
             .collect();
+
+        // Convert matmul shape statistics
+        let matmul_by_shape = if self.matmul_by_shape.is_empty() {
+            None
+        } else {
+            let mut sorted_shapes: Vec<_> = self.matmul_by_shape.iter().collect();
+            sorted_shapes.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+
+            Some(
+                sorted_shapes
+                    .iter()
+                    .take(10)
+                    .map(|(shape, stat)| MatmulShapeRecord {
+                        shape: (*shape).clone(),
+                        time_ms: stat.total_time.as_secs_f64() as f32 * 1000.0,
+                        count: stat.count,
+                        avg_ms: stat.avg_time().as_secs_f64() as f32 * 1000.0,
+                    })
+                    .collect(),
+            )
+        };
 
         ProfileReportRecord {
             total_time_ms,
@@ -227,6 +312,7 @@ impl ProfileReport {
             phase_breakdown,
             layer_breakdown,
             top_operations,
+            matmul_by_shape,
         }
     }
 
@@ -278,10 +364,27 @@ impl ProfileReport {
             let comma = if i < self.op_stats.len() - 1 { "," } else { "" };
             json.push_str(&format!(
                 "    {{\"name\": \"{}\", \"total_ms\": {:.3}, \"count\": {}, \"avg_ms\": {:.3}}}{}\n",
-                op.category.short_name(),
+                op.name,
                 op.total_time.as_secs_f64() * 1000.0,
                 op.count,
                 op.avg_time().as_secs_f64() * 1000.0,
+                comma
+            ));
+        }
+        json.push_str("  ],\n");
+
+        // Matmul by shape
+        json.push_str("  \"matmul_by_shape\": [\n");
+        let mut sorted_shapes: Vec<_> = self.matmul_by_shape.iter().collect();
+        sorted_shapes.sort_by(|a, b| b.1.total_time.cmp(&a.1.total_time));
+        for (i, (shape, stat)) in sorted_shapes.iter().take(10).enumerate() {
+            let comma = if i < sorted_shapes.len().min(10) - 1 { "," } else { "" };
+            json.push_str(&format!(
+                "    {{\"shape\": \"{}\", \"total_ms\": {:.3}, \"count\": {}, \"avg_ms\": {:.3}}}{}\n",
+                shape,
+                stat.total_time.as_secs_f64() * 1000.0,
+                stat.count,
+                stat.avg_time().as_secs_f64() * 1000.0,
                 comma
             ));
         }

@@ -1,5 +1,6 @@
 use crate::ops::{attention, rope};
 use crate::optim::ParamState;
+use crate::profile::context;
 use crate::tensor::Tensor;
 
 use super::linear::Linear;
@@ -74,6 +75,8 @@ impl MultiHeadAttention {
     /// - `position_offset`: Starting position for RoPE (for KV cache continuation)
     /// - `causal`: Whether to apply causal masking
     pub fn forward(&self, x: &Tensor, position_offset: usize, causal: bool) -> Tensor {
+        let _ctx = context("attn");
+
         let shape = x.shape();
         assert_eq!(shape.len(), 3, "Input must be [batch, seq_len, hidden_dim]");
 
@@ -83,9 +86,13 @@ impl MultiHeadAttention {
         assert_eq!(hidden, self.hidden_dim);
 
         // Project to Q, K, V
-        let q = self.wq.forward(x); // [batch, seq_len, num_heads * head_dim]
-        let k = self.wk.forward(x); // [batch, seq_len, num_kv_heads * head_dim]
-        let v = self.wv.forward(x); // [batch, seq_len, num_kv_heads * head_dim]
+        let (q, k, v) = {
+            let _ctx = context("qkv");
+            let q = self.wq.forward(x); // [batch, seq_len, num_heads * head_dim]
+            let k = self.wk.forward(x); // [batch, seq_len, num_kv_heads * head_dim]
+            let v = self.wv.forward(x); // [batch, seq_len, num_kv_heads * head_dim]
+            (q, k, v)
+        };
 
         // Reshape to [batch, seq_len, num_heads, head_dim]
         let q = self.reshape_for_attention(&q, batch, seq_len, self.num_heads);
@@ -93,8 +100,12 @@ impl MultiHeadAttention {
         let v = self.reshape_for_attention(&v, batch, seq_len, self.num_kv_heads);
 
         // Apply RoPE to Q and K
-        let q = rope(&q, self.rope_base, position_offset);
-        let k = rope(&k, self.rope_base, position_offset);
+        let (q, k) = {
+            let _ctx = context("rope");
+            let q = rope(&q, self.rope_base, position_offset);
+            let k = rope(&k, self.rope_base, position_offset);
+            (q, k)
+        };
 
         // Expand KV heads if using GQA
         let (k, v) = if self.num_kv_heads != self.num_heads {
@@ -111,7 +122,10 @@ impl MultiHeadAttention {
         let v = self.transpose_for_scores(&v, batch, seq_len, self.num_heads);
 
         // Compute attention
-        let attn_output = attention(&q, &k, &v, causal);
+        let attn_output = {
+            let _ctx = context("scores");
+            attention(&q, &k, &v, causal)
+        };
 
         // Transpose back to [batch, seq_len, num_heads, head_dim]
         let attn_output = self.transpose_from_scores(&attn_output, batch, seq_len, self.num_heads);
@@ -120,7 +134,10 @@ impl MultiHeadAttention {
         let attn_output = self.reshape_from_attention(&attn_output, batch, seq_len);
 
         // Output projection
-        self.wo.forward(&attn_output)
+        {
+            let _ctx = context("proj");
+            self.wo.forward(&attn_output)
+        }
     }
 
     /// Reshape from [batch, seq, heads * head_dim] to [batch, seq, heads, head_dim]

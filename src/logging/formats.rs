@@ -117,6 +117,19 @@ pub struct TrainConfigSnapshot {
     pub use_bf16: bool,
 }
 
+/// Matmul shape timing record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatmulShapeRecord {
+    /// Shape key (e.g., "[4096,256]x[256,512]")
+    pub shape: String,
+    /// Total time in milliseconds
+    pub time_ms: f32,
+    /// Number of invocations
+    pub count: usize,
+    /// Average time per invocation in milliseconds
+    pub avg_ms: f32,
+}
+
 /// Serializable version of ProfileReport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileReportRecord {
@@ -132,6 +145,9 @@ pub struct ProfileReportRecord {
     pub layer_breakdown: Vec<LayerTimingRecord>,
     /// Top operations by time
     pub top_operations: Vec<OpTimingRecord>,
+    /// Matmul operations grouped by shape
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matmul_by_shape: Option<Vec<MatmulShapeRecord>>,
 }
 
 /// Per-layer timing record.

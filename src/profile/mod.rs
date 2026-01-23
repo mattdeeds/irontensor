@@ -36,8 +36,8 @@ pub mod report;
 pub mod timer;
 
 pub use categories::{OpCategory, Phase};
-pub use report::{LayerTiming, OpStat, ProfileReport};
-pub use timer::{is_profiling_enabled, timed, TimedOp};
+pub use report::{LayerTiming, MatmulShapeStat, OpStat, ProfileReport};
+pub use timer::{context, is_profiling_enabled, timed, ProfileContext, TimedOp};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,6 +46,20 @@ use std::time::{Duration, Instant};
 thread_local! {
     /// Thread-local profiler instance.
     pub(crate) static PROFILER: RefCell<Option<ProfilerState>> = const { RefCell::new(None) };
+}
+
+/// Internal statistics for matmul operations grouped by shape.
+#[derive(Clone, Debug, Default)]
+struct MatmulShapeStatInternal {
+    total_time: Duration,
+    count: usize,
+}
+
+impl MatmulShapeStatInternal {
+    fn record(&mut self, duration: Duration) {
+        self.total_time += duration;
+        self.count += 1;
+    }
 }
 
 /// Profiler configuration.
@@ -80,7 +94,12 @@ pub struct ProfilerState {
     steps_recorded: usize,
     phase_times: HashMap<Phase, Duration>,
     layer_times: Vec<LayerTiming>,
-    op_stats: HashMap<OpCategory, OpStat>,
+    /// Operation stats keyed by full operation name (context.op_name)
+    op_stats: HashMap<String, OpStat>,
+    /// Context stack for hierarchical operation naming
+    context_stack: Vec<String>,
+    /// Matmul shape statistics for dimension-based analysis
+    matmul_shapes: HashMap<String, MatmulShapeStatInternal>,
 }
 
 impl ProfilerState {
@@ -96,7 +115,21 @@ impl ProfilerState {
             phase_times: HashMap::new(),
             layer_times: Vec::new(),
             op_stats: HashMap::new(),
+            context_stack: Vec::new(),
+            matmul_shapes: HashMap::new(),
         }
+    }
+
+    fn push_tag(&mut self, tag: &str) {
+        self.context_stack.push(tag.to_string());
+    }
+
+    fn pop_tag(&mut self) {
+        self.context_stack.pop();
+    }
+
+    fn current_context(&self) -> String {
+        self.context_stack.join(".")
     }
 
     fn begin_step(&mut self) {
@@ -153,20 +186,57 @@ impl ProfilerState {
             }
         }
 
-        // Record operation stats
+        // Build full operation name including context
+        let op_name = category.short_name();
+        let full_op = if self.context_stack.is_empty() {
+            op_name
+        } else {
+            format!("{}.{}", self.current_context(), op_name)
+        };
+
+        // Record operation stats with full name as key
         self.op_stats
-            .entry(category.clone())
-            .or_insert_with(|| OpStat::new(category))
+            .entry(full_op.clone())
+            .or_insert_with(|| OpStat::new_with_name(full_op))
             .record(duration, elements);
     }
 
+    /// Record matmul shape statistics for dimension-based analysis
+    pub fn record_matmul_shape(&mut self, shape_key: &str, duration: Duration) {
+        // Skip if still in warmup
+        if self.step < self.config.warmup_steps {
+            return;
+        }
+
+        self.matmul_shapes
+            .entry(shape_key.to_string())
+            .or_default()
+            .record(duration);
+    }
+
     fn generate_report(&self) -> ProfileReport {
+        // Convert matmul_shapes to the report format
+        let matmul_by_shape: HashMap<String, report::MatmulShapeStat> = self
+            .matmul_shapes
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    report::MatmulShapeStat {
+                        total_time: v.total_time,
+                        count: v.count,
+                    },
+                )
+            })
+            .collect();
+
         ProfileReport {
             total_time: self.total_time,
             steps_recorded: self.steps_recorded,
             phase_breakdown: self.phase_times.clone(),
             layer_breakdown: self.layer_times.clone(),
             op_stats: self.op_stats.values().cloned().collect(),
+            matmul_by_shape,
         }
     }
 }
@@ -250,9 +320,42 @@ impl Profiler {
                     phase_breakdown: HashMap::new(),
                     layer_breakdown: Vec::new(),
                     op_stats: Vec::new(),
+                    matmul_by_shape: HashMap::new(),
                 }
             }
         })
+    }
+
+    /// Push a context tag onto the stack for hierarchical profiling.
+    ///
+    /// Context tags are joined with "." to form full operation names.
+    /// Example: push_tag("attn"), push_tag("qkv") -> operations named "attn.qkv.Matmul"
+    pub fn push_tag(tag: &str) {
+        PROFILER.with(|p| {
+            if let Some(ref mut profiler) = *p.borrow_mut() {
+                profiler.push_tag(tag);
+            }
+        });
+    }
+
+    /// Pop the most recent context tag from the stack.
+    pub fn pop_tag() {
+        PROFILER.with(|p| {
+            if let Some(ref mut profiler) = *p.borrow_mut() {
+                profiler.pop_tag();
+            }
+        });
+    }
+
+    /// Record a matmul shape for dimension-based profiling.
+    ///
+    /// `shape_key` should be a string like "[4096,256]x[256,512]" or "[4096,256]x[512,256]^T"
+    pub fn record_matmul_shape(shape_key: &str, duration: Duration) {
+        PROFILER.with(|p| {
+            if let Some(ref mut profiler) = *p.borrow_mut() {
+                profiler.record_matmul_shape(shape_key, duration);
+            }
+        });
     }
 
     /// Get the number of steps recorded so far.

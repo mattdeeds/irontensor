@@ -9,10 +9,12 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
+use std::time::Instant;
+
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::Precision;
-use crate::profile::{timed, OpCategory};
+use crate::profile::{timed, OpCategory, Profiler};
 use crate::tensor::Tensor;
 
 const BACKWARD_GEMM_SHADER: &str = include_str!("../../shaders/backward/gemm.metal");
@@ -70,11 +72,13 @@ fn get_pipelines() -> &'static GemmBackwardPipelines {
 /// For 3D (batched): same formula applied per batch
 pub fn matmul_backward(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
     let _timer = timed(OpCategory::MatmulBackward, grad_c.numel());
+    let shape_start = Instant::now();
+
     assert_eq!(grad_c.precision(), Precision::FP32);
     assert_eq!(a.precision(), Precision::FP32);
     assert_eq!(b.precision(), Precision::FP32);
 
-    match (a.shape().len(), b.shape().len()) {
+    let result = match (a.shape().len(), b.shape().len()) {
         (2, 2) => matmul_backward_2d(grad_c, a, b),
         (3, 3) => matmul_backward_batched(grad_c, a, b),
         (4, 4) => matmul_backward_4d(grad_c, a, b),
@@ -82,7 +86,20 @@ pub fn matmul_backward(grad_c: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tens
             "matmul_backward requires 2D, 3D, or 4D tensors, got shapes {:?} and {:?}",
             a.shape(), b.shape()
         ),
-    }
+    };
+
+    // Record shape statistics for backward matmul
+    // grad_A = grad_C @ B^T and grad_B = A^T @ grad_C
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let shape_key = format!(
+        "bw:[{},{}]x[{},{}]",
+        a_shape[a_shape.len() - 2], a_shape[a_shape.len() - 1],
+        b_shape[b_shape.len() - 2], b_shape[b_shape.len() - 1]
+    );
+    Profiler::record_matmul_shape(&shape_key, shape_start.elapsed());
+
+    result
 }
 
 /// Compute only grad_A from matmul backward

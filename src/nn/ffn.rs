@@ -1,5 +1,6 @@
 use crate::ops::swiglu;
 use crate::optim::ParamState;
+use crate::profile::context;
 use crate::tensor::Tensor;
 
 use super::linear::Linear;
@@ -56,19 +57,28 @@ impl FeedForward {
     /// Input shape: [batch, seq_len, hidden_dim]
     /// Output shape: [batch, seq_len, hidden_dim]
     pub fn forward(&self, x: &Tensor) -> Tensor {
+        let _ctx = context("ffn");
+
         let shape = x.shape();
         assert!(shape.len() >= 2);
         assert_eq!(shape[shape.len() - 1], self.hidden_dim);
 
         // Gate and up projections
-        let gate = self.w_gate.forward(x); // [batch, seq, intermediate]
-        let up = self.w_up.forward(x); // [batch, seq, intermediate]
+        let (gate, up) = {
+            let _ctx = context("gate_up");
+            let gate = self.w_gate.forward(x); // [batch, seq, intermediate]
+            let up = self.w_up.forward(x); // [batch, seq, intermediate]
+            (gate, up)
+        };
 
         // SwiGLU activation: silu(gate) * up
         let hidden = swiglu(&gate, &up).unwrap();
 
         // Down projection
-        self.w_down.forward(&hidden)
+        {
+            let _ctx = context("down");
+            self.w_down.forward(&hidden)
+        }
     }
 
     /// Get total parameter count

@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use super::categories::OpCategory;
+use super::Profiler;
 use super::PROFILER;
 
 /// RAII timing guard that records duration on drop.
@@ -58,4 +59,48 @@ pub fn timed(category: OpCategory, elements: usize) -> Option<TimedOp> {
 /// Check if profiling is currently enabled.
 pub fn is_profiling_enabled() -> bool {
     PROFILER.with(|p| p.borrow().is_some())
+}
+
+/// RAII guard for profiling context.
+///
+/// Automatically pops the context tag when dropped.
+pub struct ProfileContext {
+    enabled: bool,
+}
+
+impl ProfileContext {
+    /// Create a new context guard that pushes a tag onto the profiler's context stack.
+    pub fn new(tag: &str) -> Self {
+        let enabled = is_profiling_enabled();
+        if enabled {
+            Profiler::push_tag(tag);
+        }
+        Self { enabled }
+    }
+}
+
+impl Drop for ProfileContext {
+    fn drop(&mut self) {
+        if self.enabled {
+            Profiler::pop_tag();
+        }
+    }
+}
+
+/// Create an RAII context guard for hierarchical profiling.
+///
+/// When the returned guard is dropped, the context tag is automatically popped.
+///
+/// # Example
+/// ```ignore
+/// let _ctx = context("attn");
+/// // Operations here are profiled as "attn.OpName"
+/// {
+///     let _ctx2 = context("qkv");
+///     // Operations here are profiled as "attn.qkv.OpName"
+/// }
+/// // Back to "attn.OpName"
+/// ```
+pub fn context(tag: &str) -> ProfileContext {
+    ProfileContext::new(tag)
 }

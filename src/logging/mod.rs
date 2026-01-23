@@ -48,8 +48,8 @@ pub mod train_logger;
 pub mod writer;
 
 pub use formats::{
-    current_timestamp_ms, InferenceRecord, LayerTimingRecord, OpTimingRecord, ProfileReportRecord,
-    RunLog, TrainConfigSnapshot, TrainStepRecord, TrainingLog,
+    current_timestamp_ms, InferenceRecord, LayerTimingRecord, MatmulShapeRecord, OpTimingRecord,
+    ProfileReportRecord, RunLog, TrainConfigSnapshot, TrainStepRecord, TrainingLog,
 };
 pub use inference_logger::InferenceTimer;
 pub use writer::write_json_file;

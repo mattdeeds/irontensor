@@ -8,12 +8,26 @@ use objc2::AllocAnyThread;
 use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
 
+use std::time::Instant;
+
 use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::error::{TensorError, TensorResult};
 use crate::precision::Precision;
-use crate::profile::{timed, OpCategory};
+use crate::profile::{timed, OpCategory, Profiler};
 use crate::tensor::Tensor;
+
+/// Format a shape key for matmul profiling.
+/// Example: "[4096,256]x[256,512]" or "[4096,256]x[512,256]^T"
+fn format_shape_key(a_shape: &[usize], b_shape: &[usize], transpose_b: bool) -> String {
+    let a_str = format!("[{},{}]", a_shape[a_shape.len() - 2], a_shape[a_shape.len() - 1]);
+    let b_str = format!("[{},{}]", b_shape[b_shape.len() - 2], b_shape[b_shape.len() - 1]);
+    if transpose_b {
+        format!("{}x{}^T", a_str, b_str)
+    } else {
+        format!("{}x{}", a_str, b_str)
+    }
+}
 
 /// MPS-based matrix multiplication: C = A @ B
 ///
@@ -54,7 +68,10 @@ pub fn matmul_mps(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
     };
     let _timer = timed(OpCategory::Matmul, output_elements);
 
-    match (a_shape.len(), b_shape.len()) {
+    // Track shape timing
+    let shape_start = Instant::now();
+
+    let result = match (a_shape.len(), b_shape.len()) {
         (2, 2) => matmul_mps_2d(a, b),
         (3, 3) => matmul_mps_batched(a, b),
         _ => Err(TensorError::UnsupportedDimensions {
@@ -62,7 +79,15 @@ pub fn matmul_mps(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
             expected: "2D or 3D tensors",
             got: vec![a_shape.len(), b_shape.len()],
         }),
+    };
+
+    // Record shape statistics
+    if result.is_ok() {
+        let shape_key = format_shape_key(a_shape, b_shape, false);
+        Profiler::record_matmul_shape(&shape_key, shape_start.elapsed());
     }
+
+    result
 }
 
 fn matmul_mps_2d(a: &Tensor, b: &Tensor) -> TensorResult<Tensor> {
@@ -203,6 +228,7 @@ pub fn matmul_mps_nt(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(k, k2, "Inner dimensions must match: A[{}, {}] @ B[{}, {}]^T", m, k, n, k2);
 
     let _timer = timed(OpCategory::Matmul, m * n);
+    let shape_start = Instant::now();
 
     let c = Tensor::zeros(&[m, n], Precision::FP32);
 
@@ -280,6 +306,10 @@ pub fn matmul_mps_nt(a: &Tensor, b: &Tensor) -> Tensor {
         command_buffer.waitUntilCompleted();
     });
 
+    // Record shape statistics (B transposed)
+    let shape_key = format_shape_key(a.shape(), b.shape(), true);
+    Profiler::record_matmul_shape(&shape_key, shape_start.elapsed());
+
     c
 }
 
@@ -310,6 +340,7 @@ pub fn matmul_mps_tn(a: &Tensor, b: &Tensor) -> Tensor {
     assert_eq!(k, k2, "Inner dimensions must match: A[{}, {}]^T @ B[{}, {}]", k, m, k2, n);
 
     let _timer = timed(OpCategory::Matmul, m * n);
+    let shape_start = Instant::now();
 
     let c = Tensor::zeros(&[m, n], Precision::FP32);
 
@@ -386,6 +417,10 @@ pub fn matmul_mps_tn(a: &Tensor, b: &Tensor) -> Tensor {
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
     });
+
+    // Record shape statistics (A transposed) - use ^T prefix for left transpose
+    let shape_key = format!("[{},{}]^Tx[{},{}]", a_shape[0], a_shape[1], b_shape[0], b_shape[1]);
+    Profiler::record_matmul_shape(&shape_key, shape_start.elapsed());
 
     c
 }

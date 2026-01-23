@@ -1,6 +1,7 @@
 use crate::ops::{embedding, matmul, rmsnorm, to_f32_gpu};
 use crate::optim::ParamState;
 use crate::precision::Precision;
+use crate::profile::context;
 use crate::tensor::Tensor;
 
 use super::transformer::{TransformerBlock, TransformerBlockState};
@@ -224,10 +225,13 @@ impl GPTModel {
         assert_eq!(input_ids.len(), batch_size * seq_len);
 
         // Token embedding
-        let mut hidden = embedding(&self.embed_tokens, input_ids);
-        // Reshape to [batch, seq_len, hidden_dim]
-        let hidden_data = hidden.as_f32_slice().to_vec();
-        hidden = Tensor::from_f32_slice(&hidden_data, &[batch_size, seq_len, self.config.hidden_dim]);
+        let mut hidden = {
+            let _ctx = context("embed");
+            let h = embedding(&self.embed_tokens, input_ids);
+            // Reshape to [batch, seq_len, hidden_dim]
+            let hidden_data = h.as_f32_slice().to_vec();
+            Tensor::from_f32_slice(&hidden_data, &[batch_size, seq_len, self.config.hidden_dim])
+        };
 
         // Pass through transformer layers
         for layer in &self.layers {
@@ -235,7 +239,10 @@ impl GPTModel {
         }
 
         // Final norm
-        hidden = rmsnorm(&hidden, &self.final_norm, self.config.norm_eps).unwrap();
+        hidden = {
+            let _ctx = context("final_norm");
+            rmsnorm(&hidden, &self.final_norm, self.config.norm_eps).unwrap()
+        };
 
         // Save hidden states for backward pass (reshape to 2D)
         let final_hidden = Tensor::from_f32_slice(
@@ -244,7 +251,10 @@ impl GPTModel {
         );
 
         // Output projection (compute logits)
-        let logits = self.compute_logits(&hidden, batch_size, seq_len);
+        let logits = {
+            let _ctx = context("output_proj");
+            self.compute_logits(&hidden, batch_size, seq_len)
+        };
 
         (logits, final_hidden)
     }
