@@ -70,7 +70,9 @@ impl Trainer {
                 let path = format!("{}/step_{}.bin", self.config.checkpoint_dir, self.step);
 
                 // Create checkpoint directory if it doesn't exist
-                std::fs::create_dir_all(&self.config.checkpoint_dir).ok();
+                if let Err(e) = std::fs::create_dir_all(&self.config.checkpoint_dir) {
+                    eprintln!("Failed to create checkpoint directory '{}': {}", self.config.checkpoint_dir, e);
+                }
 
                 if let Err(e) = self.save_checkpoint(&path) {
                     eprintln!("Failed to save checkpoint: {}", e);
@@ -159,7 +161,9 @@ impl Trainer {
                 if val_loss < self.best_val_loss {
                     self.best_val_loss = val_loss;
                     let path = format!("{}/best.bin", self.config.checkpoint_dir);
-                    std::fs::create_dir_all(&self.config.checkpoint_dir).ok();
+                    if let Err(e) = std::fs::create_dir_all(&self.config.checkpoint_dir) {
+                        eprintln!("Failed to create checkpoint directory '{}': {}", self.config.checkpoint_dir, e);
+                    }
                     if let Err(e) = self.save_checkpoint(&path) {
                         eprintln!("Failed to save best model: {}", e);
                     } else {
@@ -185,7 +189,9 @@ impl Trainer {
 
         // Save final checkpoint
         let path = format!("{}/final.bin", self.config.checkpoint_dir);
-        std::fs::create_dir_all(&self.config.checkpoint_dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&self.config.checkpoint_dir) {
+            eprintln!("Failed to create checkpoint directory '{}': {}", self.config.checkpoint_dir, e);
+        }
         if let Err(e) = self.save_checkpoint(&path) {
             eprintln!("Failed to save final checkpoint: {}", e);
         } else {

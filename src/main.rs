@@ -6,6 +6,7 @@ use irontensor::{
     Profiler, ProfilerConfig,
 };
 use objc2_metal::MTLDevice;
+use rand::Rng;
 use std::fs;
 use std::path::Path;
 use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
@@ -467,8 +468,8 @@ fn sample_from_logits(logits: &[f32]) -> u32 {
     let sum: f32 = exp_logits.iter().sum();
     let probs: Vec<f32> = exp_logits.iter().map(|&x| x / sum).collect();
 
-    // Sample using simple random
-    let r: f32 = simple_random();
+    // Sample using thread-local RNG
+    let r: f32 = rand::rng().random();
     let mut cumsum = 0.0;
     for (i, &p) in probs.iter().enumerate() {
         cumsum += p;
@@ -478,21 +479,4 @@ fn sample_from_logits(logits: &[f32]) -> u32 {
     }
 
     (probs.len() - 1) as u32
-}
-
-/// Simple pseudo-random number generator (0.0 to 1.0)
-fn simple_random() -> f32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static mut SEED: u64 = 0;
-    unsafe {
-        if SEED == 0 {
-            SEED = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
-        }
-        // LCG parameters
-        SEED = SEED.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (SEED >> 33) as f32 / (1u64 << 31) as f32
-    }
 }
