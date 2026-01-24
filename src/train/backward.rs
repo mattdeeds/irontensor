@@ -3,7 +3,7 @@
 //! Contains methods for computing gradients through transformer layers.
 
 use crate::nn::TransformerBlock;
-use crate::ops::{rmsnorm_backward, rope_backward, swiglu_backward, transpose_for_attention, transpose_for_attention_backward};
+use crate::ops::{dropout_backward, rmsnorm_backward, rope_backward, swiglu_backward, transpose_for_attention, transpose_for_attention_backward};
 use crate::tensor::Tensor;
 
 use super::cache::{LayerCache, LayerGradients};
@@ -41,6 +41,13 @@ impl Trainer {
         let grad_ffn_out = grad_out_3d.clone();
         let grad_post_attn_from_ffn = grad_out_3d.clone();
 
+        // Backward through FFN dropout (if applied in forward)
+        let grad_ffn_out = if cache.ffn_dropout_seed != 0 {
+            dropout_backward(&grad_ffn_out, self.model.config.ffn_dropout, cache.ffn_dropout_seed).unwrap()
+        } else {
+            grad_ffn_out
+        };
+
         // Backward through down projection
         let grad_ffn_out_2d = grad_ffn_out.view(&[n, hidden_dim]);
         let (grad_swiglu, grad_w_down) =
@@ -70,6 +77,13 @@ impl Trainer {
         // Gradient flows through residual
         let grad_attn_out = grad_post_attn.clone();
         let grad_input_from_attn_residual = grad_post_attn.clone();
+
+        // Backward through attention dropout (if applied in forward)
+        let grad_attn_out = if cache.attn_dropout_seed != 0 {
+            dropout_backward(&grad_attn_out, self.model.config.attn_dropout, cache.attn_dropout_seed).unwrap()
+        } else {
+            grad_attn_out
+        };
 
         // Backward through output projection
         let grad_attn_out_2d = grad_attn_out.view(&[n, hidden_dim]);

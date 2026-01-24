@@ -3,7 +3,7 @@
 //! Contains methods for forward pass with activation caching needed for backward pass.
 
 use crate::nn::TransformerBlock;
-use crate::ops::{embedding, flash_attention, rmsnorm, swiglu, transpose_for_attention, transpose_from_attention};
+use crate::ops::{dropout, embedding, flash_attention, rmsnorm, swiglu, transpose_for_attention, transpose_from_attention};
 use crate::profile::Profiler;
 use crate::tensor::Tensor;
 
@@ -29,7 +29,16 @@ impl Trainer {
         // Embedding lookup (convert BF16 weights to FP32 if needed)
         let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
         let embedded = embedding(&embed_fp32, input_ids);
-        let mut hidden = embedded.view(&[batch_size, seq_len, hidden_dim]);
+
+        // Apply embedding dropout
+        let (embedded_dropped, embed_dropout_seed) = if self.config.dropout_enabled
+            && self.model.config.embed_dropout > 0.0
+        {
+            dropout(&embedded, self.model.config.embed_dropout, true).unwrap()
+        } else {
+            (embedded.clone(), 0)
+        };
+        let mut hidden = embedded_dropped.view(&[batch_size, seq_len, hidden_dim]);
 
         // Process each transformer layer
         let mut layer_caches = Vec::new();
@@ -55,6 +64,7 @@ impl Trainer {
             layers: layer_caches,
             pre_final_norm,
             final_hidden: final_hidden_2d,
+            embed_dropout_seed,
         }
     }
 
@@ -132,6 +142,15 @@ impl Trainer {
         let attn_projected = linear_forward(&attn_out_2d, &layer.attention.wo.weight);
         let attn_projected = attn_projected.view(&[batch_size, seq_len, hidden_dim]);
 
+        // Apply attention dropout
+        let (attn_projected, attn_dropout_seed) = if self.config.dropout_enabled
+            && self.model.config.attn_dropout > 0.0
+        {
+            dropout(&attn_projected, self.model.config.attn_dropout, true).unwrap()
+        } else {
+            (attn_projected, 0)
+        };
+
         // Residual connection
         let post_attn = crate::ops::add(x, &attn_projected).unwrap();
 
@@ -150,6 +169,15 @@ impl Trainer {
         // Down projection
         let ffn_out = linear_forward(&swiglu_out, &layer.ffn.w_down.weight);
         let ffn_out = ffn_out.view(&[batch_size, seq_len, hidden_dim]);
+
+        // Apply FFN dropout
+        let (ffn_out, ffn_dropout_seed) = if self.config.dropout_enabled
+            && self.model.config.ffn_dropout > 0.0
+        {
+            dropout(&ffn_out, self.model.config.ffn_dropout, true).unwrap()
+        } else {
+            (ffn_out, 0)
+        };
 
         // Residual connection
         let output = crate::ops::add(&post_attn, &ffn_out).unwrap();
@@ -171,6 +199,8 @@ impl Trainer {
             gate,
             up,
             swiglu_out,
+            attn_dropout_seed,
+            ffn_dropout_seed,
         };
 
         (output, cache)

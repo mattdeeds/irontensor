@@ -34,6 +34,10 @@ pub(crate) struct LayerCache {
     pub up: Tensor,
     /// After SwiGLU [batch*seq, intermediate]
     pub swiglu_out: Tensor,
+    /// Dropout seed for attention output (0 if no dropout)
+    pub attn_dropout_seed: u64,
+    /// Dropout seed for FFN output (0 if no dropout)
+    pub ffn_dropout_seed: u64,
 }
 
 /// Cached activations for the full forward pass
@@ -46,6 +50,8 @@ pub(crate) struct ForwardCache {
     pub pre_final_norm: Tensor,
     /// After final norm [batch*seq, hidden]
     pub final_hidden: Tensor,
+    /// Dropout seed for embedding output (0 if no dropout)
+    pub embed_dropout_seed: u64,
 }
 
 /// Gradients for a single transformer layer

@@ -1,3 +1,4 @@
+mod dropout;
 mod elementwise;
 mod embedding;
 mod gemm;
@@ -7,6 +8,7 @@ mod rope;
 mod softmax;
 mod transpose;
 
+pub use dropout::dropout_backward;
 pub use elementwise::{
     gelu_backward, mul_backward, relu_backward, scale_backward, silu_backward, swiglu_backward,
 };

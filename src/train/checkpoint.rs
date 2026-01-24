@@ -309,6 +309,10 @@ fn read_model_config<R: Read>(reader: &mut R) -> std::io::Result<ModelConfig> {
         max_seq_len,
         tie_weights,
         precision,
+        // Default dropout values for backward compatibility
+        embed_dropout: 0.0,
+        attn_dropout: 0.1,
+        ffn_dropout: 0.1,
     })
 }
 
@@ -345,6 +349,9 @@ mod tests {
             max_seq_len: 128,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         };
 
         let model = GPTModel::new(&config);

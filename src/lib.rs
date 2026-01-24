@@ -8,6 +8,7 @@ pub mod ops;
 pub mod optim;
 pub mod precision;
 pub mod profile;
+pub mod rng;
 pub mod tensor;
 pub mod train;
 

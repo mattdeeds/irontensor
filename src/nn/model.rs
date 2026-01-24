@@ -31,6 +31,12 @@ pub struct ModelConfig {
     pub tie_weights: bool,
     /// Weight precision (FP32 or BF16)
     pub precision: Precision,
+    /// Dropout rate after embedding (default 0.0)
+    pub embed_dropout: f32,
+    /// Dropout rate after attention output (default 0.1)
+    pub attn_dropout: f32,
+    /// Dropout rate after FFN output (default 0.1)
+    pub ffn_dropout: f32,
 }
 
 impl ModelConfig {
@@ -48,6 +54,9 @@ impl ModelConfig {
             norm_eps: 1e-5,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         }
     }
 
@@ -65,6 +74,9 @@ impl ModelConfig {
             norm_eps: 1e-5,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         }
     }
 
@@ -82,6 +94,9 @@ impl ModelConfig {
             norm_eps: 1e-5,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         }
     }
 
@@ -100,6 +115,9 @@ impl ModelConfig {
             norm_eps: 1e-5,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         }
     }
 

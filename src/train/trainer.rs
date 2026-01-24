@@ -369,6 +369,9 @@ mod tests {
             max_seq_len: 128,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         };
 
         let train_config = TrainingConfig::default();
@@ -392,6 +395,9 @@ mod tests {
             max_seq_len: 128,
             tie_weights: true,
             precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
         };
 
         let train_config = TrainingConfig::default();
@@ -410,5 +416,182 @@ mod tests {
         assert!(loss > 0.0);
         // Loss should be reasonable for random initialization
         assert!(loss < 10.0);
+    }
+
+    #[test]
+    fn test_train_step_produces_gradients() {
+        use crate::ops::cross_entropy_fused;
+
+        let model_config = ModelConfig {
+            vocab_size: 100,
+            hidden_dim: 32,
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_dim: 64,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 128,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.0,  // Disable dropout for determinism
+            ffn_dropout: 0.0,
+        };
+
+        let mut train_config = TrainingConfig::default();
+        train_config.dropout_enabled = false;  // Disable dropout
+        train_config.async_gpu = false;  // Use synchronous mode
+
+        let trainer = Trainer::new(&model_config, &train_config);
+
+        let batch_size = 2;
+        let seq_len = 8;
+        let vocab_size = model_config.vocab_size;
+        let _hidden_dim = model_config.hidden_dim;
+        let n = batch_size * seq_len;
+
+        let input_ids: Vec<u32> = (0..n).map(|i| (i % 100) as u32).collect();
+        let target_ids: Vec<u32> = (0..n).map(|i| ((i + 1) % 100) as u32).collect();
+
+        // Step 1: Forward pass (model.forward reads GPU data, so don't use batching)
+        // NOTE: model.forward() has internal as_f32_slice() calls which require sync
+        let logits = trainer.model.forward(&input_ids, batch_size, seq_len, 0);
+
+        let logits_data = logits.as_f32_slice();
+        let logits_nonzero = logits_data.iter().any(|&x| x != 0.0);
+        println!("Logits shape: {:?}, non-zero: {}", logits.shape(), logits_nonzero);
+        assert!(logits_nonzero, "Logits should be non-zero");
+
+        // Step 2: Cross-entropy gradient (cross_entropy_fused has internal syncs)
+        let logits_2d = logits.view(&[n, vocab_size]);
+        let (loss, _, grad_logits) = cross_entropy_fused(&logits_2d, &target_ids);
+
+        let grad_logits_data = grad_logits.as_f32_slice();
+        let grad_logits_nonzero = grad_logits_data.iter().any(|&x| x != 0.0);
+        let grad_logits_sum: f32 = grad_logits_data.iter().map(|x| x.abs()).sum();
+        println!(
+            "Loss: {}, grad_logits shape: {:?}, non-zero: {}, abs_sum: {}",
+            loss,
+            grad_logits.shape(),
+            grad_logits_nonzero,
+            grad_logits_sum
+        );
+        assert!(grad_logits_nonzero, "grad_logits should be non-zero");
+
+        // Step 3: Test a simple matmul with grad_logits (matmul syncs internally)
+        let embed_fp32 = ensure_fp32(&trainer.model.embed_tokens);
+        println!("embed_fp32 shape: {:?}", embed_fp32.shape());
+
+        let grad_hidden = matmul(&grad_logits, &embed_fp32).unwrap();
+
+        let grad_hidden_data = grad_hidden.as_f32_slice();
+        let grad_hidden_nonzero = grad_hidden_data.iter().any(|&x| x != 0.0);
+        let grad_hidden_sum: f32 = grad_hidden_data.iter().map(|x| x.abs()).sum();
+        println!(
+            "grad_hidden shape: {:?}, non-zero: {}, abs_sum: {}",
+            grad_hidden.shape(),
+            grad_hidden_nonzero,
+            grad_hidden_sum
+        );
+        assert!(grad_hidden_nonzero, "grad_hidden should be non-zero");
+
+        // Loss should be positive
+        assert!(loss > 0.0, "Loss should be positive, got {}", loss);
+    }
+
+    #[test]
+    fn test_full_train_step_gradients() {
+        use crate::command_batch::CommandBatch;
+        use crate::ops::cross_entropy_fused;
+
+        // Test that trainer forward_with_cache + backward produces non-zero gradients
+        let model_config = ModelConfig {
+            vocab_size: 100,
+            hidden_dim: 32,
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_dim: 64,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 128,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.0,  // Disable dropout for determinism
+            ffn_dropout: 0.0,
+        };
+
+        let mut train_config = TrainingConfig::default();
+        train_config.dropout_enabled = false;  // Disable dropout
+        train_config.async_gpu = false;  // Use synchronous mode
+
+        let trainer = Trainer::new(&model_config, &train_config);
+
+        let batch_size = 2;
+        let seq_len = 8;
+        let vocab_size = model_config.vocab_size;
+        let n = batch_size * seq_len;
+        let input_ids: Vec<u32> = (0..n).map(|i| (i % 100) as u32).collect();
+        let target_ids: Vec<u32> = (0..n).map(|i| ((i + 1) % 100) as u32).collect();
+
+        // Test 1: Forward pass WITHOUT CommandBatch (immediate mode)
+        println!("\n=== Test 1: Forward without batching ===");
+        let cache = trainer.forward_with_cache(&input_ids, batch_size, seq_len);
+
+        let fh_data = cache.final_hidden.as_f32_slice();
+        let fh_nonzero = fh_data.iter().any(|&x| x != 0.0);
+        let fh_sum: f32 = fh_data.iter().map(|x| x.abs()).sum();
+        println!("Final hidden shape: {:?}, non-zero: {}, abs_sum: {}",
+                 cache.final_hidden.shape(), fh_nonzero, fh_sum);
+        assert!(fh_nonzero, "Final hidden should be non-zero (immediate mode)");
+
+        // Test 2: Forward pass WITH CommandBatch (batched mode)
+        println!("\n=== Test 2: Forward with batching ===");
+        CommandBatch::begin();
+        let cache2 = trainer.forward_with_cache(&input_ids, batch_size, seq_len);
+        CommandBatch::sync();
+
+        let fh_data2 = cache2.final_hidden.as_f32_slice();
+        let fh_nonzero2 = fh_data2.iter().any(|&x| x != 0.0);
+        let fh_sum2: f32 = fh_data2.iter().map(|x| x.abs()).sum();
+        println!("Final hidden shape: {:?}, non-zero: {}, abs_sum: {}",
+                 cache2.final_hidden.shape(), fh_nonzero2, fh_sum2);
+        CommandBatch::end();
+        assert!(fh_nonzero2, "Final hidden should be non-zero (batched mode)");
+
+        // Test 3: Logits computation
+        println!("\n=== Test 3: Logits computation ===");
+        let logits = trainer.compute_logits_from_hidden(&cache.final_hidden);
+        let logits_data = logits.as_f32_slice();
+        let logits_nonzero = logits_data.iter().any(|&x| x != 0.0);
+        let logits_sum: f32 = logits_data.iter().map(|x| x.abs()).sum();
+        println!("Logits shape: {:?}, non-zero: {}, abs_sum: {}",
+                 logits.shape(), logits_nonzero, logits_sum);
+        assert!(logits_nonzero, "Logits should be non-zero");
+
+        // Test 4: Cross-entropy gradient
+        println!("\n=== Test 4: Cross-entropy gradient ===");
+        let logits_2d = logits.view(&[n, vocab_size]);
+        let (loss, _, grad_logits) = cross_entropy_fused(&logits_2d, &target_ids);
+        let gl_data = grad_logits.as_f32_slice();
+        let gl_nonzero = gl_data.iter().any(|&x| x != 0.0);
+        let gl_sum: f32 = gl_data.iter().map(|x| x.abs()).sum();
+        println!("Loss: {}, grad_logits shape: {:?}, non-zero: {}, abs_sum: {}",
+                 loss, grad_logits.shape(), gl_nonzero, gl_sum);
+        assert!(gl_nonzero, "grad_logits should be non-zero");
+
+        // Test 5: Backward matmul (grad_embed_out)
+        println!("\n=== Test 5: Backward matmul ===");
+        let grad_embed_out = matmul_tn(&grad_logits, &cache.final_hidden);
+        let geo_data = grad_embed_out.as_f32_slice();
+        let geo_nonzero = geo_data.iter().any(|&x| x != 0.0);
+        let geo_sum: f32 = geo_data.iter().map(|x| x.abs()).sum();
+        println!("grad_embed_out shape: {:?}, non-zero: {}, abs_sum: {}",
+                 grad_embed_out.shape(), geo_nonzero, geo_sum);
+        assert!(geo_nonzero, "grad_embed_out should be non-zero");
+
+        println!("\n=== All checks passed! ===");
     }
 }

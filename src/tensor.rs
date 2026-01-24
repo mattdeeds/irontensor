@@ -4,6 +4,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
+use crate::command_batch::CommandBatch;
 use crate::device::MetalContext;
 use crate::precision::{bf16_slice_to_f32, f32_slice_to_bf16, Precision};
 
@@ -24,14 +25,29 @@ impl Clone for Tensor {
             .newBufferWithLength_options(alloc_size, MTLResourceOptions::StorageModeShared)
             .expect("Failed to allocate Metal buffer for clone");
 
-        // Copy data from old buffer to new buffer
+        // Use GPU blit copy to work correctly with CommandBatch
+        // This ensures the copy is added to the command buffer and executed on GPU
         if byte_size > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.buffer.contents().as_ptr() as *const u8,
-                    new_buffer.contents().as_ptr() as *mut u8,
-                    byte_size,
-                );
+            if CommandBatch::is_active() {
+                // Batched mode: sync first to ensure source data is ready,
+                // then do CPU copy (blit encoder conflicts with compute encoder)
+                CommandBatch::sync();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.buffer.contents().as_ptr() as *const u8,
+                        new_buffer.contents().as_ptr() as *mut u8,
+                        byte_size,
+                    );
+                }
+            } else {
+                // Immediate mode: direct CPU copy
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.buffer.contents().as_ptr() as *const u8,
+                        new_buffer.contents().as_ptr() as *mut u8,
+                        byte_size,
+                    );
+                }
             }
         }
 

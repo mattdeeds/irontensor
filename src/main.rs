@@ -207,6 +207,7 @@ fn main() {
         checkpoint_dir: "checkpoints".to_string(),
         use_bf16,
         async_gpu,
+        dropout_enabled: true,
     };
 
     println!("\nTraining Configuration:");

@@ -36,6 +36,7 @@ pub enum OpCategory {
     Elementwise(String),
     Transpose,
     RepeatKV,
+    Dropout,
 
     // Backward operations
     EmbeddingBackward,
@@ -47,6 +48,7 @@ pub enum OpCategory {
     CrossEntropyBackward,
     TransposeBackward,
     RepeatKVBackward,
+    DropoutBackward,
 
     // Optimizer operations
     LionStep,
@@ -75,6 +77,7 @@ impl fmt::Display for OpCategory {
             OpCategory::Elementwise(name) => write!(f, "Elementwise({})", name),
             OpCategory::Transpose => write!(f, "Transpose"),
             OpCategory::RepeatKV => write!(f, "RepeatKV"),
+            OpCategory::Dropout => write!(f, "Dropout"),
 
             OpCategory::EmbeddingBackward => write!(f, "EmbeddingBackward"),
             OpCategory::MatmulBackward => write!(f, "MatmulBackward"),
@@ -85,6 +88,7 @@ impl fmt::Display for OpCategory {
             OpCategory::CrossEntropyBackward => write!(f, "CrossEntropyBackward"),
             OpCategory::TransposeBackward => write!(f, "TransposeBackward"),
             OpCategory::RepeatKVBackward => write!(f, "RepeatKVBackward"),
+            OpCategory::DropoutBackward => write!(f, "DropoutBackward"),
 
             OpCategory::LionStep => write!(f, "LionStep"),
             OpCategory::GradientClip => write!(f, "GradientClip"),

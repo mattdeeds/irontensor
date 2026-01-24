@@ -33,6 +33,11 @@ pub enum TensorError {
     EmptyTensor {
         operation: &'static str,
     },
+    /// Invalid value for operation.
+    InvalidValue {
+        operation: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for TensorError {
@@ -52,6 +57,9 @@ impl fmt::Display for TensorError {
             }
             TensorError::EmptyTensor { operation } => {
                 write!(f, "{}: empty tensor not supported", operation)
+            }
+            TensorError::InvalidValue { operation, message } => {
+                write!(f, "{}: {}", operation, message)
             }
         }
     }

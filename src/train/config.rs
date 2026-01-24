@@ -31,6 +31,9 @@ pub struct TrainingConfig {
     /// When enabled, the optimizer step commits asynchronously, allowing
     /// the CPU to start preparing the next batch while the GPU finishes.
     pub async_gpu: bool,
+    /// Enable dropout during training.
+    /// When false, dropout is disabled (useful for evaluation/testing).
+    pub dropout_enabled: bool,
 }
 
 impl Default for TrainingConfig {
@@ -49,6 +52,7 @@ impl Default for TrainingConfig {
             checkpoint_dir: "checkpoints".to_string(),
             use_bf16: false,
             async_gpu: true, // Enabled by default for better performance
+            dropout_enabled: true, // Enabled by default for training
         }
     }
 }
