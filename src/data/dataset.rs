@@ -4,6 +4,8 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+use crate::profile::{timed, OpCategory};
+
 /// Memory-mapped tokenized dataset
 ///
 /// Efficiently loads pre-tokenized data using mmap for near-zero overhead.
@@ -134,6 +136,9 @@ impl TokenDataset {
     /// Returns (input_ids, target_ids) where each has shape [batch_size * seq_len]
     pub fn get_batches(&self, seq_indices: &[usize]) -> (Vec<u32>, Vec<u32>) {
         let batch_size = seq_indices.len();
+        let total_tokens = batch_size * self.seq_len * 2; // input + target tokens
+        let _timer = timed(OpCategory::DataLoading, total_tokens);
+
         let mut input_ids = Vec::with_capacity(batch_size * self.seq_len);
         let mut target_ids = Vec::with_capacity(batch_size * self.seq_len);
 

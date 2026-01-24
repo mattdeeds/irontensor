@@ -4,7 +4,7 @@ use crate::ops::{
     softmax, softmax_backward, to_f32_gpu, transpose_3d_gpu,
 };
 use crate::precision::Precision;
-use crate::profile::Profiler;
+use crate::profile::{timed, OpCategory, Profiler};
 use crate::tensor::Tensor;
 
 /// Ensure tensor is FP32 for compute. If BF16, converts to FP32.
@@ -45,6 +45,9 @@ pub(crate) fn scale_gradients_inplace(grads: &[&Tensor], scale: f32) {
 /// reading from GPU buffers is fast and avoids the overhead of
 /// dispatching additional GPU reduction kernels.
 pub(crate) fn compute_total_grad_norm(grads: &[&Tensor]) -> f32 {
+    let total_elements: usize = grads.iter().map(|g| g.numel()).sum();
+    let _timer = timed(OpCategory::GradientNormCPU, total_elements);
+
     let mut sum_sq = 0.0f32;
     for g in grads {
         for &val in g.as_f32_slice() {

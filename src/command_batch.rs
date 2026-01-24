@@ -30,6 +30,7 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -40,6 +41,7 @@ use objc2_metal::{
 };
 
 use crate::device::MetalContext;
+use crate::profile::OpCategory;
 
 thread_local! {
     static BATCH: RefCell<Option<BatchState>> = const { RefCell::new(None) };
@@ -113,7 +115,20 @@ impl BatchState {
     fn commit_and_wait(&mut self) {
         self.end_current_encoder();
         self.command_buffer.commit();
+
+        // Time the GPU wait to identify sync overhead
+        let start = Instant::now();
         self.command_buffer.waitUntilCompleted();
+        let wait_duration = start.elapsed();
+
+        // Record sync wait time if profiling is enabled
+        // Note: We use manual recording here because we're inside a RefCell borrow
+        // and timed() would try to borrow PROFILER which may cause issues
+        crate::profile::PROFILER.with(|p| {
+            if let Some(ref mut profiler) = *p.borrow_mut() {
+                profiler.record(OpCategory::SyncWait, wait_duration, self.op_count);
+            }
+        });
     }
 
     /// Commit the command buffer asynchronously and return a completion tracker

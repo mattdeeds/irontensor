@@ -9,6 +9,7 @@ use crate::command_batch::CommandBatch;
 use crate::nn::{GPTModel, GPTModelState, ModelConfig};
 use crate::ops::{
     cross_entropy_fused, embedding_backward, matmul, rmsnorm_backward,
+    total_l2_norm_gpu,
 };
 use crate::optim::{Lion, LionConfig};
 use crate::profile::{Phase, Profiler};
@@ -18,7 +19,7 @@ use super::cache::ForwardCache;
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::TrainingConfig;
 use super::helpers::{
-    add_tensors, compute_total_grad_norm, ensure_fp32, scale_gradients_inplace,
+    add_tensors, ensure_fp32, scale_gradients_inplace,
 };
 use super::scheduler::{CosineAnnealingLR, LRScheduler};
 
@@ -227,9 +228,8 @@ impl Trainer {
         };
 
         // ========== Compute gradient norm and clip ==========
-        // Sync before computing gradient norms (need to read gradient data)
-        CommandBatch::sync();
-
+        // Use GPU-based gradient norm computation - dispatches reduction kernels
+        // to GPU, syncs once, and reads only partial sums (much faster than CPU)
         let mut all_grads: Vec<&Tensor> = vec![&grad_embed, &grad_final_norm];
         for grads in &layer_grads {
             all_grads.push(&grads.grad_attn_norm);
@@ -243,7 +243,7 @@ impl Trainer {
             all_grads.push(&grads.grad_w_down);
         }
 
-        let total_grad_norm = compute_total_grad_norm(&all_grads);
+        let total_grad_norm = total_l2_norm_gpu(&all_grads);
         let clip_scale = if total_grad_norm > self.config.max_grad_norm {
             self.config.max_grad_norm / total_grad_norm
         } else {

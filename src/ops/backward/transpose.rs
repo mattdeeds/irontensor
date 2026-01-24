@@ -1,8 +1,10 @@
 use crate::ops::{transpose_2d, transpose_for_attention, transpose_from_attention};
+use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
 /// Backward for transpose_2d - transpose is its own inverse for 2D tensors
 pub fn transpose_2d_backward(grad_output: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::TransposeBackward, grad_output.numel());
     transpose_2d(grad_output)
 }
 
@@ -17,6 +19,7 @@ pub fn transpose_for_attention_backward(
     heads: usize,
     head_dim: usize,
 ) -> Tensor {
+    let _timer = timed(OpCategory::TransposeBackward, grad_output.numel());
     // The backward of transpose_for_attention is transpose_from_attention
     transpose_from_attention(grad_output, batch, seq, heads, head_dim)
 }
@@ -26,6 +29,7 @@ pub fn transpose_for_attention_backward(
 /// Forward: [batch, heads, seq, head_dim] -> [batch, seq, heads, head_dim]
 /// Backward: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
 pub fn transpose_from_attention_backward(grad_output: &Tensor) -> Tensor {
+    let _timer = timed(OpCategory::TransposeBackward, grad_output.numel());
     // The backward of transpose_from_attention is transpose_for_attention
     transpose_for_attention(grad_output)
 }

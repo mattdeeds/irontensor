@@ -53,6 +53,11 @@ pub enum OpCategory {
     GradientClip,
     GradientNorm,
     ZeroGradients,
+
+    // Diagnostic categories for throughput gap investigation
+    GradientNormCPU, // CPU-based gradient norm computation
+    SyncWait,        // CommandBatch::sync() GPU wait time
+    DataLoading,     // Batch preparation and data loading overhead
 }
 
 impl fmt::Display for OpCategory {
@@ -85,6 +90,10 @@ impl fmt::Display for OpCategory {
             OpCategory::GradientClip => write!(f, "GradientClip"),
             OpCategory::GradientNorm => write!(f, "GradientNorm"),
             OpCategory::ZeroGradients => write!(f, "ZeroGradients"),
+
+            OpCategory::GradientNormCPU => write!(f, "GradientNormCPU"),
+            OpCategory::SyncWait => write!(f, "SyncWait"),
+            OpCategory::DataLoading => write!(f, "DataLoading"),
         }
     }
 }
