@@ -97,7 +97,7 @@ pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
     let indices_buffer = unsafe {
         ctx.device().newBufferWithBytes_length_options(
             NonNull::new(indices.as_ptr() as *mut _).unwrap(),
-            indices.len() * std::mem::size_of::<u32>(),
+            std::mem::size_of_val(indices),
             MTLResourceOptions::StorageModeShared,
         )
     }

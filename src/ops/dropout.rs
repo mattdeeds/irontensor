@@ -74,7 +74,7 @@ pub fn dropout(input: &Tensor, dropout_rate: f32, training: bool) -> TensorResul
     }
 
     // Validate dropout rate
-    if dropout_rate < 0.0 || dropout_rate >= 1.0 {
+    if !(0.0..1.0).contains(&dropout_rate) {
         return Err(TensorError::InvalidValue {
             operation: "dropout",
             message: format!("dropout_rate must be in [0, 1), got {}", dropout_rate),

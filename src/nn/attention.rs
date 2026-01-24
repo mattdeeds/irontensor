@@ -43,7 +43,7 @@ impl MultiHeadAttention {
     /// - `rope_base`: RoPE base frequency (typically 10000.0)
     pub fn new(hidden_dim: usize, num_heads: usize, num_kv_heads: usize, rope_base: f32) -> Self {
         assert!(
-            num_heads % num_kv_heads == 0,
+            num_heads.is_multiple_of(num_kv_heads),
             "num_heads must be divisible by num_kv_heads"
         );
 

@@ -59,12 +59,14 @@ impl Trainer {
         let final_hidden = rmsnorm(&hidden, &final_norm_fp32, self.model.config.norm_eps).unwrap();
         let final_hidden_2d = final_hidden.view(&[n, hidden_dim]);
 
+        // Note: embedded and embed_dropout_seed are computed above but not cached,
+        // as they are not needed for backward pass
+        let _ = (embedded, embed_dropout_seed); // Silence unused variable warnings
+
         ForwardCache {
-            embedded,
             layers: layer_caches,
             pre_final_norm,
             final_hidden: final_hidden_2d,
-            embed_dropout_seed,
         }
     }
 
@@ -182,14 +184,13 @@ impl Trainer {
         // Residual connection
         let output = crate::ops::add(&post_attn, &ffn_out).unwrap();
 
+        // Note: q_proj, k_proj, v_proj, q_rope, k_rope are computed above but not cached,
+        // as they are not needed for backward pass (we recompute attention gradients)
+        let _ = (q_proj, k_proj, v_proj, q_rope, k_rope); // Silence unused variable warnings
+
         let cache = LayerCache {
             input,
             normed_attn,
-            q_proj,
-            k_proj,
-            v_proj,
-            q_rope,
-            k_rope,
             q_for_attn,
             k_for_attn,
             v_for_attn,

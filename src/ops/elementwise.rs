@@ -97,18 +97,6 @@ fn try_dispatch_binary_op(
     Ok(dispatch_binary_op_inner(pipeline, a, b))
 }
 
-fn dispatch_binary_op(
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    a: &Tensor,
-    b: &Tensor,
-) -> Tensor {
-    assert_eq!(a.precision(), Precision::FP32);
-    assert_eq!(b.precision(), Precision::FP32);
-    assert_eq!(a.shape(), b.shape(), "Tensors must have the same shape");
-
-    dispatch_binary_op_inner(pipeline, a, b)
-}
-
 fn dispatch_binary_op_inner(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     a: &Tensor,
@@ -168,15 +156,6 @@ fn try_dispatch_unary_op(
     Ok(dispatch_unary_op_inner(pipeline, input))
 }
 
-fn dispatch_unary_op(
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    input: &Tensor,
-) -> Tensor {
-    assert_eq!(input.precision(), Precision::FP32);
-
-    dispatch_unary_op_inner(pipeline, input)
-}
-
 fn dispatch_unary_op_inner(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     input: &Tensor,
@@ -232,16 +211,6 @@ fn try_dispatch_scalar_op(
     }
 
     Ok(dispatch_scalar_op_inner(pipeline, input, scalar))
-}
-
-fn dispatch_scalar_op(
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    input: &Tensor,
-    scalar: f32,
-) -> Tensor {
-    assert_eq!(input.precision(), Precision::FP32);
-
-    dispatch_scalar_op_inner(pipeline, input, scalar)
 }
 
 fn dispatch_scalar_op_inner(

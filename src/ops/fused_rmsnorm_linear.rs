@@ -149,7 +149,7 @@ pub fn fused_rmsnorm_linear(
 
     if use_tiled {
         // Tiled: each threadgroup handles one row and a tile of outputs
-        let num_out_tiles = (out_features + FUSED_THREADS - 1) / FUSED_THREADS;
+        let num_out_tiles = out_features.div_ceil(FUSED_THREADS);
 
         let threadgroup_count = MTLSize {
             width: num_out_tiles,

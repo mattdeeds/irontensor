@@ -4,7 +4,7 @@ use crate::ops::{
     softmax, softmax_backward, to_f32_gpu, transpose_3d_gpu,
 };
 use crate::precision::Precision;
-use crate::profile::{timed, OpCategory, Profiler};
+use crate::profile::Profiler;
 use crate::tensor::Tensor;
 
 /// Ensure tensor is FP32 for compute. If BF16, converts to FP32.
@@ -37,24 +37,6 @@ pub(crate) fn add3_tensors(a: &Tensor, b: &Tensor, c: &Tensor) -> Tensor {
 /// Useful for gradient clipping to avoid allocating new tensors
 pub(crate) fn scale_gradients_inplace(grads: &[&Tensor], scale: f32) {
     scale_tensors_inplace(grads, scale).unwrap()
-}
-
-/// Compute total L2 norm of multiple gradient tensors
-///
-/// Note: This uses CPU because on Apple Silicon's unified memory,
-/// reading from GPU buffers is fast and avoids the overhead of
-/// dispatching additional GPU reduction kernels.
-pub(crate) fn compute_total_grad_norm(grads: &[&Tensor]) -> f32 {
-    let total_elements: usize = grads.iter().map(|g| g.numel()).sum();
-    let _timer = timed(OpCategory::GradientNormCPU, total_elements);
-
-    let mut sum_sq = 0.0f32;
-    for g in grads {
-        for &val in g.as_f32_slice() {
-            sum_sq += val * val;
-        }
-    }
-    sum_sq.sqrt()
 }
 
 /// Linear forward: output = input @ weight.T
@@ -241,6 +223,7 @@ pub(crate) fn repeat_kv_backward(
 ///   - v: [batch, heads, seq, head_dim]
 ///
 /// Returns: (grad_Q, grad_K, grad_V) all with shape [batch, heads, seq, head_dim]
+#[cfg(test)]
 pub(crate) fn attention_backward_pipelined(
     grad_output: &Tensor,
     q: &Tensor,

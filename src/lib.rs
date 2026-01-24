@@ -1,3 +1,7 @@
+/// Golden ratio conjugate (φ - 1 = 1/φ ≈ 0.618), used for low-discrepancy sequences
+/// in weight initialization and shuffling algorithms.
+pub(crate) const PHI_FRAC: f32 = 0.618_034;
+
 pub mod command_batch;
 pub mod data;
 pub mod device;

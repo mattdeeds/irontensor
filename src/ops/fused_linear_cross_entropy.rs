@@ -154,7 +154,7 @@ pub fn fused_linear_cross_entropy(
     let targets_buffer = unsafe {
         ctx.device().newBufferWithBytes_length_options(
             NonNull::new(targets.as_ptr() as *mut _).unwrap(),
-            targets.len() * std::mem::size_of::<i32>(),
+            std::mem::size_of_val(targets),
             MTLResourceOptions::StorageModeShared,
         )
     }
@@ -314,7 +314,7 @@ pub fn fused_linear_cross_entropy_forward_only(
     let targets_buffer = unsafe {
         ctx.device().newBufferWithBytes_length_options(
             NonNull::new(targets.as_ptr() as *mut _).unwrap(),
-            targets.len() * std::mem::size_of::<i32>(),
+            std::mem::size_of_val(targets),
             MTLResourceOptions::StorageModeShared,
         )
     }

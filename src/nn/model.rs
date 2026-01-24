@@ -178,7 +178,7 @@ impl GPTModel {
         // Initialize embedding with small random values
         let embed_data: Vec<f32> = (0..config.vocab_size * config.hidden_dim)
             .map(|i| {
-                let x = ((i as f32 * 0.618033988749895) % 1.0) * 2.0 - 1.0;
+                let x = ((i as f32 * crate::PHI_FRAC) % 1.0) * 2.0 - 1.0;
                 x * 0.02 // Small initialization
             })
             .collect();
@@ -207,7 +207,7 @@ impl GPTModel {
         } else {
             let data: Vec<f32> = (0..config.vocab_size * config.hidden_dim)
                 .map(|i| {
-                    let x = ((i as f32 * 0.618033988749895) % 1.0) * 2.0 - 1.0;
+                    let x = ((i as f32 * crate::PHI_FRAC) % 1.0) * 2.0 - 1.0;
                     x * 0.02
                 })
                 .collect();
@@ -422,7 +422,7 @@ impl GPTModelState {
             layer_states: model
                 .layers
                 .iter()
-                .map(|l| TransformerBlockState::new(l))
+                .map(TransformerBlockState::new)
                 .collect(),
             final_norm_state: ParamState::new(model.final_norm.shape()),
             output_weight_state: model.output_weight.as_ref().map(|w| ParamState::new(w.shape())),

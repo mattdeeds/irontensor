@@ -37,7 +37,6 @@ const THREADGROUP_SIZE: usize = 256;
 
 struct ReductionPipelines {
     sum_squares: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    sum: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 static REDUCTION_PIPELINES: OnceLock<ReductionPipelines> = OnceLock::new();
@@ -62,7 +61,6 @@ fn get_pipelines() -> &'static ReductionPipelines {
 
         ReductionPipelines {
             sum_squares: make_pipeline("sum_squares_f32"),
-            sum: make_pipeline("sum_f32"),
         }
     })
 }
@@ -82,7 +80,7 @@ pub fn sum_squares_gpu(input: &Tensor) -> f32 {
     let pipelines = get_pipelines();
 
     // Calculate number of threadgroups needed
-    let num_threadgroups = (count + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    let num_threadgroups = count.div_ceil(THREADGROUP_SIZE);
     let num_threadgroups = num_threadgroups.max(1);
 
     // Create buffer for partial sums (one per threadgroup)
@@ -165,7 +163,7 @@ pub fn total_l2_norm_gpu(tensors: &[&Tensor]) -> f32 {
             continue;
         }
 
-        let num_threadgroups = (count + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+        let num_threadgroups = count.div_ceil(THREADGROUP_SIZE);
         let num_threadgroups = num_threadgroups.max(1);
 
         let partial_sums = Tensor::zeros(&[num_threadgroups], Precision::FP32);

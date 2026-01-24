@@ -326,7 +326,7 @@ impl Logger {
             state
                 .borrow()
                 .as_ref()
-                .map_or(false, |s| s.config.include_op_breakdown)
+                .is_some_and(|s| s.config.include_op_breakdown)
         })
     }
 }
@@ -362,7 +362,7 @@ fn chrono_lite_timestamp() -> String {
 
     // Very rough month/day approximation (30 days per month)
     let month = (day_of_year / 30).min(11) + 1;
-    let day = (day_of_year % 30).max(0) + 1;
+    let day = (day_of_year % 30) + 1;
 
     format!(
         "{:04}{:02}{:02}_{:02}{:02}{:02}",

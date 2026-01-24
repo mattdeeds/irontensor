@@ -78,7 +78,7 @@ pub fn repeat_kv_gpu(
 
     let repeats = num_heads / num_kv_heads;
     assert!(
-        num_heads % num_kv_heads == 0,
+        num_heads.is_multiple_of(num_kv_heads),
         "num_heads ({}) must be divisible by num_kv_heads ({})",
         num_heads,
         num_kv_heads
@@ -164,7 +164,7 @@ pub fn repeat_kv_backward_gpu(
 
     let repeats = num_heads / num_kv_heads;
     assert!(
-        num_heads % num_kv_heads == 0,
+        num_heads.is_multiple_of(num_kv_heads),
         "num_heads ({}) must be divisible by num_kv_heads ({})",
         num_heads,
         num_kv_heads

@@ -63,7 +63,7 @@ impl MatmulShapeStatInternal {
 }
 
 /// Profiler configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProfilerConfig {
     /// Whether profiling is enabled.
     pub enabled: bool,
@@ -71,16 +71,6 @@ pub struct ProfilerConfig {
     pub warmup_steps: usize,
     /// Interval for automatic report printing (0 = disabled).
     pub report_interval: usize,
-}
-
-impl Default for ProfilerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            warmup_steps: 0,
-            report_interval: 0,
-        }
-    }
 }
 
 /// Internal profiler state.
@@ -148,7 +138,7 @@ impl ProfilerState {
 
             // Auto-report if configured
             if self.config.report_interval > 0
-                && self.steps_recorded % self.config.report_interval == 0
+                && self.steps_recorded.is_multiple_of(self.config.report_interval)
             {
                 self.generate_report().print();
             }

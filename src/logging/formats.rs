@@ -182,6 +182,7 @@ pub struct InferenceRecord {
 
 impl TrainStepRecord {
     /// Create a new training step record with current timestamp.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         step: usize,
         epoch: usize,

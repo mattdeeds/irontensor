@@ -1,4 +1,4 @@
-/// Learning rate schedulers for training
+//! Learning rate schedulers for training
 
 /// Learning rate scheduler trait
 pub trait LRScheduler {

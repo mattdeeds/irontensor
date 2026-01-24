@@ -97,7 +97,7 @@ pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> TensorResult<Tensor>
     }
 
     let hidden_dim = shape[shape.len() - 1];
-    if gamma.shape() != &[hidden_dim] {
+    if gamma.shape() != [hidden_dim] {
         return Err(TensorError::ShapeMismatch {
             operation: "rmsnorm",
             expected: format!("[{}]", hidden_dim),

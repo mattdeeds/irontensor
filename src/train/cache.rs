@@ -6,16 +6,6 @@ pub(crate) struct LayerCache {
     pub input: Tensor,
     /// After attention norm [batch, seq, hidden]
     pub normed_attn: Tensor,
-    /// Q after projection [batch*seq, qkv_dim]
-    pub q_proj: Tensor,
-    /// K after projection [batch*seq, kv_dim]
-    pub k_proj: Tensor,
-    /// V after projection [batch*seq, kv_dim]
-    pub v_proj: Tensor,
-    /// Q after RoPE [batch, heads, seq, head_dim]
-    pub q_rope: Tensor,
-    /// K after RoPE [batch, kv_heads, seq, head_dim]
-    pub k_rope: Tensor,
     /// Q transposed for attention [batch, heads, seq, head_dim]
     pub q_for_attn: Tensor,
     /// K transposed for attention (expanded if GQA) [batch, heads, seq, head_dim]
@@ -42,16 +32,12 @@ pub(crate) struct LayerCache {
 
 /// Cached activations for the full forward pass
 pub(crate) struct ForwardCache {
-    /// Embedded tokens [batch*seq, hidden]
-    pub embedded: Tensor,
     /// Per-layer caches
     pub layers: Vec<LayerCache>,
     /// Hidden state before final norm [batch, seq, hidden] (output of last layer)
     pub pre_final_norm: Tensor,
     /// After final norm [batch*seq, hidden]
     pub final_hidden: Tensor,
-    /// Dropout seed for embedding output (0 if no dropout)
-    pub embed_dropout_seed: u64,
 }
 
 /// Gradients for a single transformer layer

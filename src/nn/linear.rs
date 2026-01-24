@@ -39,7 +39,7 @@ impl Linear {
         let weight_data: Vec<f32> = (0..out_features * in_features)
             .map(|i| {
                 // Simple deterministic pseudo-random based on index
-                let x = ((i as f32 * 0.618033988749895) % 1.0) * 2.0 - 1.0;
+                let x = ((i as f32 * crate::PHI_FRAC) % 1.0) * 2.0 - 1.0;
                 x * limit
             })
             .collect();

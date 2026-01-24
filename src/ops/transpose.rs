@@ -82,6 +82,8 @@ pub fn transpose_2d(input: &Tensor) -> Tensor {
 
 /// MPS-based 2D transpose using MPSMatrixCopy with transpose flags.
 /// 1.05-2.09x faster than custom shader, with larger speedups for bigger matrices.
+/// Kept as reference implementation per PERF_OPTIMIZATION.md.
+#[allow(dead_code)]
 fn transpose_2d_mps(input: &Tensor) -> Tensor {
     let _timer = timed(OpCategory::Transpose, input.numel());
     assert_eq!(input.precision(), Precision::FP32);
@@ -220,8 +222,8 @@ fn transpose_2d_custom(input: &Tensor) -> Tensor {
         const TILE_SIZE: usize = 16;
 
         // Dispatch in tiles
-        let grid_x = (cols + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE;
-        let grid_y = (rows + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE;
+        let grid_x = cols.div_ceil(TILE_SIZE) * TILE_SIZE;
+        let grid_y = rows.div_ceil(TILE_SIZE) * TILE_SIZE;
         let grid_size = MTLSize { width: grid_x, height: grid_y, depth: 1 };
         let threadgroup_size = MTLSize { width: TILE_SIZE, height: TILE_SIZE, depth: 1 };
 

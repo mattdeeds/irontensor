@@ -88,7 +88,7 @@ pub fn cross_entropy(logits: &Tensor, targets: &[u32]) -> (f32, Tensor) {
     let targets_buffer = unsafe {
         ctx.device().newBufferWithBytes_length_options(
             NonNull::new(targets.as_ptr() as *mut _).unwrap(),
-            targets.len() * std::mem::size_of::<u32>(),
+            std::mem::size_of_val(targets),
             MTLResourceOptions::StorageModeShared,
         )
     }
@@ -190,7 +190,7 @@ pub fn cross_entropy_backward(logits: &Tensor, targets: &[u32]) -> Tensor {
     let targets_buffer = unsafe {
         ctx.device().newBufferWithBytes_length_options(
             NonNull::new(targets.as_ptr() as *mut _).unwrap(),
-            targets.len() * std::mem::size_of::<u32>(),
+            std::mem::size_of_val(targets),
             MTLResourceOptions::StorageModeShared,
         )
     }
@@ -271,7 +271,7 @@ pub fn cross_entropy_fused(logits: &Tensor, targets: &[u32]) -> (f32, Tensor, Te
     let targets_buffer = unsafe {
         ctx.device().newBufferWithBytes_length_options(
             NonNull::new(targets.as_ptr() as *mut _).unwrap(),
-            targets.len() * std::mem::size_of::<u32>(),
+            std::mem::size_of_val(targets),
             MTLResourceOptions::StorageModeShared,
         )
     }

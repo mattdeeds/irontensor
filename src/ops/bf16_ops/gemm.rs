@@ -61,8 +61,8 @@ pub fn matmul_bf16(a: &Tensor, b: &Tensor) -> Tensor {
     }
 
     let grid_size = MTLSize {
-        width: (n + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE,
-        height: (m + TILE_SIZE - 1) / TILE_SIZE * TILE_SIZE,
+        width: n.div_ceil(TILE_SIZE) * TILE_SIZE,
+        height: m.div_ceil(TILE_SIZE) * TILE_SIZE,
         depth: 1,
     };
     let threadgroup_size = MTLSize {

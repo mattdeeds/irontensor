@@ -121,7 +121,7 @@ impl TokenDataset {
     pub fn get_batch(&self, seq_idx: usize) -> (Vec<u32>, Vec<u32>) {
         let start = seq_idx * self.seq_len;
         assert!(
-            start + self.seq_len + 1 <= self.num_tokens,
+            start + self.seq_len < self.num_tokens,
             "Sequence index out of bounds"
         );
 
@@ -169,7 +169,7 @@ impl<'a> DatasetIterator<'a> {
         if shuffle {
             // Simple shuffle using a deterministic pseudo-random permutation
             for i in (1..indices.len()).rev() {
-                let j = ((i as f32 * 0.618033988749895) as usize) % (i + 1);
+                let j = ((i as f32 * crate::PHI_FRAC) as usize) % (i + 1);
                 indices.swap(i, j);
             }
         }

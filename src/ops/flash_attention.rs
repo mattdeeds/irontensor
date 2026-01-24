@@ -162,7 +162,7 @@ pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tens
     } else {
         // Each threadgroup processes one query block
         let block_m = 32;
-        let num_q_blocks = (seq_len + block_m - 1) / block_m;
+        let num_q_blocks = seq_len.div_ceil(block_m);
 
         let threadgroup_count = MTLSize {
             width: num_q_blocks,

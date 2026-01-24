@@ -68,7 +68,7 @@ pub fn rope_backward(grad_output: &Tensor, base: f32, position_offset: usize) ->
     let num_heads = shape[2];
     let head_dim = shape[3];
 
-    assert!(head_dim % 2 == 0);
+    assert!(head_dim.is_multiple_of(2));
 
     let grad_input = Tensor::zeros(shape, Precision::FP32);
 

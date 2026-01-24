@@ -46,7 +46,7 @@ impl CheckpointConfig {
 
     /// Check if a given layer should be checkpointed
     pub fn should_checkpoint(&self, layer_idx: usize) -> bool {
-        self.enabled && (layer_idx % self.checkpoint_every == 0)
+        self.enabled && layer_idx.is_multiple_of(self.checkpoint_every)
     }
 }
 

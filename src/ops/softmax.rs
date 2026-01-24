@@ -95,6 +95,8 @@ pub fn softmax(input: &Tensor) -> TensorResult<Tensor> {
 
 /// MPS-based softmax using MPSMatrixSoftMax.
 /// 1.8-5.4x faster than custom shader across typical LLM dimensions.
+/// Kept as reference implementation per PERF_OPTIMIZATION.md.
+#[allow(dead_code)]
 fn softmax_mps(input: &Tensor) -> Tensor {
     let _timer = timed(OpCategory::Softmax, input.numel());
     assert_eq!(input.precision(), Precision::FP32);

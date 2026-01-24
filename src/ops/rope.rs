@@ -74,7 +74,7 @@ pub fn rope(input: &Tensor, base: f32, position_offset: usize) -> Tensor {
     let num_heads = shape[2];
     let head_dim = shape[3];
 
-    assert!(head_dim % 2 == 0, "head_dim must be even, got {}", head_dim);
+    assert!(head_dim.is_multiple_of(2), "head_dim must be even, got {}", head_dim);
 
     let output = Tensor::zeros(shape, Precision::FP32);
 

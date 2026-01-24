@@ -50,7 +50,7 @@ impl Trainer {
             next_batch = prefetch_batch;
 
             // Log at intervals
-            if self.step % self.config.log_interval == 0 {
+            if self.step.is_multiple_of(self.config.log_interval) {
                 let elapsed = step_start.elapsed().as_secs_f32();
                 let tokens_per_sec = (self.config.log_interval * batch_size * seq_len) as f32 / elapsed;
 
@@ -67,7 +67,7 @@ impl Trainer {
             }
 
             // Save checkpoint at intervals
-            if self.step % self.config.save_interval == 0 && self.step > 0 {
+            if self.step.is_multiple_of(self.config.save_interval) && self.step > 0 {
                 let path = format!("{}/step_{}.bin", self.config.checkpoint_dir, self.step);
 
                 // Create checkpoint directory if it doesn't exist

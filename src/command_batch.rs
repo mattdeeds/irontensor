@@ -43,6 +43,9 @@ use objc2_metal::{
 use crate::device::MetalContext;
 use crate::profile::OpCategory;
 
+/// Type alias for the complex MTLCommandBuffer completion handler block type.
+type CommandBufferHandler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>;
+
 thread_local! {
     static BATCH: RefCell<Option<BatchState>> = const { RefCell::new(None) };
     /// Tracks the last async command buffer for wait_for_completion
@@ -54,7 +57,7 @@ struct PendingBuffer {
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     completed: Arc<AtomicBool>,
     /// Keep the completion block alive until command buffer completes
-    _block: RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>,
+    _block: CommandBufferHandler,
 }
 
 impl PendingBuffer {

@@ -19,7 +19,6 @@ impl Precision {
 ///
 /// BF16 has the same exponent range as FP32 (8 bits) but only 7 mantissa bits.
 /// This makes conversion to/from FP32 trivial - just truncate/extend the lower 16 bits.
-
 /// Convert f32 to bf16 (represented as u16)
 #[inline]
 pub fn f32_to_bf16(x: f32) -> u16 {

@@ -48,7 +48,7 @@ impl FeedForward {
     /// Create FFN with default intermediate dimension (8/3 * hidden_dim, rounded)
     pub fn new_default(hidden_dim: usize) -> Self {
         // Llama uses 8/3 * hidden_dim, rounded to nearest multiple of 256
-        let intermediate = (hidden_dim * 8 / 3 + 255) / 256 * 256;
+        let intermediate = (hidden_dim * 8 / 3).div_ceil(256) * 256;
         Self::new(hidden_dim, intermediate)
     }
 

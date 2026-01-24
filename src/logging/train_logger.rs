@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use super::formats::{OpTimingRecord, TrainStepRecord};
 
 /// Create a TrainStepRecord with optional phase timing and operation breakdown.
+#[allow(clippy::too_many_arguments)]
 pub fn create_step_record(
     step: usize,
     epoch: usize,
