@@ -478,7 +478,8 @@ mod tests {
         let grad_h = grad_hidden.as_f32_slice();
         for d in 0..hidden_dim {
             assert_eq!(
-                grad_h[1 * hidden_dim + d], 0.0,
+                grad_h[hidden_dim + d],
+                0.0,
                 "Gradient for ignored position 1 should be zero"
             );
             assert_eq!(

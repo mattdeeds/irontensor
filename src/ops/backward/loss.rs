@@ -361,6 +361,7 @@ pub fn cross_entropy_fused(logits: &Tensor, targets: &[u32]) -> (f32, Tensor, Te
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 

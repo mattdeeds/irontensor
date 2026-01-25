@@ -439,16 +439,17 @@ mod tests {
             ffn_dropout: 0.0,
         };
 
-        let mut train_config = TrainingConfig::default();
-        train_config.dropout_enabled = false;  // Disable dropout
-        train_config.async_gpu = false;  // Use synchronous mode
+        let train_config = TrainingConfig {
+            dropout_enabled: false, // Disable dropout
+            async_gpu: false,       // Use synchronous mode
+            ..Default::default()
+        };
 
         let trainer = Trainer::new(&model_config, &train_config);
 
         let batch_size = 2;
         let seq_len = 8;
         let vocab_size = model_config.vocab_size;
-        let _hidden_dim = model_config.hidden_dim;
         let n = batch_size * seq_len;
 
         let input_ids: Vec<u32> = (0..n).map(|i| (i % 100) as u32).collect();
@@ -523,9 +524,11 @@ mod tests {
             ffn_dropout: 0.0,
         };
 
-        let mut train_config = TrainingConfig::default();
-        train_config.dropout_enabled = false;  // Disable dropout
-        train_config.async_gpu = false;  // Use synchronous mode
+        let train_config = TrainingConfig {
+            dropout_enabled: false, // Disable dropout
+            async_gpu: false,       // Use synchronous mode
+            ..Default::default()
+        };
 
         let trainer = Trainer::new(&model_config, &train_config);
 

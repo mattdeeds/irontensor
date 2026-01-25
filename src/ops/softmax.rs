@@ -371,7 +371,7 @@ mod tests {
         // Should not have NaN or Inf
         for (i, &val) in result.iter().enumerate() {
             assert!(val.is_finite(), "Result {} is not finite: {}", i, val);
-            assert!(val >= 0.0 && val <= 1.0, "Result {} out of range: {}", i, val);
+            assert!((0.0..=1.0).contains(&val), "Result {} out of range: {}", i, val);
         }
 
         // Verify sum is 1

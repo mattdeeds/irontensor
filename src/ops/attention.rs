@@ -540,6 +540,7 @@ fn softmax_4d(t: &Tensor) -> Tensor {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn reference_attention(
         q: &[f32],
         k: &[f32],

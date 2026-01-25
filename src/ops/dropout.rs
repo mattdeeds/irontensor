@@ -238,7 +238,7 @@ mod tests {
         // With p=0.5, expect roughly half zeros (with some variance)
         // Allow for statistical variance: 35% to 65%
         assert!(
-            num_zeros >= 350 && num_zeros <= 650,
+            (350..=650).contains(&num_zeros),
             "Expected ~50% zeros, got {}%",
             num_zeros * 100 / 1000
         );

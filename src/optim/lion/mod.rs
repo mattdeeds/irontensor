@@ -15,6 +15,7 @@ pub use gradients::{clip_grad_norm, grad_norm, zero_gradients};
 pub use optimizer::Lion;
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use crate::tensor::Tensor;

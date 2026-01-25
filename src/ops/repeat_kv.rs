@@ -423,7 +423,7 @@ mod tests {
         let input = Tensor::from_f32_slice(&input_data, &[batch, seq_len, num_kv_heads, head_dim]);
 
         // Forward
-        let expanded = repeat_kv_gpu(&input, batch, seq_len, num_heads, num_kv_heads, head_dim);
+        let _expanded = repeat_kv_gpu(&input, batch, seq_len, num_heads, num_kv_heads, head_dim);
         crate::command_batch::CommandBatch::sync();
 
         // Gradient of ones for output

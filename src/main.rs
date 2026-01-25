@@ -16,6 +16,8 @@ use tokenizers::{DecoderWrapper, PreTokenizerWrapper, Tokenizer};
 const TINY_SHAKESPEARE_URL: &str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
 fn main() {
+    let start_time = Instant::now();
+
     // Load environment variables from .env file (if it exists)
     dotenvy::dotenv().ok();
 
@@ -303,7 +305,8 @@ fn main() {
     // Shutdown logger (writes the complete log file)
     Logger::shutdown();
 
-    println!("\nDone!");
+    let total_duration = start_time.elapsed();
+    println!("\nDone! Total time: {:.2?}", total_duration);
 }
 
 /// Callback that prints to console and logs to file.
