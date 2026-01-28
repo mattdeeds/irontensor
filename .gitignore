@@ -4,3 +4,4 @@
 /checkpoints
 /old
 /logs
+*.DS_Store
