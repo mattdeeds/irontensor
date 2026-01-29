@@ -6,6 +6,7 @@ pub mod command_batch;
 pub mod data;
 pub mod device;
 pub mod error;
+pub mod gpu_trace;
 pub mod inference;
 pub mod logging;
 pub mod nn;
@@ -55,4 +56,5 @@ pub use logging::{
 };
 pub use command_batch::CommandBatch;
 pub use error::{TensorError, TensorResult};
+pub use gpu_trace::{GpuTrace, GpuTraceConfig, GpuTraceError, GpuTraceGuard};
 pub use inference::{GeneratorConfig, TextGenerator, sample_from_logits};

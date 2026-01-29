@@ -1,4 +1,5 @@
 use super::checkpoint_grad::CheckpointConfig;
+use crate::gpu_trace::GpuTraceConfig;
 
 /// Training configuration
 #[derive(Debug, Clone)]
@@ -50,6 +51,13 @@ pub struct TrainingConfig {
     /// When enabled, stores only layer inputs at checkpoint boundaries and recomputes
     /// activations during backward pass. Trades compute for ~90% activation memory reduction.
     pub checkpoint_config: CheckpointConfig,
+    /// GPU trace capture configuration.
+    /// When enabled via IRONTENSOR_GPU_TRACE=1, captures GPU traces for shader profiling.
+    /// Optional step to capture can be set via IRONTENSOR_GPU_TRACE_STEP=N.
+    pub gpu_trace_config: Option<GpuTraceConfig>,
+    /// Specific step to capture GPU trace for (if gpu_trace_config is Some).
+    /// When None and gpu_trace is enabled, captures every step (not recommended).
+    pub gpu_trace_step: Option<usize>,
 }
 
 impl Default for TrainingConfig {
@@ -73,7 +81,27 @@ impl Default for TrainingConfig {
             early_stopping_patience: None, // Disabled by default
             early_stopping_min_delta: 0.0, // Any improvement resets counter
             checkpoint_config: CheckpointConfig::default(), // Disabled by default
+            gpu_trace_config: if GpuTraceConfig::is_enabled_via_env() {
+                Some(GpuTraceConfig::from_env())
+            } else {
+                None
+            },
+            gpu_trace_step: GpuTraceConfig::capture_step_from_env(),
         }
+    }
+}
+
+impl TrainingConfig {
+    /// Create a config with GPU trace capture enabled for a specific step.
+    ///
+    /// This is useful for programmatic control over GPU trace capture.
+    pub fn with_gpu_trace(mut self, output_dir: &str, step: usize) -> Self {
+        self.gpu_trace_config = Some(GpuTraceConfig {
+            output_dir: output_dir.to_string(),
+            timestamp_files: true,
+        });
+        self.gpu_trace_step = Some(step);
+        self
     }
 }
 

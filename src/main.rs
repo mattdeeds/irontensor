@@ -123,6 +123,8 @@ fn main() {
         early_stopping_patience: None,
         early_stopping_min_delta: 0.0,
         checkpoint_config: irontensor::train::CheckpointConfig::default(),
+        // GPU trace config is read from environment in Default
+        ..Default::default()
     };
 
     // Initialize logger

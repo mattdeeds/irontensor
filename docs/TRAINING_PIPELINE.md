@@ -934,6 +934,101 @@ With checkpointing, each checkpointed layer stores only:
 
 Activation checkpointing produces **identical gradients** to standard training. This is verified by the test `test_activation_checkpointing` which compares loss, gradient norms, and final weights.
 
+### GPU Trace Capture
+
+GPU trace capture allows you to capture `.gputrace` files that can be opened in Xcode for detailed shader analysis. This reveals information that CPU-side timing cannot provide:
+
+- GPU kernel execution time (not the same as CPU wait time)
+- Shader register usage and occupancy
+- Memory bandwidth utilization
+- Pipeline stalls and synchronization overhead
+- GPU timeline visualization
+
+**Files:**
+- `src/gpu_trace.rs` - GPU trace capture API
+
+**Environment Variables:**
+
+```bash
+# Enable programmatic GPU capture (required by Metal)
+# Without this, GPU trace capture will silently fail
+export METAL_CAPTURE_ENABLED=1
+
+# Enable GPU trace capture
+IRONTENSOR_GPU_TRACE=1 cargo run --release
+
+# Specify output directory (default: current directory)
+IRONTENSOR_GPU_TRACE_DIR=./traces cargo run --release
+
+# Capture only a specific training step
+IRONTENSOR_GPU_TRACE_STEP=50 cargo run --release
+
+# Full example
+METAL_CAPTURE_ENABLED=1 IRONTENSOR_GPU_TRACE=1 IRONTENSOR_GPU_TRACE_DIR=./traces IRONTENSOR_GPU_TRACE_STEP=10 cargo run --release
+```
+
+**Programmatic API:**
+
+```rust
+use irontensor::{GpuTrace, GpuTraceGuard};
+
+// Check if GPU trace capture is supported
+if GpuTrace::is_supported() {
+    // Manual capture
+    GpuTrace::start("/tmp/my_trace.gputrace")?;
+    // ... GPU operations ...
+    GpuTrace::stop()?;
+
+    // Block capture (RAII style)
+    let result = GpuTrace::capture("/tmp/forward.gputrace", || {
+        trainer.compute_loss(&input_ids, &target_ids, batch_size, seq_len)
+    })?;
+
+    // Guard-based capture (auto-stops on drop)
+    let _guard = GpuTraceGuard::start("/tmp/train_step.gputrace")?;
+    trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
+    // Capture stops automatically when _guard is dropped
+}
+```
+
+**Training Integration:**
+
+GPU trace capture is automatically integrated with the training loop. Set environment variables before running:
+
+```bash
+# Capture step 100 of training
+IRONTENSOR_GPU_TRACE=1 IRONTENSOR_GPU_TRACE_STEP=100 cargo run --release
+```
+
+The trace will be saved to `{output_dir}/train_step_{step}.gputrace`.
+
+**Opening Traces in Xcode:**
+
+1. Double-click the `.gputrace` file to open in Xcode
+2. Or: File → Open → select the .gputrace file
+3. Navigate the GPU Timeline to see all command buffers
+4. Click on individual compute passes to see shader statistics
+
+**What to Look For:**
+
+| Metric | What It Tells You |
+|--------|-------------------|
+| Shader Execution Time | Actual GPU time per kernel |
+| Register Usage | Higher usage = fewer concurrent threads |
+| Occupancy | % of GPU threads that can run simultaneously |
+| Memory Bandwidth | How efficiently memory is accessed |
+| ALU Utilization | How much compute capacity is used |
+| Cache Hit Rate | Efficiency of memory access patterns |
+
+**Limitations:**
+
+- Requires `METAL_CAPTURE_ENABLED=1` environment variable for programmatic capture
+- Capture files can be large (1-5GB+ for a single training step)
+- Adds overhead during capture (first logged step after capture may show lower throughput)
+- Output file must not exist before capture starts
+- macOS only (requires Metal framework)
+- Only one capture can be active at a time
+
 ---
 
 ## Example Training Loop

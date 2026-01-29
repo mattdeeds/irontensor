@@ -43,7 +43,14 @@ impl Trainer {
             // This overlaps CPU data loading with GPU computation
             let prefetch_batch = iter.next();
 
-            let (loss, gn) = self.train_step(&input_ids, &target_ids, actual_batch, seq_len);
+            // Check if we should capture GPU trace for this step
+            let should_capture = self.should_capture_gpu_trace();
+
+            let (loss, gn) = if should_capture {
+                self.train_step_with_gpu_trace(&input_ids, &target_ids, actual_batch, seq_len)
+            } else {
+                self.train_step(&input_ids, &target_ids, actual_batch, seq_len)
+            };
             tokens_processed += actual_batch * seq_len;
 
             // Use prefetched batch for next iteration

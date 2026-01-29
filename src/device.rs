@@ -2,7 +2,10 @@ use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{
+    MTLCaptureDestination, MTLCaptureManager, MTLCommandQueue, MTLCreateSystemDefaultDevice,
+    MTLDevice,
+};
 
 pub struct MetalContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -39,6 +42,24 @@ impl MetalContext {
     /// On Apple Silicon with unified memory, this tracks all Metal buffer allocations.
     pub fn current_allocated_size(&self) -> usize {
         self.device.currentAllocatedSize()
+    }
+
+    /// Get the shared capture manager singleton.
+    ///
+    /// The capture manager allows programmatic control over GPU trace capture
+    /// for shader profiling in Xcode.
+    pub fn capture_manager(&self) -> Retained<MTLCaptureManager> {
+        // SAFETY: sharedCaptureManager returns a singleton that is always valid
+        unsafe { MTLCaptureManager::sharedCaptureManager() }
+    }
+
+    /// Check if GPU trace capture to file is supported on this system.
+    ///
+    /// Returns true if the system supports capturing to GPU trace documents
+    /// that can be opened in Xcode.
+    pub fn supports_gpu_trace(&self) -> bool {
+        self.capture_manager()
+            .supportsDestination(MTLCaptureDestination::GPUTraceDocument)
     }
 }
 
