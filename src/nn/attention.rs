@@ -291,6 +291,25 @@ impl MultiHeadAttentionState {
             wo_state: ParamState::new(layer.wo.weight.shape()),
         }
     }
+
+    /// Save the attention state to a writer.
+    pub fn save<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.wq_state.save(writer)?;
+        self.wk_state.save(writer)?;
+        self.wv_state.save(writer)?;
+        self.wo_state.save(writer)?;
+        Ok(())
+    }
+
+    /// Load the attention state from a reader.
+    pub fn load<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        Ok(Self {
+            wq_state: ParamState::load(reader)?,
+            wk_state: ParamState::load(reader)?,
+            wv_state: ParamState::load(reader)?,
+            wo_state: ParamState::load(reader)?,
+        })
+    }
 }
 
 #[cfg(test)]

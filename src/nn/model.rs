@@ -428,6 +428,69 @@ impl GPTModelState {
             output_weight_state: model.output_weight.as_ref().map(|w| ParamState::new(w.shape())),
         }
     }
+
+    /// Save the model optimizer state to a writer.
+    pub fn save<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Save embedding state
+        self.embed_state.save(writer)?;
+
+        // Save number of layers
+        let num_layers = self.layer_states.len() as u32;
+        writer.write_all(&num_layers.to_le_bytes())?;
+
+        // Save layer states
+        for layer_state in &self.layer_states {
+            layer_state.save(writer)?;
+        }
+
+        // Save final norm state
+        self.final_norm_state.save(writer)?;
+
+        // Save output weight state (if present)
+        let has_output_state = self.output_weight_state.is_some();
+        writer.write_all(&[if has_output_state { 1u8 } else { 0u8 }])?;
+        if let Some(ref state) = self.output_weight_state {
+            state.save(writer)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load the model optimizer state from a reader.
+    pub fn load<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        // Load embedding state
+        let embed_state = ParamState::load(reader)?;
+
+        // Load number of layers
+        let mut buf4 = [0u8; 4];
+        reader.read_exact(&mut buf4)?;
+        let num_layers = u32::from_le_bytes(buf4) as usize;
+
+        // Load layer states
+        let mut layer_states = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layer_states.push(TransformerBlockState::load(reader)?);
+        }
+
+        // Load final norm state
+        let final_norm_state = ParamState::load(reader)?;
+
+        // Load output weight state (if present)
+        let mut buf1 = [0u8; 1];
+        reader.read_exact(&mut buf1)?;
+        let output_weight_state = if buf1[0] == 1 {
+            Some(ParamState::load(reader)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            embed_state,
+            layer_states,
+            final_norm_state,
+            output_weight_state,
+        })
+    }
 }
 
 #[cfg(test)]

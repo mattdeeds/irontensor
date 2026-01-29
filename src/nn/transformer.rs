@@ -115,6 +115,25 @@ impl TransformerBlockState {
             ffn_norm_state: ParamState::new(block.ffn_norm.shape()),
         }
     }
+
+    /// Save the transformer block state to a writer.
+    pub fn save<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.attention_state.save(writer)?;
+        self.ffn_state.save(writer)?;
+        self.attn_norm_state.save(writer)?;
+        self.ffn_norm_state.save(writer)?;
+        Ok(())
+    }
+
+    /// Load the transformer block state from a reader.
+    pub fn load<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        Ok(Self {
+            attention_state: MultiHeadAttentionState::load(reader)?,
+            ffn_state: FeedForwardState::load(reader)?,
+            attn_norm_state: ParamState::load(reader)?,
+            ffn_norm_state: ParamState::load(reader)?,
+        })
+    }
 }
 
 #[cfg(test)]

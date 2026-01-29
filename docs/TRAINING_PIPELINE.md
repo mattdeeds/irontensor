@@ -456,18 +456,39 @@ optimizer.set_lr(lr);
 ### API
 
 ```rust
-// Save checkpoint
+// Save checkpoint (weights only)
 trainer.save_checkpoint("model.bin")?;
 
-// Resume training
-let trainer = Trainer::from_checkpoint("model.bin", &train_config)?;
+// Save checkpoint with optimizer state (for stable training resumption)
+trainer.save_checkpoint_with_optimizer("model_full.bin")?;
+
+// Resume training (automatically loads optimizer state if present)
+let trainer = Trainer::from_checkpoint("model_full.bin", &train_config)?;
 ```
+
+### Optimizer State Checkpointing
+
+Optimizer state (Lion momentum tensors) can be saved alongside model weights for stable training resumption:
+
+```rust
+// Without optimizer state - momentum resets to zero on resume
+trainer.save_checkpoint("weights_only.bin")?;
+
+// With optimizer state - training continues smoothly
+trainer.save_checkpoint_with_optimizer("full_checkpoint.bin")?;
+```
+
+**Why it matters:** When momentum is reset to zero, the optimizer needs several steps to "warm up" again, potentially causing:
+- Temporary training instability
+- Slightly different convergence path
+- Wasted compute re-learning momentum statistics
 
 ### Notes
 
 - BF16 weights automatically converted to FP32 on save for compatibility
-- Optimizer state is NOT saved (momentum tensors rebuilt on load)
+- Optimizer state (momentum tensors) can optionally be saved/loaded
 - Model config is embedded in checkpoint for validation
+- Checkpoints without optimizer state are smaller but may cause brief instability on resume
 
 ---
 

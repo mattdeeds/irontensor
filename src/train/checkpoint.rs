@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::nn::{GPTModel, ModelConfig};
+use crate::nn::{GPTModel, GPTModelState, ModelConfig};
 use crate::ops::to_f32_gpu;
 use crate::precision::Precision;
 use crate::tensor::Tensor;
@@ -10,8 +10,11 @@ use crate::tensor::Tensor;
 /// Magic number for checkpoint file format
 const CHECKPOINT_MAGIC: u32 = 0x49524F4E; // "IRON" in hex
 
-/// Checkpoint file version
-const CHECKPOINT_VERSION: u32 = 1;
+/// Checkpoint file version (v2 adds optimizer state support)
+const CHECKPOINT_VERSION: u32 = 2;
+
+/// Minimum supported version for loading
+const MIN_SUPPORTED_VERSION: u32 = 1;
 
 /// Training checkpoint containing model weights and optimizer state
 #[derive(Debug)]
@@ -26,6 +29,8 @@ pub struct Checkpoint {
     pub best_val_loss: f32,
     /// Learning rate at checkpoint
     pub learning_rate: f32,
+    /// Whether optimizer state was included in the checkpoint
+    pub has_optimizer_state: bool,
 }
 
 impl Checkpoint {
@@ -37,6 +42,7 @@ impl Checkpoint {
             epoch: 0,
             best_val_loss: f32::INFINITY,
             learning_rate: 0.0,
+            has_optimizer_state: false,
         }
     }
 }
@@ -92,11 +98,37 @@ fn load_tensor<R: Read>(reader: &mut R) -> std::io::Result<Tensor> {
     Ok(Tensor::from_f32_slice(&data, &shape))
 }
 
-/// Save model weights to a file
+/// Save model weights to a file (without optimizer state).
+///
+/// For training resumption with stable optimizer momentum, use
+/// `save_model_weights_with_optimizer` instead.
 pub fn save_model_weights<P: AsRef<Path>>(
     path: P,
     model: &GPTModel,
     checkpoint: &Checkpoint,
+) -> std::io::Result<()> {
+    save_model_weights_internal(path, model, checkpoint, None)
+}
+
+/// Save model weights and optimizer state to a file.
+///
+/// This preserves the optimizer momentum tensors, allowing training to resume
+/// without the "warmup" period that occurs when momentum is reset to zero.
+pub fn save_model_weights_with_optimizer<P: AsRef<Path>>(
+    path: P,
+    model: &GPTModel,
+    checkpoint: &Checkpoint,
+    model_state: &GPTModelState,
+) -> std::io::Result<()> {
+    save_model_weights_internal(path, model, checkpoint, Some(model_state))
+}
+
+/// Internal function to save model weights with optional optimizer state.
+fn save_model_weights_internal<P: AsRef<Path>>(
+    path: P,
+    model: &GPTModel,
+    checkpoint: &Checkpoint,
+    model_state: Option<&GPTModelState>,
 ) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -144,12 +176,41 @@ pub fn save_model_weights<P: AsRef<Path>>(
     let tie_weights = checkpoint.config.tie_weights;
     writer.write_all(&(if tie_weights { 1u8 } else { 0u8 }).to_le_bytes())?;
 
+    // V2: Write optimizer state flag and data
+    let has_optimizer_state = model_state.is_some();
+    writer.write_all(&[if has_optimizer_state { 1u8 } else { 0u8 }])?;
+
+    if let Some(state) = model_state {
+        state.save(&mut writer)?;
+    }
+
     writer.flush()?;
     Ok(())
 }
 
-/// Load model weights from a file
+/// Load model weights from a file (without optimizer state).
+///
+/// Returns (model, checkpoint). If the checkpoint contains optimizer state,
+/// use `load_model_weights_with_optimizer` to also retrieve it.
 pub fn load_model_weights<P: AsRef<Path>>(path: P) -> std::io::Result<(GPTModel, Checkpoint)> {
+    let (model, checkpoint, _) = load_model_weights_internal(path)?;
+    Ok((model, checkpoint))
+}
+
+/// Load model weights and optimizer state from a file.
+///
+/// Returns (model, checkpoint, optimizer_state). The optimizer state is `Some`
+/// if it was saved with the checkpoint, `None` otherwise.
+pub fn load_model_weights_with_optimizer<P: AsRef<Path>>(
+    path: P,
+) -> std::io::Result<(GPTModel, Checkpoint, Option<GPTModelState>)> {
+    load_model_weights_internal(path)
+}
+
+/// Internal function to load model weights with optional optimizer state.
+fn load_model_weights_internal<P: AsRef<Path>>(
+    path: P,
+) -> std::io::Result<(GPTModel, Checkpoint, Option<GPTModelState>)> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -168,10 +229,13 @@ pub fn load_model_weights<P: AsRef<Path>>(path: P) -> std::io::Result<(GPTModel,
 
     reader.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if version != CHECKPOINT_VERSION {
+    if !(MIN_SUPPORTED_VERSION..=CHECKPOINT_VERSION).contains(&version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Unsupported checkpoint version: {}", version),
+            format!(
+                "Unsupported checkpoint version: {} (supported: {}-{})",
+                version, MIN_SUPPORTED_VERSION, CHECKPOINT_VERSION
+            ),
         ));
     }
 
@@ -220,15 +284,34 @@ pub fn load_model_weights<P: AsRef<Path>>(path: P) -> std::io::Result<(GPTModel,
     let mut tie_flag = [0u8; 1];
     reader.read_exact(&mut tie_flag)?;
 
+    // V2: Read optimizer state if present
+    let (has_optimizer_state, model_state) = if version >= 2 {
+        let mut opt_flag = [0u8; 1];
+        match reader.read_exact(&mut opt_flag) {
+            Ok(()) => {
+                if opt_flag[0] == 1 {
+                    let state = GPTModelState::load(&mut reader)?;
+                    (true, Some(state))
+                } else {
+                    (false, None)
+                }
+            }
+            Err(_) => (false, None), // EOF - no optimizer state (backward compat)
+        }
+    } else {
+        (false, None) // V1 format has no optimizer state
+    };
+
     let checkpoint = Checkpoint {
         config,
         step,
         epoch,
         best_val_loss,
         learning_rate,
+        has_optimizer_state,
     };
 
-    Ok((model, checkpoint))
+    Ok((model, checkpoint, model_state))
 }
 
 fn write_model_config<W: Write>(writer: &mut W, config: &ModelConfig) -> std::io::Result<()> {
@@ -361,6 +444,7 @@ mod tests {
             epoch: 5,
             best_val_loss: 2.5,
             learning_rate: 1e-4,
+            has_optimizer_state: false,
         };
 
         let path = temp_dir().join("test_model.bin");
@@ -377,6 +461,69 @@ mod tests {
         assert_eq!(loaded_checkpoint.config.vocab_size, config.vocab_size);
         assert_eq!(loaded_checkpoint.config.hidden_dim, config.hidden_dim);
         assert_eq!(loaded_checkpoint.config.num_layers, config.num_layers);
+
+        // Verify some weights match
+        assert_eq!(
+            model.embed_tokens.as_f32_slice(),
+            loaded_model.embed_tokens.as_f32_slice()
+        );
+
+        // Cleanup
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_save_load_model_with_optimizer_state() {
+        let config = ModelConfig {
+            vocab_size: 100,
+            hidden_dim: 32,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_dim: 64,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 128,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.1,
+            ffn_dropout: 0.1,
+        };
+
+        let model = GPTModel::new(&config);
+        let model_state = GPTModelState::new(&model);
+
+        let checkpoint = Checkpoint {
+            config: config.clone(),
+            step: 100,
+            epoch: 5,
+            best_val_loss: 2.5,
+            learning_rate: 1e-4,
+            has_optimizer_state: true,
+        };
+
+        let path = temp_dir().join("test_model_with_optim.bin");
+        save_model_weights_with_optimizer(&path, &model, &checkpoint, &model_state).unwrap();
+
+        let (loaded_model, loaded_checkpoint, loaded_state) =
+            load_model_weights_with_optimizer(&path).unwrap();
+
+        // Verify checkpoint metadata
+        assert_eq!(loaded_checkpoint.step, 100);
+        assert_eq!(loaded_checkpoint.epoch, 5);
+        assert!(loaded_checkpoint.has_optimizer_state);
+
+        // Verify optimizer state was loaded
+        assert!(loaded_state.is_some());
+        let loaded_state = loaded_state.unwrap();
+
+        // Verify optimizer state shapes match
+        assert_eq!(
+            loaded_state.embed_state.momentum.shape(),
+            model_state.embed_state.momentum.shape()
+        );
+        assert_eq!(loaded_state.layer_states.len(), model_state.layer_states.len());
 
         // Verify some weights match
         assert_eq!(

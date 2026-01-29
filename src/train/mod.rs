@@ -11,7 +11,10 @@ mod trainer;
 mod training_loop;
 
 pub use callbacks::{PrintCallback, TrainCallback};
-pub use checkpoint::{load_model_weights, save_model_weights, Checkpoint};
+pub use checkpoint::{
+    load_model_weights, load_model_weights_with_optimizer, save_model_weights,
+    save_model_weights_with_optimizer, Checkpoint,
+};
 pub use checkpoint_grad::{CheckpointConfig, GradientCheckpoints, RecomputeSegment};
 pub use config::{TrainMetrics, TrainingConfig};
 pub use scheduler::{

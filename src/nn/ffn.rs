@@ -116,6 +116,23 @@ impl FeedForwardState {
             w_down_state: ParamState::new(layer.w_down.weight.shape()),
         }
     }
+
+    /// Save the FFN state to a writer.
+    pub fn save<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.w_gate_state.save(writer)?;
+        self.w_up_state.save(writer)?;
+        self.w_down_state.save(writer)?;
+        Ok(())
+    }
+
+    /// Load the FFN state from a reader.
+    pub fn load<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        Ok(Self {
+            w_gate_state: ParamState::load(reader)?,
+            w_up_state: ParamState::load(reader)?,
+            w_down_state: ParamState::load(reader)?,
+        })
+    }
 }
 
 #[cfg(test)]

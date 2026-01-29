@@ -75,12 +75,18 @@ impl Trainer {
     }
 
     /// Create trainer from a checkpoint.
+    ///
+    /// If the checkpoint contains optimizer state, it will be restored automatically.
+    /// Otherwise, fresh optimizer state (zeroed momentum) will be created.
     pub fn from_checkpoint<P: AsRef<Path>>(
         path: P,
         train_config: TrainingConfig,
     ) -> std::io::Result<Self> {
-        let (model, checkpoint) = super::checkpoint::load_model_weights(path)?;
-        let model_state = GPTModelState::new(&model);
+        let (model, checkpoint, opt_state) =
+            super::checkpoint::load_model_weights_with_optimizer(path)?;
+
+        // Use loaded optimizer state if available, otherwise create fresh state
+        let model_state = opt_state.unwrap_or_else(|| GPTModelState::new(&model));
 
         let optimizer = Lion::new(LionConfig {
             lr: train_config.learning_rate,
@@ -95,6 +101,18 @@ impl Trainer {
             train_config.total_steps,
         ));
 
+        if checkpoint.has_optimizer_state {
+            eprintln!(
+                "Loaded checkpoint with optimizer state (step {}, epoch {})",
+                checkpoint.step, checkpoint.epoch
+            );
+        } else {
+            eprintln!(
+                "Loaded checkpoint without optimizer state (step {}, epoch {}) - momentum will restart from zero",
+                checkpoint.step, checkpoint.epoch
+            );
+        }
+
         Ok(Self {
             config: train_config,
             model,
@@ -107,7 +125,10 @@ impl Trainer {
         })
     }
 
-    /// Save a checkpoint.
+    /// Save a checkpoint (without optimizer state).
+    ///
+    /// For training resumption with stable optimizer momentum, use
+    /// `save_checkpoint_with_optimizer` instead.
     pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let checkpoint = Checkpoint {
             config: self.model.config.clone(),
@@ -115,8 +136,30 @@ impl Trainer {
             epoch: self.epoch,
             best_val_loss: self.best_val_loss,
             learning_rate: self.scheduler.get_lr(self.step),
+            has_optimizer_state: false,
         };
         save_model_weights(path, &self.model, &checkpoint)
+    }
+
+    /// Save a checkpoint with optimizer state.
+    ///
+    /// This preserves the optimizer momentum tensors, allowing training to resume
+    /// without the "warmup" period that occurs when momentum is reset to zero.
+    pub fn save_checkpoint_with_optimizer<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        let checkpoint = Checkpoint {
+            config: self.model.config.clone(),
+            step: self.step,
+            epoch: self.epoch,
+            best_val_loss: self.best_val_loss,
+            learning_rate: self.scheduler.get_lr(self.step),
+            has_optimizer_state: true,
+        };
+        super::checkpoint::save_model_weights_with_optimizer(
+            path,
+            &self.model,
+            &checkpoint,
+            &self.model_state,
+        )
     }
 
     /// Compute loss for a batch (forward pass only, no gradients).
