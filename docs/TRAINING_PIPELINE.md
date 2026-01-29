@@ -48,6 +48,7 @@ let mut trainer = Trainer::new(&model_config, &train_config);
 - `use_bf16` - Enable BF16 training
 - `async_gpu` - Enable CPU/GPU overlap
 - `dropout_enabled` - Enable dropout layers
+- `accumulation_steps` - Number of micro-batches to accumulate (default: 1)
 
 **ModelConfig** (`src/nn/model.rs`):
 - `vocab_size`, `hidden_dim`, `num_layers`, `num_heads`
@@ -712,6 +713,32 @@ CommandBatch::wait_for_completion();    // Wait before reading
 │     return (loss, total_grad_norm)                          │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Gradient Accumulation
+
+When `accumulation_steps > 1`, the training step is modified to accumulate gradients over multiple micro-batches:
+
+```
+Micro-batch 1: forward → backward → scale(1/N) → accumulate → return (loss, 0.0)
+Micro-batch 2: forward → backward → scale(1/N) → accumulate → return (loss, 0.0)
+...
+Micro-batch N: forward → backward → scale(1/N) → accumulate → clip → optimize → zero accumulators → return (avg_loss, grad_norm)
+```
+
+**Configuration:**
+
+```rust
+let train_config = TrainingConfig {
+    accumulation_steps: 4,  // Effective batch = batch_size * 4
+    ..Default::default()
+};
+```
+
+**Return behavior:**
+- During accumulation (micro_step < N): `(micro_batch_loss, 0.0)`
+- On optimizer step (micro_step == N): `(average_loss, grad_norm)`
+
+**Use case:** Train with larger effective batch sizes when GPU memory is limited.
 
 ---
 

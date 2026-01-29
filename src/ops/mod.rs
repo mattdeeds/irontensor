@@ -29,7 +29,7 @@ pub use bf16_ops::{
     softmax_bf16, swiglu_bf16, to_bf16_gpu, to_f32_gpu,
 };
 pub use dropout::dropout;
-pub use elementwise::{add, add3, add_scalar, gelu, mul, relu, scale, scale_inplace, scale_tensors_inplace, silu, swiglu};
+pub use elementwise::{add, add3, add_scalar, axpy_inplace, gelu, mul, relu, scale, scale_inplace, scale_tensors_inplace, silu, swiglu, zero_tensor};
 pub use embedding::embedding;
 pub use flash_attention::flash_attention;
 pub use fused_linear_cross_entropy::{fused_linear_cross_entropy, fused_linear_cross_entropy_forward_only};

@@ -1,3 +1,4 @@
+use crate::precision::Precision;
 use crate::tensor::Tensor;
 
 /// Cached activations for a single transformer layer
@@ -53,4 +54,79 @@ pub(crate) struct LayerGradients {
     pub grad_w_gate: Tensor,
     pub grad_w_up: Tensor,
     pub grad_w_down: Tensor,
+}
+
+/// Accumulated gradients for a single transformer layer (used for gradient accumulation)
+pub(crate) struct AccumulatedLayerGradients {
+    pub grad_attn_norm: Tensor,
+    pub grad_ffn_norm: Tensor,
+    pub grad_wq: Tensor,
+    pub grad_wk: Tensor,
+    pub grad_wv: Tensor,
+    pub grad_wo: Tensor,
+    pub grad_w_gate: Tensor,
+    pub grad_w_up: Tensor,
+    pub grad_w_down: Tensor,
+}
+
+impl AccumulatedLayerGradients {
+    /// Create zero-initialized accumulated gradients matching model shapes
+    pub fn zeros(
+        hidden_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        intermediate_dim: usize,
+    ) -> Self {
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        Self {
+            grad_attn_norm: Tensor::zeros(&[hidden_dim], Precision::FP32),
+            grad_ffn_norm: Tensor::zeros(&[hidden_dim], Precision::FP32),
+            grad_wq: Tensor::zeros(&[q_dim, hidden_dim], Precision::FP32),
+            grad_wk: Tensor::zeros(&[kv_dim, hidden_dim], Precision::FP32),
+            grad_wv: Tensor::zeros(&[kv_dim, hidden_dim], Precision::FP32),
+            grad_wo: Tensor::zeros(&[hidden_dim, q_dim], Precision::FP32),
+            grad_w_gate: Tensor::zeros(&[intermediate_dim, hidden_dim], Precision::FP32),
+            grad_w_up: Tensor::zeros(&[intermediate_dim, hidden_dim], Precision::FP32),
+            grad_w_down: Tensor::zeros(&[hidden_dim, intermediate_dim], Precision::FP32),
+        }
+    }
+}
+
+/// Accumulated gradients for the full model (used for gradient accumulation)
+pub(crate) struct AccumulatedGradients {
+    pub grad_embed: Tensor,
+    pub grad_final_norm: Tensor,
+    pub layer_grads: Vec<AccumulatedLayerGradients>,
+}
+
+impl AccumulatedGradients {
+    /// Create zero-initialized accumulated gradients matching model shapes
+    pub fn zeros(
+        vocab_size: usize,
+        hidden_dim: usize,
+        num_layers: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        intermediate_dim: usize,
+    ) -> Self {
+        Self {
+            grad_embed: Tensor::zeros(&[vocab_size, hidden_dim], Precision::FP32),
+            grad_final_norm: Tensor::zeros(&[hidden_dim], Precision::FP32),
+            layer_grads: (0..num_layers)
+                .map(|_| {
+                    AccumulatedLayerGradients::zeros(
+                        hidden_dim,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        intermediate_dim,
+                    )
+                })
+                .collect(),
+        }
+    }
 }

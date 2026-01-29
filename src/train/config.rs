@@ -34,6 +34,10 @@ pub struct TrainingConfig {
     /// Enable dropout during training.
     /// When false, dropout is disabled (useful for evaluation/testing).
     pub dropout_enabled: bool,
+    /// Number of micro-batches to accumulate before optimizer step.
+    /// Effective batch size = batch_size * accumulation_steps.
+    /// Default is 1 (no accumulation).
+    pub accumulation_steps: usize,
 }
 
 impl Default for TrainingConfig {
@@ -53,6 +57,7 @@ impl Default for TrainingConfig {
             use_bf16: false,
             async_gpu: true, // Enabled by default for better performance
             dropout_enabled: true, // Enabled by default for training
+            accumulation_steps: 1, // No accumulation by default
         }
     }
 }

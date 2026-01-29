@@ -29,6 +29,8 @@ struct ElementwisePipelines {
     gelu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     relu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     swiglu: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    axpy_inplace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    zero: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 static ELEMENTWISE_PIPELINES: OnceLock<ElementwisePipelines> = OnceLock::new();
@@ -62,6 +64,8 @@ fn get_pipelines() -> &'static ElementwisePipelines {
             gelu: make_pipeline("gelu_f32"),
             relu: make_pipeline("relu_f32"),
             swiglu: make_pipeline("swiglu_f32"),
+            axpy_inplace: make_pipeline("axpy_inplace_f32"),
+            zero: make_pipeline("zero_f32"),
         }
     })
 }
@@ -554,6 +558,134 @@ pub fn scale_tensors_inplace(tensors: &[&Tensor], scalar: f32) -> TensorResult<(
             threadgroup_size,
         );
     }
+
+    Ok(())
+}
+
+/// In-place scaled addition (AXPY): A = A + scale * B
+///
+/// Efficient for gradient accumulation: acc = acc + (1/N) * grad
+/// where N is the number of gradient accumulation steps.
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensors are not FP32
+/// - `TensorError::ShapeMismatch` if tensor shapes don't match
+pub fn axpy_inplace(a: &Tensor, b: &Tensor, scale: f32) -> TensorResult<()> {
+    let _timer = timed(OpCategory::Elementwise("axpy".to_string()), a.numel());
+
+    if a.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "axpy_inplace",
+            expected: "FP32",
+            got: if a.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+    if b.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "axpy_inplace",
+            expected: "FP32",
+            got: if b.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+    if a.shape() != b.shape() {
+        return Err(TensorError::ShapeMismatch {
+            operation: "axpy_inplace",
+            expected: format!("{:?}", a.shape()),
+            got: format!("{:?}", b.shape()),
+        });
+    }
+
+    let count = a.numel();
+    let ctx = MetalContext::global();
+    let pipeline = &get_pipelines().axpy_inplace;
+
+    let scale_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&scale as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<f32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .expect("Failed to create scale buffer");
+
+    let count_u32: u32 = count as u32;
+    let count_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .expect("Failed to create count buffer");
+
+    let thread_width = pipeline.threadExecutionWidth();
+    let grid_size = MTLSize { width: count, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
+
+    let a_buf = a.buffer();
+    let b_buf = b.buffer();
+
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&scale_buffer), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
+        },
+        grid_size,
+        threadgroup_size,
+    );
+
+    Ok(())
+}
+
+/// Zero tensor in-place
+///
+/// Sets all elements to zero. Useful for resetting accumulated gradients.
+///
+/// # Errors
+/// - `TensorError::PrecisionMismatch` if tensor is not FP32
+pub fn zero_tensor(tensor: &Tensor) -> TensorResult<()> {
+    let _timer = timed(OpCategory::Elementwise("zero".to_string()), tensor.numel());
+
+    if tensor.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "zero_tensor",
+            expected: "FP32",
+            got: if tensor.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+        });
+    }
+
+    let count = tensor.numel();
+    let ctx = MetalContext::global();
+    let pipeline = &get_pipelines().zero;
+
+    let count_u32: u32 = count as u32;
+    let count_buffer = unsafe {
+        ctx.device().newBufferWithBytes_length_options(
+            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
+            std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .expect("Failed to create count buffer");
+
+    let thread_width = pipeline.threadExecutionWidth();
+    let grid_size = MTLSize { width: count, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
+
+    let tensor_buf = tensor.buffer();
+
+    CommandBatch::dispatch(
+        pipeline,
+        |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(tensor_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 1);
+        },
+        grid_size,
+        threadgroup_size,
+    );
 
     Ok(())
 }

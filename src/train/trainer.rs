@@ -15,7 +15,7 @@ use crate::optim::{Lion, LionConfig};
 use crate::profile::{Phase, Profiler};
 use crate::tensor::Tensor;
 
-use super::cache::ForwardCache;
+use super::cache::{AccumulatedGradients, ForwardCache};
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::TrainingConfig;
 use super::helpers::{
@@ -35,6 +35,12 @@ pub struct Trainer {
     pub step: usize,
     pub epoch: usize,
     pub best_val_loss: f32,
+    /// Micro-step counter for gradient accumulation (0 to accumulation_steps-1)
+    micro_step: usize,
+    /// Accumulated gradients (None if accumulation_steps == 1)
+    accumulated_grads: Option<AccumulatedGradients>,
+    /// Accumulated loss for averaging
+    accumulated_loss: f32,
 }
 
 impl Trainer {
@@ -62,6 +68,22 @@ impl Trainer {
             train_config.total_steps,
         ));
 
+        // Initialize accumulated gradients if using gradient accumulation
+        let accumulated_grads = if train_config.accumulation_steps > 1 {
+            let head_dim = model_config.hidden_dim / model_config.num_heads;
+            Some(AccumulatedGradients::zeros(
+                model_config.vocab_size,
+                model_config.hidden_dim,
+                model_config.num_layers,
+                model_config.num_heads,
+                model_config.num_kv_heads,
+                head_dim,
+                model_config.intermediate_dim,
+            ))
+        } else {
+            None
+        };
+
         Self {
             config: train_config.clone(),
             model,
@@ -71,6 +93,9 @@ impl Trainer {
             step: 0,
             epoch: 0,
             best_val_loss: f32::INFINITY,
+            micro_step: 0,
+            accumulated_grads,
+            accumulated_loss: 0.0,
         }
     }
 
@@ -113,6 +138,23 @@ impl Trainer {
             );
         }
 
+        // Initialize accumulated gradients if using gradient accumulation
+        let accumulated_grads = if train_config.accumulation_steps > 1 {
+            let model_config = &checkpoint.config;
+            let head_dim = model_config.hidden_dim / model_config.num_heads;
+            Some(AccumulatedGradients::zeros(
+                model_config.vocab_size,
+                model_config.hidden_dim,
+                model_config.num_layers,
+                model_config.num_heads,
+                model_config.num_kv_heads,
+                head_dim,
+                model_config.intermediate_dim,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             config: train_config,
             model,
@@ -122,6 +164,9 @@ impl Trainer {
             step: checkpoint.step,
             epoch: checkpoint.epoch,
             best_val_loss: checkpoint.best_val_loss,
+            micro_step: 0,
+            accumulated_grads,
+            accumulated_loss: 0.0,
         })
     }
 
@@ -181,7 +226,18 @@ impl Trainer {
 
     /// Training step with full backward pass through all layers.
     ///
-    /// Returns (loss, gradient_norm).
+    /// When `accumulation_steps > 1`, this method accumulates gradients over multiple
+    /// micro-batches before applying the optimizer. The effective batch size becomes
+    /// `batch_size * accumulation_steps`.
+    ///
+    /// Returns (loss, gradient_norm, optimizer_stepped):
+    /// - `loss`: The loss for this micro-batch
+    /// - `gradient_norm`: The gradient norm (only meaningful when optimizer stepped)
+    /// - For backwards compatibility, returns (loss, grad_norm) tuple
+    ///
+    /// When using gradient accumulation:
+    /// - Loss is the micro-batch loss (not averaged)
+    /// - Gradient norm is 0.0 except on the final micro-batch when optimizer steps
     pub fn train_step(
         &mut self,
         input_ids: &[u32],
@@ -189,6 +245,8 @@ impl Trainer {
         batch_size: usize,
         seq_len: usize,
     ) -> (f32, f32) {
+        use crate::ops::{axpy_inplace, zero_tensor};
+
         // Wait for any pending async work from previous step
         // This ensures optimizer updates are complete before we read weights
         if self.config.async_gpu {
@@ -200,11 +258,10 @@ impl Trainer {
 
         Profiler::begin_step();
 
-        let lr = self.scheduler.get_lr(self.step);
-        self.optimizer.set_lr(lr);
-
         let vocab_size = self.model.config.vocab_size;
         let n = batch_size * seq_len;
+        let hidden_dim = self.model.config.hidden_dim;
+        let accumulation_steps = self.config.accumulation_steps;
 
         // ========== Forward pass with activation caching ==========
         Profiler::set_phase(Phase::Forward);
@@ -232,7 +289,6 @@ impl Trainer {
         let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
         let grad_hidden_2d = matmul(&grad_logits, &embed_fp32).unwrap();
         // Reshape to 3D for norm backward
-        let hidden_dim = self.model.config.hidden_dim;
         let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
 
         // Backward through final norm (convert BF16 gamma to FP32 if needed)
@@ -270,9 +326,141 @@ impl Trainer {
             grad_embed_in
         };
 
-        // ========== Compute gradient norm and clip ==========
-        // Use GPU-based gradient norm computation - dispatches reduction kernels
-        // to GPU, syncs once, and reads only partial sums (much faster than CPU)
+        // ========== Gradient Accumulation ==========
+        if accumulation_steps > 1 {
+            // Scale factor for averaging gradients over accumulation steps
+            let scale = 1.0 / accumulation_steps as f32;
+
+            // Accumulate gradients into storage
+            if let Some(ref acc) = self.accumulated_grads {
+                axpy_inplace(&acc.grad_embed, &grad_embed, scale).unwrap();
+                axpy_inplace(&acc.grad_final_norm, &grad_final_norm, scale).unwrap();
+
+                for (layer_idx, grads) in layer_grads.iter().enumerate() {
+                    let acc_layer = &acc.layer_grads[layer_idx];
+                    axpy_inplace(&acc_layer.grad_attn_norm, &grads.grad_attn_norm, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_ffn_norm, &grads.grad_ffn_norm, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_wq, &grads.grad_wq, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_wk, &grads.grad_wk, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_wv, &grads.grad_wv, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_wo, &grads.grad_wo, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_w_gate, &grads.grad_w_gate, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_w_up, &grads.grad_w_up, scale).unwrap();
+                    axpy_inplace(&acc_layer.grad_w_down, &grads.grad_w_down, scale).unwrap();
+                }
+            }
+
+            // Accumulate loss for averaging
+            self.accumulated_loss += loss;
+            self.micro_step += 1;
+
+            // Check if we should apply optimizer
+            if self.micro_step < accumulation_steps {
+                // Not yet time to apply optimizer - just return the micro-batch loss
+                if self.config.async_gpu {
+                    CommandBatch::commit_async();
+                } else {
+                    CommandBatch::end();
+                }
+                Profiler::end_step();
+                return (loss, 0.0);
+            }
+
+            // Final micro-batch of accumulation cycle - apply optimizer with accumulated gradients
+            self.micro_step = 0;
+            let avg_loss = self.accumulated_loss / accumulation_steps as f32;
+            self.accumulated_loss = 0.0;
+
+            // Use accumulated gradients for clipping and optimizer
+            if let Some(ref acc) = self.accumulated_grads {
+                // Compute gradient norm and clip using accumulated gradients
+                let mut all_grads: Vec<&Tensor> = vec![&acc.grad_embed, &acc.grad_final_norm];
+                for acc_layer in &acc.layer_grads {
+                    all_grads.push(&acc_layer.grad_attn_norm);
+                    all_grads.push(&acc_layer.grad_ffn_norm);
+                    all_grads.push(&acc_layer.grad_wq);
+                    all_grads.push(&acc_layer.grad_wk);
+                    all_grads.push(&acc_layer.grad_wv);
+                    all_grads.push(&acc_layer.grad_wo);
+                    all_grads.push(&acc_layer.grad_w_gate);
+                    all_grads.push(&acc_layer.grad_w_up);
+                    all_grads.push(&acc_layer.grad_w_down);
+                }
+
+                let total_grad_norm = total_l2_norm_gpu(&all_grads);
+                let clip_scale = if total_grad_norm > self.config.max_grad_norm {
+                    self.config.max_grad_norm / total_grad_norm
+                } else {
+                    1.0
+                };
+
+                if clip_scale != 1.0 {
+                    scale_gradients_inplace(&all_grads, clip_scale);
+                }
+
+                // Apply optimizer with accumulated gradients
+                Profiler::set_phase(Phase::Optimizer);
+                let lr = self.scheduler.get_lr(self.step);
+                self.optimizer.set_lr(lr);
+                let use_bf16 = self.config.use_bf16;
+
+                macro_rules! opt_step {
+                    ($weights:expr, $grads:expr, $state:expr) => {
+                        if use_bf16 {
+                            self.optimizer.step_bf16($weights, $grads, $state);
+                        } else {
+                            self.optimizer.step($weights, $grads, $state);
+                        }
+                    };
+                }
+
+                opt_step!(&self.model.embed_tokens, &acc.grad_embed, &mut self.model_state.embed_state);
+                opt_step!(&self.model.final_norm, &acc.grad_final_norm, &mut self.model_state.final_norm_state);
+
+                for (layer_idx, acc_layer) in acc.layer_grads.iter().enumerate() {
+                    let layer = &self.model.layers[layer_idx];
+                    let state = &mut self.model_state.layer_states[layer_idx];
+
+                    opt_step!(&layer.attn_norm, &acc_layer.grad_attn_norm, &mut state.attn_norm_state);
+                    opt_step!(&layer.ffn_norm, &acc_layer.grad_ffn_norm, &mut state.ffn_norm_state);
+                    opt_step!(&layer.attention.wq.weight, &acc_layer.grad_wq, &mut state.attention_state.wq_state);
+                    opt_step!(&layer.attention.wk.weight, &acc_layer.grad_wk, &mut state.attention_state.wk_state);
+                    opt_step!(&layer.attention.wv.weight, &acc_layer.grad_wv, &mut state.attention_state.wv_state);
+                    opt_step!(&layer.attention.wo.weight, &acc_layer.grad_wo, &mut state.attention_state.wo_state);
+                    opt_step!(&layer.ffn.w_gate.weight, &acc_layer.grad_w_gate, &mut state.ffn_state.w_gate_state);
+                    opt_step!(&layer.ffn.w_up.weight, &acc_layer.grad_w_up, &mut state.ffn_state.w_up_state);
+                    opt_step!(&layer.ffn.w_down.weight, &acc_layer.grad_w_down, &mut state.ffn_state.w_down_state);
+                }
+
+                // Zero accumulated gradients for next cycle
+                zero_tensor(&acc.grad_embed).unwrap();
+                zero_tensor(&acc.grad_final_norm).unwrap();
+                for acc_layer in &acc.layer_grads {
+                    zero_tensor(&acc_layer.grad_attn_norm).unwrap();
+                    zero_tensor(&acc_layer.grad_ffn_norm).unwrap();
+                    zero_tensor(&acc_layer.grad_wq).unwrap();
+                    zero_tensor(&acc_layer.grad_wk).unwrap();
+                    zero_tensor(&acc_layer.grad_wv).unwrap();
+                    zero_tensor(&acc_layer.grad_wo).unwrap();
+                    zero_tensor(&acc_layer.grad_w_gate).unwrap();
+                    zero_tensor(&acc_layer.grad_w_up).unwrap();
+                    zero_tensor(&acc_layer.grad_w_down).unwrap();
+                }
+
+                self.step += 1;
+
+                if self.config.async_gpu {
+                    CommandBatch::commit_async();
+                } else {
+                    CommandBatch::end();
+                }
+                Profiler::end_step();
+                return (avg_loss, total_grad_norm);
+            }
+        }
+
+        // ========== No accumulation: original behavior ==========
+        // Compute gradient norm and clip
         let mut all_grads: Vec<&Tensor> = vec![&grad_embed, &grad_final_norm];
         for grads in &layer_grads {
             all_grads.push(&grads.grad_attn_norm);
@@ -293,17 +481,16 @@ impl Trainer {
             1.0
         };
 
-        // Scale all gradients in-place with a single batched operation
-        // This avoids allocating 56 new tensors and reduces kernel launch overhead
         if clip_scale != 1.0 {
             scale_gradients_inplace(&all_grads, clip_scale);
         }
 
         // ========== Apply optimizer to all parameters ==========
         Profiler::set_phase(Phase::Optimizer);
+        let lr = self.scheduler.get_lr(self.step);
+        self.optimizer.set_lr(lr);
         let use_bf16 = self.config.use_bf16;
 
-        // Helper macro to handle precision-aware optimizer step
         macro_rules! opt_step {
             ($weights:expr, $grads:expr, $state:expr) => {
                 if use_bf16 {
@@ -314,36 +501,19 @@ impl Trainer {
             };
         }
 
-        // Embedding (gradients are already scaled in-place)
-        opt_step!(
-            &self.model.embed_tokens,
-            &grad_embed,
-            &mut self.model_state.embed_state
-        );
+        opt_step!(&self.model.embed_tokens, &grad_embed, &mut self.model_state.embed_state);
+        opt_step!(&self.model.final_norm, &grad_final_norm, &mut self.model_state.final_norm_state);
 
-        // Final norm
-        opt_step!(
-            &self.model.final_norm,
-            &grad_final_norm,
-            &mut self.model_state.final_norm_state
-        );
-
-        // Transformer layers
         for (layer_idx, grads) in layer_grads.iter().enumerate() {
             let layer = &self.model.layers[layer_idx];
             let state = &mut self.model_state.layer_states[layer_idx];
 
-            // Attention norms
             opt_step!(&layer.attn_norm, &grads.grad_attn_norm, &mut state.attn_norm_state);
             opt_step!(&layer.ffn_norm, &grads.grad_ffn_norm, &mut state.ffn_norm_state);
-
-            // Attention weights
             opt_step!(&layer.attention.wq.weight, &grads.grad_wq, &mut state.attention_state.wq_state);
             opt_step!(&layer.attention.wk.weight, &grads.grad_wk, &mut state.attention_state.wk_state);
             opt_step!(&layer.attention.wv.weight, &grads.grad_wv, &mut state.attention_state.wv_state);
             opt_step!(&layer.attention.wo.weight, &grads.grad_wo, &mut state.attention_state.wo_state);
-
-            // FFN weights
             opt_step!(&layer.ffn.w_gate.weight, &grads.grad_w_gate, &mut state.ffn_state.w_gate_state);
             opt_step!(&layer.ffn.w_up.weight, &grads.grad_w_up, &mut state.ffn_state.w_up_state);
             opt_step!(&layer.ffn.w_down.weight, &grads.grad_w_down, &mut state.ffn_state.w_down_state);
@@ -351,13 +521,9 @@ impl Trainer {
 
         self.step += 1;
 
-        // End command batching
         if self.config.async_gpu {
-            // Async mode: commit without waiting, allowing CPU to prepare next batch
-            // The wait happens at the start of the next train_step
             CommandBatch::commit_async();
         } else {
-            // Sync mode: commit and wait for all optimizer steps
             CommandBatch::end();
         }
 
@@ -639,5 +805,64 @@ mod tests {
         assert!(geo_nonzero, "grad_embed_out should be non-zero");
 
         println!("\n=== All checks passed! ===");
+    }
+
+    #[test]
+    fn test_gradient_accumulation() {
+        // Test that gradient accumulation works correctly
+        let model_config = ModelConfig {
+            vocab_size: 100,
+            hidden_dim: 32,
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_dim: 64,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 128,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.0,
+            ffn_dropout: 0.0,
+        };
+
+        let train_config = TrainingConfig {
+            dropout_enabled: false,
+            async_gpu: false,
+            accumulation_steps: 2, // Accumulate 2 micro-batches
+            ..Default::default()
+        };
+
+        let mut trainer = Trainer::new(&model_config, &train_config);
+
+        let batch_size = 2;
+        let seq_len = 8;
+        let n = batch_size * seq_len;
+        let input_ids: Vec<u32> = (0..n).map(|i| (i % 100) as u32).collect();
+        let target_ids: Vec<u32> = (0..n).map(|i| ((i + 1) % 100) as u32).collect();
+
+        // First micro-batch: should NOT step optimizer
+        let (loss1, grad_norm1) = trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
+        assert!(loss1 > 0.0, "Loss should be positive");
+        assert_eq!(grad_norm1, 0.0, "Grad norm should be 0 on first micro-batch (no optimizer step)");
+        assert_eq!(trainer.step, 0, "Step should not increment on first micro-batch");
+
+        // Second micro-batch: should step optimizer
+        let (loss2, grad_norm2) = trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
+        assert!(loss2 > 0.0, "Loss should be positive");
+        assert!(grad_norm2 > 0.0, "Grad norm should be > 0 on optimizer step");
+        assert_eq!(trainer.step, 1, "Step should increment after accumulation cycle");
+
+        // Third micro-batch: again should NOT step optimizer
+        let (loss3, grad_norm3) = trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
+        assert!(loss3 > 0.0, "Loss should be positive");
+        assert_eq!(grad_norm3, 0.0, "Grad norm should be 0 on first micro-batch of new cycle");
+        assert_eq!(trainer.step, 1, "Step should not increment on first micro-batch");
+
+        println!("Gradient accumulation test passed!");
+        println!("  loss1={}, grad_norm1={}", loss1, grad_norm1);
+        println!("  loss2={}, grad_norm2={}", loss2, grad_norm2);
+        println!("  loss3={}, grad_norm3={}", loss3, grad_norm3);
     }
 }

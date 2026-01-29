@@ -139,3 +139,28 @@ kernel void scale_inplace_f32(
         A[gid] = A[gid] * scalar;
     }
 }
+
+// In-place scaled add (AXPY): A = A + scale * B
+// Efficient for gradient accumulation: acc = acc + (1/N) * grad
+kernel void axpy_inplace_f32(
+    device float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    constant float& scale [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        A[gid] = A[gid] + scale * B[gid];
+    }
+}
+
+// Zero tensor in-place
+kernel void zero_f32(
+    device float* A [[buffer(0)]],
+    constant uint& count [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        A[gid] = 0.0f;
+    }
+}

@@ -210,6 +210,7 @@ fn main() {
         use_bf16,
         async_gpu,
         dropout_enabled: true,
+        accumulation_steps: 1,  // No gradient accumulation
     };
 
     println!("\nTraining Configuration:");
