@@ -100,6 +100,71 @@ pub fn dropout(input: &Tensor, dropout_rate: f32, training: bool) -> TensorResul
 
     // Get unique seed for this dropout call
     let seed = next_dropout_seed();
+    dropout_with_seed_impl(input, &output, dropout_rate, scale, seed, count)
+}
+
+/// Apply dropout with a specific seed for deterministic replay.
+///
+/// This is used during activation checkpointing recomputation to ensure
+/// the same dropout mask is applied as in the original forward pass.
+///
+/// # Arguments
+/// * `input` - Input tensor
+/// * `dropout_rate` - Probability of dropping each element (0.0 to 1.0)
+/// * `seed` - The seed to use for mask generation (from original forward pass)
+///
+/// # Returns
+/// * Output tensor with the same dropout mask as the original forward pass
+///
+/// # Errors
+/// * `TensorError::PrecisionMismatch` if input is not FP32
+/// * `TensorError::InvalidValue` if dropout_rate is not in [0, 1]
+pub fn dropout_with_seed(input: &Tensor, dropout_rate: f32, seed: u64) -> TensorResult<Tensor> {
+    let _timer = timed(OpCategory::Dropout, input.numel());
+
+    // Zero seed means no dropout was applied
+    if seed == 0 || dropout_rate == 0.0 {
+        return Ok(input.clone());
+    }
+
+    // Validate dropout rate
+    if !(0.0..1.0).contains(&dropout_rate) {
+        return Err(TensorError::InvalidValue {
+            operation: "dropout_with_seed",
+            message: format!("dropout_rate must be in [0, 1), got {}", dropout_rate),
+        });
+    }
+
+    // Validate precision
+    if input.precision() != Precision::FP32 {
+        return Err(TensorError::PrecisionMismatch {
+            operation: "dropout_with_seed",
+            expected: "FP32",
+            got: if input.precision() == Precision::BF16 {
+                "BF16"
+            } else {
+                "unknown"
+            },
+        });
+    }
+
+    let count = input.numel();
+    let output = Tensor::zeros(input.shape(), Precision::FP32);
+    let scale = 1.0 / (1.0 - dropout_rate);
+
+    let (output, _) = dropout_with_seed_impl(input, &output, dropout_rate, scale, seed, count)?;
+    Ok(output)
+}
+
+/// Internal implementation of dropout with a specific seed.
+fn dropout_with_seed_impl(
+    input: &Tensor,
+    output: &Tensor,
+    dropout_rate: f32,
+    scale: f32,
+    seed: u64,
+    count: usize,
+) -> TensorResult<(Tensor, u64)> {
     let seed_lo = seed as u32;
     let seed_hi = (seed >> 32) as u32;
 
@@ -183,7 +248,7 @@ pub fn dropout(input: &Tensor, dropout_rate: f32, training: bool) -> TensorResul
         threadgroup_size,
     );
 
-    Ok((output, seed))
+    Ok((output.clone(), seed))
 }
 
 #[cfg(test)]

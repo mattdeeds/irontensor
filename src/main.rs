@@ -122,6 +122,7 @@ fn main() {
         accumulation_steps: 1,
         early_stopping_patience: None,
         early_stopping_min_delta: 0.0,
+        checkpoint_config: irontensor::train::CheckpointConfig::default(),
     };
 
     // Initialize logger

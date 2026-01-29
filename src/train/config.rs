@@ -1,3 +1,5 @@
+use super::checkpoint_grad::CheckpointConfig;
+
 /// Training configuration
 #[derive(Debug, Clone)]
 pub struct TrainingConfig {
@@ -44,6 +46,10 @@ pub struct TrainingConfig {
     /// Minimum improvement in validation loss required to reset patience counter.
     /// Default is 0.0 (any improvement resets counter).
     pub early_stopping_min_delta: f32,
+    /// Activation checkpointing configuration.
+    /// When enabled, stores only layer inputs at checkpoint boundaries and recomputes
+    /// activations during backward pass. Trades compute for ~90% activation memory reduction.
+    pub checkpoint_config: CheckpointConfig,
 }
 
 impl Default for TrainingConfig {
@@ -66,6 +72,7 @@ impl Default for TrainingConfig {
             accumulation_steps: 1, // No accumulation by default
             early_stopping_patience: None, // Disabled by default
             early_stopping_min_delta: 0.0, // Any improvement resets counter
+            checkpoint_config: CheckpointConfig::default(), // Disabled by default
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::optim::{Lion, LionConfig};
 use crate::profile::{Phase, Profiler};
 use crate::tensor::Tensor;
 
-use super::cache::{AccumulatedGradients, ForwardCache};
+use super::cache::{AccumulatedGradients, ForwardCache, LayerCacheVariant};
 use super::checkpoint::{save_model_weights, Checkpoint};
 use super::config::TrainingConfig;
 use super::helpers::{
@@ -269,54 +269,120 @@ impl Trainer {
 
         // ========== Forward pass with activation caching ==========
         Profiler::set_phase(Phase::Forward);
-        let cache = self.forward_with_cache(input_ids, batch_size, seq_len);
 
-        // Compute logits: final_hidden @ embed_tokens.T
-        let logits = self.compute_logits_from_hidden(&cache.final_hidden);
+        // Use checkpointing forward pass if enabled
+        let use_checkpointing = self.config.checkpoint_config.enabled;
+        let (loss, layer_grads, grad_embed_out, grad_final_norm, grad_hidden) = if use_checkpointing {
+            // Forward with checkpointing (stores only minimal data for some layers)
+            let cache = self.forward_with_checkpointing(input_ids, batch_size, seq_len);
 
-        // Sync before operations that need completed results
-        CommandBatch::sync();
-        let logits_2d = logits.view(&[n, vocab_size]);
+            // Compute logits: final_hidden @ embed_tokens.T
+            let logits = self.compute_logits_from_hidden(&cache.final_hidden);
 
-        // Compute loss and gradient w.r.t. logits (has internal syncs for loss read)
-        let (loss, _, grad_logits) = cross_entropy_fused(&logits_2d, target_ids);
+            // Sync before operations that need completed results
+            CommandBatch::sync();
+            let logits_2d = logits.view(&[n, vocab_size]);
 
-        // ========== Backward pass ==========
-        Profiler::set_phase(Phase::Backward);
+            // Compute loss and gradient w.r.t. logits (has internal syncs for loss read)
+            let (loss_val, _, grad_logits) = cross_entropy_fused(&logits_2d, target_ids);
 
-        // Gradient for embedding from output projection
-        // logits = final_hidden @ embed.T, so grad_embed_out = grad_logits.T @ final_hidden
-        let grad_embed_out = matmul_tn(&grad_logits, &cache.final_hidden);
+            // ========== Backward pass ==========
+            Profiler::set_phase(Phase::Backward);
 
-        // Gradient flowing back through output projection
-        // grad_final_hidden = grad_logits @ embed (convert BF16 weights to FP32 if needed)
-        let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
-        let grad_hidden_2d = matmul(&grad_logits, &embed_fp32).unwrap();
-        // Reshape to 3D for norm backward
-        let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
+            // Gradient for embedding from output projection
+            let grad_embed_out = matmul_tn(&grad_logits, &cache.final_hidden);
 
-        // Backward through final norm (convert BF16 gamma to FP32 if needed)
-        let final_norm_fp32 = ensure_fp32(&self.model.final_norm);
-        let (grad_pre_norm, grad_final_norm) = rmsnorm_backward(
-            &grad_hidden_3d,
-            &self.get_pre_final_norm_hidden(&cache, batch_size, seq_len),
-            &final_norm_fp32,
-            self.model.config.norm_eps,
-        );
-        let mut grad_hidden = grad_pre_norm;
+            // Gradient flowing back through output projection
+            let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
+            let grad_hidden_2d = matmul(&grad_logits, &embed_fp32).unwrap();
+            let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
 
-        // Backward through transformer layers (in reverse order)
-        let mut layer_grads = Vec::new();
-        for (layer_idx, layer_cache) in cache.layers.iter().enumerate().rev() {
-            Profiler::set_layer(Some(layer_idx));
-            let layer = &self.model.layers[layer_idx];
-            let grads =
-                self.backward_transformer_layer(&grad_hidden, layer_cache, layer, batch_size, seq_len);
-            grad_hidden = grads.grad_input.clone();
-            layer_grads.push(grads);
-        }
-        Profiler::set_layer(None);
-        layer_grads.reverse();
+            // Backward through final norm
+            let final_norm_fp32 = ensure_fp32(&self.model.final_norm);
+            let (grad_pre_norm, grad_final_norm) = rmsnorm_backward(
+                &grad_hidden_3d,
+                &cache.pre_final_norm,
+                &final_norm_fp32,
+                self.model.config.norm_eps,
+            );
+            let mut grad_hidden = grad_pre_norm;
+
+            // Backward through transformer layers (in reverse order)
+            // For checkpointed layers, recompute the full cache first
+            let mut layer_grads = Vec::new();
+            let num_layers = cache.layers.len();
+            for layer_idx in (0..num_layers).rev() {
+                Profiler::set_layer(Some(layer_idx));
+                let layer = &self.model.layers[layer_idx];
+
+                // Get or recompute full cache
+                let grads = match &cache.layers[layer_idx] {
+                    LayerCacheVariant::Full(c) => {
+                        self.backward_transformer_layer(&grad_hidden, c, layer, batch_size, seq_len)
+                    }
+                    LayerCacheVariant::Checkpointed(cp) => {
+                        // Recompute full cache then compute gradients
+                        let recomputed_cache = self.recompute_layer_forward(cp, layer, batch_size, seq_len);
+                        self.backward_transformer_layer(&grad_hidden, &recomputed_cache, layer, batch_size, seq_len)
+                    }
+                };
+
+                grad_hidden = grads.grad_input.clone();
+                layer_grads.push(grads);
+            }
+            Profiler::set_layer(None);
+            layer_grads.reverse();
+
+            (loss_val, layer_grads, grad_embed_out, grad_final_norm, grad_hidden)
+        } else {
+            // Standard forward pass (stores all activations)
+            let cache = self.forward_with_cache(input_ids, batch_size, seq_len);
+
+            // Compute logits: final_hidden @ embed_tokens.T
+            let logits = self.compute_logits_from_hidden(&cache.final_hidden);
+
+            // Sync before operations that need completed results
+            CommandBatch::sync();
+            let logits_2d = logits.view(&[n, vocab_size]);
+
+            // Compute loss and gradient w.r.t. logits (has internal syncs for loss read)
+            let (loss_val, _, grad_logits) = cross_entropy_fused(&logits_2d, target_ids);
+
+            // ========== Backward pass ==========
+            Profiler::set_phase(Phase::Backward);
+
+            // Gradient for embedding from output projection
+            let grad_embed_out = matmul_tn(&grad_logits, &cache.final_hidden);
+
+            // Gradient flowing back through output projection
+            let embed_fp32 = ensure_fp32(&self.model.embed_tokens);
+            let grad_hidden_2d = matmul(&grad_logits, &embed_fp32).unwrap();
+            let grad_hidden_3d = grad_hidden_2d.view(&[batch_size, seq_len, hidden_dim]);
+
+            // Backward through final norm
+            let final_norm_fp32 = ensure_fp32(&self.model.final_norm);
+            let (grad_pre_norm, grad_final_norm) = rmsnorm_backward(
+                &grad_hidden_3d,
+                &self.get_pre_final_norm_hidden(&cache, batch_size, seq_len),
+                &final_norm_fp32,
+                self.model.config.norm_eps,
+            );
+            let mut grad_hidden = grad_pre_norm;
+
+            // Backward through transformer layers (in reverse order)
+            let mut layer_grads = Vec::new();
+            for (layer_idx, layer_cache) in cache.layers.iter().enumerate().rev() {
+                Profiler::set_layer(Some(layer_idx));
+                let layer = &self.model.layers[layer_idx];
+                let grads = self.backward_transformer_layer(&grad_hidden, layer_cache, layer, batch_size, seq_len);
+                grad_hidden = grads.grad_input.clone();
+                layer_grads.push(grads);
+            }
+            Profiler::set_layer(None);
+            layer_grads.reverse();
+
+            (loss_val, layer_grads, grad_embed_out, grad_final_norm, grad_hidden)
+        };
 
         // Backward through embedding lookup
         // Reshape grad_hidden to 2D for embedding_backward
@@ -868,5 +934,281 @@ mod tests {
         println!("  loss1={}, grad_norm1={}", loss1, grad_norm1);
         println!("  loss2={}, grad_norm2={}", loss2, grad_norm2);
         println!("  loss3={}, grad_norm3={}", loss3, grad_norm3);
+    }
+
+    #[test]
+    fn test_activation_checkpointing() {
+        use crate::train::CheckpointConfig;
+
+        // Test that training with activation checkpointing produces similar results
+        // to training without checkpointing (gradient values should be identical)
+        let model_config = ModelConfig {
+            vocab_size: 100,
+            hidden_dim: 32,
+            num_layers: 2, // Need multiple layers to test checkpointing
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_dim: 64,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 128,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.0, // Disable dropout for deterministic comparison
+            ffn_dropout: 0.0,
+        };
+
+        // Train without checkpointing
+        let train_config_no_ckpt = TrainingConfig {
+            dropout_enabled: false,
+            async_gpu: false,
+            checkpoint_config: CheckpointConfig::default(), // Disabled
+            ..Default::default()
+        };
+
+        let mut trainer_no_ckpt = Trainer::new(&model_config, &train_config_no_ckpt);
+
+        let batch_size = 2;
+        let seq_len = 8;
+        let n = batch_size * seq_len;
+        let input_ids: Vec<u32> = (0..n).map(|i| (i % 100) as u32).collect();
+        let target_ids: Vec<u32> = (0..n).map(|i| ((i + 1) % 100) as u32).collect();
+
+        // Get initial weights for comparison
+        let initial_embed = trainer_no_ckpt.model.embed_tokens.as_f32_slice().to_vec();
+
+        let (loss_no_ckpt, grad_norm_no_ckpt) =
+            trainer_no_ckpt.train_step(&input_ids, &target_ids, batch_size, seq_len);
+
+        // Get weights after training without checkpointing
+        let weights_no_ckpt = trainer_no_ckpt.model.embed_tokens.as_f32_slice().to_vec();
+
+        // Train with checkpointing (checkpoint every layer)
+        let train_config_with_ckpt = TrainingConfig {
+            dropout_enabled: false,
+            async_gpu: false,
+            checkpoint_config: CheckpointConfig::enabled(), // All layers checkpointed
+            ..Default::default()
+        };
+
+        let mut trainer_with_ckpt = Trainer::new(&model_config, &train_config_with_ckpt);
+
+        // Verify initial weights match
+        let initial_embed_ckpt = trainer_with_ckpt.model.embed_tokens.as_f32_slice().to_vec();
+        assert_eq!(
+            initial_embed, initial_embed_ckpt,
+            "Initial weights should match"
+        );
+
+        let (loss_with_ckpt, grad_norm_with_ckpt) =
+            trainer_with_ckpt.train_step(&input_ids, &target_ids, batch_size, seq_len);
+
+        // Get weights after training with checkpointing
+        let weights_with_ckpt = trainer_with_ckpt.model.embed_tokens.as_f32_slice().to_vec();
+
+        // Compare losses
+        let loss_diff = (loss_no_ckpt - loss_with_ckpt).abs();
+        println!("Loss without checkpointing: {}", loss_no_ckpt);
+        println!("Loss with checkpointing: {}", loss_with_ckpt);
+        println!("Loss difference: {}", loss_diff);
+        assert!(
+            loss_diff < 1e-4,
+            "Losses should be very close, got diff {}",
+            loss_diff
+        );
+
+        // Compare gradient norms
+        let grad_norm_diff = (grad_norm_no_ckpt - grad_norm_with_ckpt).abs();
+        println!("Grad norm without checkpointing: {}", grad_norm_no_ckpt);
+        println!("Grad norm with checkpointing: {}", grad_norm_with_ckpt);
+        println!("Grad norm difference: {}", grad_norm_diff);
+        assert!(
+            grad_norm_diff < 1e-4,
+            "Gradient norms should be very close, got diff {}",
+            grad_norm_diff
+        );
+
+        // Compare final weights (should be identical since gradients are the same)
+        let mut max_weight_diff: f32 = 0.0;
+        for (w1, w2) in weights_no_ckpt.iter().zip(weights_with_ckpt.iter()) {
+            let diff = (w1 - w2).abs();
+            if diff > max_weight_diff {
+                max_weight_diff = diff;
+            }
+        }
+        println!("Max weight difference: {}", max_weight_diff);
+        assert!(
+            max_weight_diff < 1e-4,
+            "Weights should be very close, got max diff {}",
+            max_weight_diff
+        );
+
+        println!("Activation checkpointing test passed!");
+    }
+
+    #[test]
+    fn test_activation_checkpointing_interval() {
+        use crate::train::CheckpointConfig;
+
+        // Test checkpointing with interval > 1 (only some layers checkpointed)
+        let model_config = ModelConfig {
+            vocab_size: 100,
+            hidden_dim: 32,
+            num_layers: 4, // Need at least 4 layers to test interval=2
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_dim: 64,
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 128,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.0,
+            ffn_dropout: 0.0,
+        };
+
+        // Train with checkpointing every 2nd layer (layers 0 and 2 checkpointed)
+        let train_config = TrainingConfig {
+            dropout_enabled: false,
+            async_gpu: false,
+            checkpoint_config: CheckpointConfig::with_interval(2),
+            ..Default::default()
+        };
+
+        let mut trainer = Trainer::new(&model_config, &train_config);
+
+        let batch_size = 2;
+        let seq_len = 8;
+        let n = batch_size * seq_len;
+        let input_ids: Vec<u32> = (0..n).map(|i| (i % 100) as u32).collect();
+        let target_ids: Vec<u32> = (0..n).map(|i| ((i + 1) % 100) as u32).collect();
+
+        // Should complete without errors
+        let (loss, grad_norm) = trainer.train_step(&input_ids, &target_ids, batch_size, seq_len);
+
+        assert!(loss > 0.0, "Loss should be positive");
+        assert!(grad_norm > 0.0, "Grad norm should be positive");
+        assert_eq!(trainer.step, 1, "Step should increment");
+
+        println!("Activation checkpointing with interval=2 passed!");
+        println!("  loss={}, grad_norm={}", loss, grad_norm);
+    }
+
+    /// Benchmark memory usage with vs without activation checkpointing.
+    ///
+    /// Run with: cargo test benchmark_checkpointing_memory --release -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn benchmark_checkpointing_memory() {
+        use crate::device::{format_bytes, gpu_memory_allocated};
+        use crate::train::CheckpointConfig;
+
+        // Use a larger model to see meaningful memory differences
+        let model_config = ModelConfig {
+            vocab_size: 2048,
+            hidden_dim: 512,
+            num_layers: 8,
+            num_heads: 8,
+            num_kv_heads: 8,
+            intermediate_dim: 512 * 4, // 2048
+            norm_eps: 1e-5,
+            rope_base: 10000.0,
+            max_seq_len: 512,
+            tie_weights: true,
+            precision: Precision::FP32,
+            embed_dropout: 0.0,
+            attn_dropout: 0.0,
+            ffn_dropout: 0.0,
+        };
+
+        let batch_size = 16;
+        let seq_len = 256;
+        let n = batch_size * seq_len;
+
+        println!("\n{}", "=".repeat(70));
+        println!("Activation Checkpointing Memory Benchmark");
+        println!("{}", "=".repeat(70));
+        println!("\nModel: hidden={}, layers={}, heads={}",
+                 model_config.hidden_dim, model_config.num_layers, model_config.num_heads);
+        println!("Batch: batch_size={}, seq_len={}, tokens={}", batch_size, seq_len, n);
+
+        // Prepare input data
+        let input_ids: Vec<u32> = (0..n).map(|i| (i % model_config.vocab_size) as u32).collect();
+
+        // ===== Test 1: Without checkpointing =====
+        println!("\n--- Without Checkpointing ---");
+
+        let train_config_no_ckpt = TrainingConfig {
+            dropout_enabled: false,
+            async_gpu: false,
+            checkpoint_config: CheckpointConfig::default(), // Disabled
+            ..Default::default()
+        };
+
+        // Force GC-like behavior by dropping any previous allocations
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mem_before_no_ckpt = gpu_memory_allocated();
+        let trainer_no_ckpt = Trainer::new(&model_config, &train_config_no_ckpt);
+        let mem_after_model = gpu_memory_allocated();
+
+        println!("  Model memory: {}", format_bytes(mem_after_model - mem_before_no_ckpt));
+
+        // Do forward pass to capture activation memory
+        let cache = trainer_no_ckpt.forward_with_cache(&input_ids, batch_size, seq_len);
+        let mem_after_forward_no_ckpt = gpu_memory_allocated();
+        let activation_mem_no_ckpt = mem_after_forward_no_ckpt - mem_after_model;
+
+        println!("  Activation memory (forward cache): {}", format_bytes(activation_mem_no_ckpt));
+
+        // Clean up
+        drop(cache);
+        drop(trainer_no_ckpt);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // ===== Test 2: With checkpointing (all layers) =====
+        println!("\n--- With Checkpointing (all layers) ---");
+
+        let train_config_with_ckpt = TrainingConfig {
+            dropout_enabled: false,
+            async_gpu: false,
+            checkpoint_config: CheckpointConfig::enabled(), // All layers
+            ..Default::default()
+        };
+
+        let mem_before_ckpt = gpu_memory_allocated();
+        let trainer_with_ckpt = Trainer::new(&model_config, &train_config_with_ckpt);
+        let mem_after_model_ckpt = gpu_memory_allocated();
+
+        println!("  Model memory: {}", format_bytes(mem_after_model_ckpt - mem_before_ckpt));
+
+        // Do forward pass with checkpointing
+        let cache_ckpt = trainer_with_ckpt.forward_with_checkpointing(&input_ids, batch_size, seq_len);
+        let mem_after_forward_ckpt = gpu_memory_allocated();
+        let activation_mem_ckpt = mem_after_forward_ckpt - mem_after_model_ckpt;
+
+        println!("  Activation memory (checkpointed): {}", format_bytes(activation_mem_ckpt));
+
+        // Clean up
+        drop(cache_ckpt);
+        drop(trainer_with_ckpt);
+
+        // ===== Summary =====
+        println!("\n--- Summary ---");
+        println!("  Without checkpointing: {}", format_bytes(activation_mem_no_ckpt));
+        println!("  With checkpointing:    {}", format_bytes(activation_mem_ckpt));
+
+        if activation_mem_no_ckpt > activation_mem_ckpt {
+            let savings = activation_mem_no_ckpt - activation_mem_ckpt;
+            let ratio = activation_mem_no_ckpt as f64 / activation_mem_ckpt.max(1) as f64;
+            println!("  Memory saved:          {} ({:.1}x reduction)",
+                     format_bytes(savings), ratio);
+        } else {
+            println!("  Note: Checkpointed memory >= non-checkpointed (may be due to measurement timing)");
+        }
+
+        println!("{}", "=".repeat(70));
     }
 }

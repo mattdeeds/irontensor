@@ -18,7 +18,7 @@ pub mod tensor;
 pub mod train;
 
 pub use data::{DatasetIterator, TokenDataset};
-pub use device::MetalContext;
+pub use device::{MetalContext, gpu_memory_allocated, format_bytes};
 pub use nn::{
     FeedForward, FeedForwardState, GPTModel, GPTModelState, Linear, LinearState, ModelConfig,
     MultiHeadAttention, MultiHeadAttentionState, TransformerBlock, TransformerBlockState,

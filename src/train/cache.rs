@@ -31,10 +31,48 @@ pub(crate) struct LayerCache {
     pub ffn_dropout_seed: u64,
 }
 
+/// Minimal data for checkpointed layers (activation checkpointing).
+///
+/// Instead of storing all intermediate activations (~112 MB per layer),
+/// we store only the layer input and dropout seeds (~8 MB per layer).
+/// During backward pass, activations are recomputed from this checkpoint.
+pub(crate) struct CheckpointedLayerData {
+    /// Layer input [batch, seq, hidden] - used to recompute all activations
+    pub input: Tensor,
+    /// Dropout seed for attention output (for deterministic replay)
+    pub attn_dropout_seed: u64,
+    /// Dropout seed for FFN output (for deterministic replay)
+    pub ffn_dropout_seed: u64,
+}
+
+/// Either full cache or checkpoint for a layer.
+///
+/// Used during forward pass with activation checkpointing enabled.
+/// Checkpointed layers store only minimal data and recompute activations during backward.
+pub(crate) enum LayerCacheVariant {
+    /// Full cache with all intermediate activations
+    Full(LayerCache),
+    /// Minimal checkpoint data for recomputation
+    Checkpointed(CheckpointedLayerData),
+}
+
+
 /// Cached activations for the full forward pass
 pub(crate) struct ForwardCache {
     /// Per-layer caches
     pub layers: Vec<LayerCache>,
+    /// Hidden state before final norm [batch, seq, hidden] (output of last layer)
+    pub pre_final_norm: Tensor,
+    /// After final norm [batch*seq, hidden]
+    pub final_hidden: Tensor,
+}
+
+/// Cached activations for forward pass with activation checkpointing.
+///
+/// Some layers store full cache, others store only checkpoint data.
+pub(crate) struct ForwardCacheCheckpointed {
+    /// Per-layer caches (either full or checkpointed)
+    pub layers: Vec<LayerCacheVariant>,
     /// Hidden state before final norm [batch, seq, hidden] (output of last layer)
     pub pre_final_norm: Tensor,
     /// After final norm [batch*seq, hidden]

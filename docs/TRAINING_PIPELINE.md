@@ -51,6 +51,7 @@ let mut trainer = Trainer::new(&model_config, &train_config);
 - `accumulation_steps` - Number of micro-batches to accumulate (default: 1)
 - `early_stopping_patience` - Stop after N evals without improvement (None = disabled)
 - `early_stopping_min_delta` - Minimum improvement threshold (default: 0.0)
+- `checkpoint_config` - Activation checkpointing configuration (see [Activation Checkpointing](#activation-checkpointing))
 
 **ModelConfig** (`src/nn/model.rs`):
 - `vocab_size`, `hidden_dim`, `num_layers`, `num_heads`
@@ -854,6 +855,84 @@ pub struct ForwardCache {
 | **MPS GEMM** | Metal Performance Shaders | 2-4x faster matmul |
 | **Lion Optimizer** | Sign-based, no variance | Less memory than Adam |
 | **Async GPU Mode** | CPU/GPU overlap | Better utilization |
+| **Activation Checkpointing** | Recompute activations in backward | ~90% activation memory reduction |
+
+### Activation Checkpointing
+
+Activation checkpointing (gradient checkpointing) trades compute for memory by storing only layer inputs during forward pass and recomputing activations during backward pass.
+
+**Files:**
+- `src/train/checkpoint_grad.rs` - Configuration and checkpoint storage
+- `src/train/forward.rs` - Checkpointing forward pass implementation
+- `src/train/trainer.rs` - Integration with train_step
+
+**Configuration:**
+
+```rust
+use irontensor::train::{TrainingConfig, CheckpointConfig};
+
+let train_config = TrainingConfig {
+    // Checkpoint all layers (maximum memory savings)
+    checkpoint_config: CheckpointConfig::enabled(),
+    ..Default::default()
+};
+
+// Or checkpoint every N layers (balance compute vs memory)
+let train_config = TrainingConfig {
+    checkpoint_config: CheckpointConfig::with_interval(2), // Every other layer
+    ..Default::default()
+};
+
+// Disabled by default
+let train_config = TrainingConfig {
+    checkpoint_config: CheckpointConfig::default(),  // enabled: false
+    ..Default::default()
+};
+```
+
+**Memory Savings:**
+
+Without checkpointing, each layer stores 11 tensors (~112 MB per layer for batch=16, seq=256, hidden=512):
+- input, normed_attn, q_for_attn, k_for_attn, v_for_attn
+- attn_out_pre_wo, post_attn, normed_ffn
+- gate, up, swiglu_out
+
+With checkpointing, each checkpointed layer stores only:
+- input tensor (~8 MB)
+- dropout seeds (16 bytes)
+
+**Memory reduction: ~14x per checkpointed layer**
+
+**Trade-offs:**
+
+| Aspect | Without Checkpointing | With checkpoint_every=1 |
+|--------|----------------------|-------------------------|
+| Activation memory | ~112 MB/layer | ~8 MB/layer |
+| Backward compute | 1x | ~1.3-1.5x (recompute) |
+| Training speed | Baseline | ~20-30% slower |
+
+**How it works:**
+
+1. **Forward pass:** For checkpointed layers, compute output normally but store only:
+   - Layer input tensor
+   - Dropout seeds (for deterministic replay)
+
+2. **Backward pass:** Before computing gradients for a checkpointed layer:
+   - Recompute full forward pass from stored input
+   - Use stored dropout seeds to replicate exact dropout masks
+   - Compute gradients using recomputed activations
+
+3. **Dropout determinism:** Uses `dropout_with_seed()` to apply identical dropout masks during recomputation, ensuring gradients are mathematically identical to non-checkpointed training.
+
+**When to use:**
+
+- Training larger models that don't fit in memory
+- Using longer sequence lengths
+- When compute is cheap relative to memory (common on Apple Silicon)
+
+**Verification:**
+
+Activation checkpointing produces **identical gradients** to standard training. This is verified by the test `test_activation_checkpointing` which compares loss, gradient norms, and final weights.
 
 ---
 

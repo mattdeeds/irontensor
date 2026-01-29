@@ -32,4 +32,36 @@ impl MetalContext {
     pub fn command_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         &self.command_queue
     }
+
+    /// Returns the current total GPU memory allocated by Metal (in bytes).
+    ///
+    /// This is useful for profiling memory usage during training.
+    /// On Apple Silicon with unified memory, this tracks all Metal buffer allocations.
+    pub fn current_allocated_size(&self) -> usize {
+        self.device.currentAllocatedSize()
+    }
+}
+
+/// Returns the current total GPU memory allocated by Metal (in bytes).
+///
+/// Convenience function that calls `MetalContext::global().current_allocated_size()`.
+pub fn gpu_memory_allocated() -> usize {
+    MetalContext::global().current_allocated_size()
+}
+
+/// Format bytes as human-readable string (e.g., "123.4 MB")
+pub fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    const GB: usize = 1024 * 1024 * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
