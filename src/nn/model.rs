@@ -170,6 +170,8 @@ pub struct GPTModel {
     pub final_norm: Tensor,
     /// Output projection weights [vocab_size, hidden_dim] (may be tied to embed_tokens)
     output_weight: Option<Tensor>,
+    /// Whether the model is in training mode (affects dropout behavior)
+    training: bool,
 }
 
 impl GPTModel {
@@ -220,7 +222,35 @@ impl GPTModel {
             layers,
             final_norm,
             output_weight,
+            training: true, // Default to training mode
         }
+    }
+
+    /// Set the training mode.
+    ///
+    /// When `training` is true, dropout is applied during forward pass.
+    /// When `training` is false (evaluation mode), dropout is disabled.
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Check if the model is in training mode.
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Run with evaluation mode temporarily enabled.
+    ///
+    /// Sets training=false, runs the closure, then restores training mode.
+    pub fn eval_mode<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&Self) -> R,
+    {
+        let was_training = self.training;
+        self.training = false;
+        let result = f(self);
+        self.training = was_training;
+        result
     }
 
     /// Forward pass

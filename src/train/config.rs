@@ -38,6 +38,12 @@ pub struct TrainingConfig {
     /// Effective batch size = batch_size * accumulation_steps.
     /// Default is 1 (no accumulation).
     pub accumulation_steps: usize,
+    /// Early stopping patience: stop training if validation loss doesn't improve
+    /// for this many consecutive evaluations. None = disabled.
+    pub early_stopping_patience: Option<usize>,
+    /// Minimum improvement in validation loss required to reset patience counter.
+    /// Default is 0.0 (any improvement resets counter).
+    pub early_stopping_min_delta: f32,
 }
 
 impl Default for TrainingConfig {
@@ -58,6 +64,8 @@ impl Default for TrainingConfig {
             async_gpu: true, // Enabled by default for better performance
             dropout_enabled: true, // Enabled by default for training
             accumulation_steps: 1, // No accumulation by default
+            early_stopping_patience: None, // Disabled by default
+            early_stopping_min_delta: 0.0, // Any improvement resets counter
         }
     }
 }

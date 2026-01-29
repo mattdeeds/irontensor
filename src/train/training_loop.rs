@@ -99,9 +99,14 @@ impl Trainer {
     /// Evaluate on a validation dataset.
     ///
     /// Returns the average loss across all batches in the dataset.
-    pub fn evaluate(&self, dataset: &TokenDataset, batch_size: usize) -> f32 {
+    /// Automatically disables dropout during evaluation.
+    pub fn evaluate(&mut self, dataset: &TokenDataset, batch_size: usize) -> f32 {
         let seq_len = dataset.seq_len();
         let iter = DatasetIterator::new(dataset, batch_size, false);
+
+        // Set model to evaluation mode (disables dropout)
+        let was_training = self.model.is_training();
+        self.model.set_training(false);
 
         let mut total_loss = 0.0f32;
         let mut num_batches = 0usize;
@@ -116,6 +121,9 @@ impl Trainer {
             total_loss += loss;
             num_batches += 1;
         }
+
+        // Restore training mode
+        self.model.set_training(was_training);
 
         if num_batches > 0 {
             total_loss / num_batches as f32
@@ -154,13 +162,17 @@ impl Trainer {
             self.train_epoch(train_dataset, batch_size, true, callback);
 
             // Validation
+            let mut should_early_stop = false;
             if let Some(val_ds) = val_dataset {
                 let val_loss = self.evaluate(val_ds, batch_size);
                 callback.on_eval(self.step, val_loss);
 
-                // Save best model
-                if val_loss < self.best_val_loss {
+                // Check for improvement (with min_delta threshold)
+                let min_delta = self.config.early_stopping_min_delta;
+                if val_loss < self.best_val_loss - min_delta {
+                    // Improvement: save best model and reset patience
                     self.best_val_loss = val_loss;
+                    self.patience_counter = 0;
                     let path = format!("{}/best.bin", self.config.checkpoint_dir);
                     if let Err(e) = std::fs::create_dir_all(&self.config.checkpoint_dir) {
                         eprintln!("Failed to create checkpoint directory '{}': {}", self.config.checkpoint_dir, e);
@@ -170,7 +182,23 @@ impl Trainer {
                     } else {
                         println!("New best validation loss: {:.4}", val_loss);
                     }
+                } else {
+                    // No improvement: increment patience counter
+                    self.patience_counter += 1;
+                    if let Some(patience) = self.config.early_stopping_patience
+                        && self.patience_counter >= patience
+                    {
+                        println!(
+                            "Early stopping: no improvement for {} evaluations (best val_loss: {:.4})",
+                            patience, self.best_val_loss
+                        );
+                        should_early_stop = true;
+                    }
                 }
+            }
+
+            if should_early_stop {
+                break;
             }
 
             if self.step >= self.config.total_steps {

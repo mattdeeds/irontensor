@@ -69,6 +69,8 @@ pub struct TrainStepRecord {
     pub epoch: usize,
     /// Training loss for this step
     pub loss: f32,
+    /// Perplexity (exp(loss)) - more interpretable measure of model quality
+    pub perplexity: f32,
     /// Gradient norm before clipping
     pub grad_norm: f32,
     /// Current learning rate
@@ -84,6 +86,9 @@ pub struct TrainStepRecord {
     /// Validation loss (if evaluated this step)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub val_loss: Option<f32>,
+    /// Validation perplexity (if evaluated this step)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_perplexity: Option<f32>,
     /// Phase timing breakdown in milliseconds (Forward, Backward, Optimizer)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_times_ms: Option<HashMap<String, f32>>,
@@ -199,6 +204,7 @@ impl TrainStepRecord {
             step,
             epoch,
             loss,
+            perplexity: loss.exp(),
             grad_norm,
             learning_rate,
             tokens_per_sec,
@@ -206,14 +212,16 @@ impl TrainStepRecord {
             batch_size,
             seq_len,
             val_loss: None,
+            val_perplexity: None,
             phase_times_ms: None,
             op_breakdown: None,
         }
     }
 
-    /// Set validation loss.
+    /// Set validation loss (also computes validation perplexity).
     pub fn with_val_loss(mut self, val_loss: f32) -> Self {
         self.val_loss = Some(val_loss);
+        self.val_perplexity = Some(val_loss.exp());
         self
     }
 

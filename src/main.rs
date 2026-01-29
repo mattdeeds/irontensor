@@ -211,6 +211,8 @@ fn main() {
         async_gpu,
         dropout_enabled: true,
         accumulation_steps: 1,  // No gradient accumulation
+        early_stopping_patience: None, // Disabled
+        early_stopping_min_delta: 0.0,
     };
 
     println!("\nTraining Configuration:");

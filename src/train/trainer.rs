@@ -41,6 +41,8 @@ pub struct Trainer {
     accumulated_grads: Option<AccumulatedGradients>,
     /// Accumulated loss for averaging
     accumulated_loss: f32,
+    /// Counter for early stopping patience (tracks consecutive evaluations without improvement)
+    pub(super) patience_counter: usize,
 }
 
 impl Trainer {
@@ -96,6 +98,7 @@ impl Trainer {
             micro_step: 0,
             accumulated_grads,
             accumulated_loss: 0.0,
+            patience_counter: 0,
         }
     }
 
@@ -167,6 +170,7 @@ impl Trainer {
             micro_step: 0,
             accumulated_grads,
             accumulated_loss: 0.0,
+            patience_counter: 0, // Reset patience when loading from checkpoint
         })
     }
 
