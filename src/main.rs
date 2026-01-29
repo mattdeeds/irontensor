@@ -22,12 +22,28 @@ fn main() {
 
     // Initialize the Metal context
     let ctx = MetalContext::global();
-    println!("IronTensor - GPT Training on Tiny Shakespeare");
-    println!("==============================================");
+
+    // Print ascii art banner
+    println!(
+        r#"
+  _                 _____
+ (_)               |_   _|
+  _ _ __ ___  _ __   | | ___ _ __  ___  ___  _ __
+ | | '__/ _ \| '_ \  | |/ _ \ '_ \/ __|/ _ \| '__|
+ | | | | (_) | | | | | |  __/ | | \__ \ (_) | |
+ |_|_|  \___/|_| |_| \_/\___|_| |_|___/\___/|_|
+
+"#
+    );
     println!("Device: {}\n", ctx.device().name());
 
     // Check if logging is enabled (profiler is enabled when logging is enabled)
     let logging_enabled = std::env::var("IRONTENSOR_LOG").is_ok();
+
+    // Check if inference is enabled (default: true)
+    let inference_enabled = std::env::var("IRONTENSOR_INFERENCE")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true);
 
     // Initialize profiler (enabled when logging is enabled)
     Profiler::init(ProfilerConfig {
@@ -51,6 +67,7 @@ fn main() {
     println!("  Model: {}", model_name);
     println!("  Steps: {}", total_steps);
     println!("  Batch size: {}", batch_size);
+    println!("  Inference: {}", if inference_enabled { "enabled" } else { "disabled" });
     println!();
 
     // Create data directory if it doesn't exist
@@ -286,28 +303,33 @@ fn main() {
     }
 
     // =====================================================================
-    // Step 6: Text Generation
+    // Step 6: Text Generation (optional)
     // =====================================================================
-    println!("=== Step 6: Text Generation ===\n");
+    if inference_enabled {
+        let inference_start = Instant::now();
+        println!("=== Step 6: Text Generation ===\n");
 
-    let prompts = vec![
-        "ROMEO:",
-        "To be or not",
-        "The king",
-        "JULIET:\nO Romeo,",
-    ];
+        let prompts = vec![
+            "ROMEO:",
+            "To be or not",
+            "The king",
+            "JULIET:\nO Romeo,",
+        ];
 
-    let generator = TextGenerator::new(GeneratorConfig {
-        temperature: 0.8,
-        max_tokens: 100,
-        ..Default::default()
-    });
+        let generator = TextGenerator::new(GeneratorConfig {
+            temperature: 0.8,
+            max_tokens: 100,
+            ..Default::default()
+        });
 
-    for prompt in prompts {
-        println!("Prompt: \"{}\"", prompt);
-        let generated = generator.generate(&mut trainer.model, &tokenizer, prompt);
-        println!("Generated:\n{}\n", generated);
-        println!("{}", "-".repeat(40));
+        for prompt in prompts {
+            println!("Prompt: \"{}\"", prompt);
+            let generated = generator.generate(&mut trainer.model, &tokenizer, prompt);
+            println!("Generated:\n{}\n", generated);
+            println!("{}", "-".repeat(40));
+        }
+        let inference_duration = inference_start.elapsed();
+        println!("Text generation completed in {:.2?}\n", inference_duration);
     }
 
     // Shutdown logger (writes the complete log file)
