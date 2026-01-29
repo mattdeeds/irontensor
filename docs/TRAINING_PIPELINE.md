@@ -49,6 +49,8 @@ let mut trainer = Trainer::new(&model_config, &train_config);
 - `async_gpu` - Enable CPU/GPU overlap
 - `dropout_enabled` - Enable dropout layers
 - `accumulation_steps` - Number of micro-batches to accumulate (default: 1)
+- `early_stopping_patience` - Stop after N evals without improvement (None = disabled)
+- `early_stopping_min_delta` - Minimum improvement threshold (default: 0.0)
 
 **ModelConfig** (`src/nn/model.rs`):
 - `vocab_size`, `hidden_dim`, `num_layers`, `num_heads`
@@ -491,6 +493,40 @@ trainer.save_checkpoint_with_optimizer("full_checkpoint.bin")?;
 - Model config is embedded in checkpoint for validation
 - Checkpoints without optimizer state are smaller but may cause brief instability on resume
 
+### Evaluation Mode
+
+The model tracks training mode to properly disable dropout during evaluation:
+
+```rust
+// Model starts in training mode by default
+let mut model = GPTModel::new(&config);
+assert!(model.is_training());
+
+// Set evaluation mode (disables dropout)
+model.set_training(false);
+
+// Trainer.evaluate() handles this automatically
+let val_loss = trainer.evaluate(&val_dataset, batch_size);  // dropout disabled
+```
+
+### Early Stopping
+
+Early stopping prevents overfitting by stopping training when validation loss stops improving:
+
+```rust
+let train_config = TrainingConfig {
+    early_stopping_patience: Some(5),  // Stop after 5 evals without improvement
+    early_stopping_min_delta: 0.001,   // Minimum improvement threshold
+    ..Default::default()
+};
+```
+
+**Behavior:**
+1. After each validation, check if `val_loss < best_val_loss - min_delta`
+2. If improved: save best model, reset patience counter
+3. If not improved: increment patience counter
+4. When patience counter >= patience: stop training
+
 ---
 
 ## 9. Profiling and Logging
@@ -579,7 +615,7 @@ IRONTENSOR_LOG_OPS=1       # Include op breakdown
     "best_val_loss": 7.62,
     "avg_tokens_per_sec": 6800.0,
     "steps": [
-      {"step": 10, "loss": 7.61, "grad_norm": 0.97, "tokens_per_sec": 6616, ...}
+      {"step": 10, "loss": 7.61, "perplexity": 2020.7, "grad_norm": 0.97, "tokens_per_sec": 6616, ...}
     ],
     "profiler_report": {
       "total_time_ms": 45320.5,
@@ -597,7 +633,8 @@ IRONTENSOR_LOG_OPS=1       # Include op breakdown
 **Training:**
 - `total_time_sec`, `total_steps`, `epochs_completed`
 - `final_loss`, `best_val_loss`, `avg_tokens_per_sec`
-- Per-step: loss, grad_norm, learning_rate, tokens_per_sec, step_time_ms
+- Per-step: loss, perplexity, grad_norm, learning_rate, tokens_per_sec, step_time_ms
+- Validation: val_loss, val_perplexity (when evaluated)
 
 **Inference:**
 - `time_to_first_token_ms` (TTFT)
@@ -740,6 +777,23 @@ let train_config = TrainingConfig {
 
 **Use case:** Train with larger effective batch sizes when GPU memory is limited.
 
+### Evaluation and Early Stopping
+
+During training, after each epoch validation is performed:
+
+```
+1. Set model to eval mode (disables dropout)
+2. Compute average loss over validation dataset
+3. Restore training mode
+4. Check for improvement:
+   - If val_loss < best_val_loss - min_delta:
+       Save best checkpoint, reset patience counter
+   - Else:
+       Increment patience counter
+       If patience_counter >= early_stopping_patience:
+           Stop training early
+```
+
 ---
 
 ## 12. Key Data Structures
@@ -756,6 +810,7 @@ pub struct Trainer {
     pub step: usize,
     pub epoch: usize,
     pub best_val_loss: f32,
+    patience_counter: usize,           // For early stopping
 }
 ```
 
@@ -820,6 +875,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         warmup_steps: 100,
         total_steps: 10000,
         use_bf16: true,
+        early_stopping_patience: Some(5),  // Stop if no improvement for 5 evals
         ..Default::default()
     };
 
