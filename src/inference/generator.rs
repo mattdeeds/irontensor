@@ -72,12 +72,60 @@ impl TextGenerator {
         result
     }
 
+    /// Generate text with streaming output.
+    ///
+    /// The callback is called with each new piece of generated text as it's produced.
+    /// Returns the complete generated text (same as `generate()`).
+    ///
+    /// # Arguments
+    /// * `model` - The GPT model to use for generation
+    /// * `tokenizer` - Tokenizer for encoding/decoding text
+    /// * `prompt` - The input prompt to continue from
+    /// * `on_token` - Callback called with each new text fragment
+    ///
+    /// # Returns
+    /// The generated text including the original prompt.
+    pub fn generate_streaming<F>(
+        &self,
+        model: &mut GPTModel,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        on_token: F,
+    ) -> String
+    where
+        F: FnMut(&str),
+    {
+        // Save training state and set to eval mode
+        let was_training = model.is_training();
+        model.set_training(false);
+
+        let result = self.generate_internal_streaming(model, tokenizer, prompt, on_token);
+
+        // Restore training state
+        model.set_training(was_training);
+
+        result
+    }
+
     fn generate_internal(
         &self,
         model: &GPTModel,
         tokenizer: &Tokenizer,
         prompt: &str,
     ) -> String {
+        self.generate_internal_streaming(model, tokenizer, prompt, |_| {})
+    }
+
+    fn generate_internal_streaming<F>(
+        &self,
+        model: &GPTModel,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        mut on_token: F,
+    ) -> String
+    where
+        F: FnMut(&str),
+    {
         // Encode prompt
         let encoding = tokenizer
             .encode(prompt, false)
@@ -89,6 +137,10 @@ impl TextGenerator {
 
         // Start inference timing
         let mut timer = InferenceTimer::new(prompt_len, self.config.temperature);
+
+        // Track decoded length for incremental output
+        let initial_decoded = tokenizer.decode(&tokens, true).expect("Failed to decode");
+        let mut last_decoded_len = initial_decoded.len();
 
         // Generate tokens one at a time
         for i in 0..self.config.max_tokens {
@@ -127,6 +179,13 @@ impl TextGenerator {
 
             tokens.push(next_token);
 
+            // Decode full sequence and emit new text
+            let decoded = tokenizer.decode(&tokens, true).expect("Failed to decode");
+            if decoded.len() > last_decoded_len {
+                on_token(&decoded[last_decoded_len..]);
+                last_decoded_len = decoded.len();
+            }
+
             // Track inference timing
             if i == 0 {
                 timer.mark_first_token();
@@ -143,7 +202,7 @@ impl TextGenerator {
         // Finish timing and log (automatically logs if Logger is enabled)
         let _ = timer.finish();
 
-        // Decode
+        // Decode final result
         tokenizer.decode(&tokens, true).expect("Failed to decode")
     }
 }

@@ -175,10 +175,8 @@ impl Logger {
         LOGGER_STATE.with(|state| {
             match LoggerState::new(config) {
                 Ok(s) => {
-                    let log_path = s.log_path();
                     *state.borrow_mut() = Some(s);
                     LOGGING_ENABLED.store(true, Ordering::SeqCst);
-                    eprintln!("[Logger] Initialized, will write to: {}", log_path.display());
                 }
                 Err(e) => {
                     eprintln!("[Logger] Failed to initialize: {}", e);
@@ -205,9 +203,9 @@ impl Logger {
 
                 // Write the complete run log
                 if let Err(e) = write_json_file(&log_path, &s.run_log) {
-                    eprintln!("[Logger] Failed to write log: {}", e);
+                    eprintln!("Failed to write log: {}", e);
                 } else {
-                    eprintln!("[Logger] Wrote log to: {}", log_path.display());
+                    println!("Log saved to {}", log_path.display());
                 }
             }
         });

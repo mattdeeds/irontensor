@@ -6,6 +6,7 @@ use irontensor::logging::{LogConfig, Logger, TrainStepRecord};
 use irontensor::train::{TrainCallback, TrainMetrics};
 use objc2_metal::MTLDevice;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
@@ -22,38 +23,14 @@ fn main() {
 
     // Initialize the Metal context
     let ctx = MetalContext::global();
+    let device_name = ctx.device().name().to_string();
 
-    // Print ascii art banner
-    println!(
-        r#"
-  _                 _____
- (_)               |_   _|
-  _ _ __ ___  _ __   | | ___ _ __  ___  ___  _ __
- | | '__/ _ \| '_ \  | |/ _ \ '_ \/ __|/ _ \| '__|
- | | | | (_) | | | | | |  __/ | | \__ \ (_) | |
- |_|_|  \___/|_| |_| \_/\___|_| |_|___/\___/|_|
-
-"#
-    );
-    println!("Device: {}\n", ctx.device().name());
-
-    // Check if logging is enabled (profiler is enabled when logging is enabled)
+    // Parse configuration from environment variables
     let logging_enabled = std::env::var("IRONTENSOR_LOG").is_ok();
-
-    // Check if inference is enabled (default: true)
     let inference_enabled = std::env::var("IRONTENSOR_INFERENCE")
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(true);
-
-    // Initialize profiler (enabled when logging is enabled)
-    Profiler::init(ProfilerConfig {
-        enabled: logging_enabled,
-        warmup_steps: 5,
-        report_interval: 0,
-    });
-
-    // Parse configuration from environment variables
-    let model_name = std::env::var("IRONTENSOR_MODEL").unwrap_or_else(|_| "shakespeare".to_string());
+    let model_name = std::env::var("IRONTENSOR_MODEL").unwrap_or_else(|_| "small".to_string());
     let total_steps: usize = std::env::var("IRONTENSOR_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -62,153 +39,69 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
+    let use_bf16 = std::env::var("IRONTENSOR_BF16").is_ok();
+    let async_gpu = std::env::var("IRONTENSOR_SYNC_GPU").is_err();
+    let log_dir = std::env::var("IRONTENSOR_LOG_DIR").unwrap_or_else(|_| "logs".to_string());
 
-    println!("Configuration:");
-    println!("  Model: {}", model_name);
-    println!("  Steps: {}", total_steps);
-    println!("  Batch size: {}", batch_size);
-    println!("  Inference: {}", if inference_enabled { "enabled" } else { "disabled" });
-    println!();
+    // Initialize profiler (enabled when logging is enabled)
+    Profiler::init(ProfilerConfig {
+        enabled: logging_enabled,
+        warmup_steps: 5,
+        report_interval: 0,
+    });
 
-    // Create data directory if it doesn't exist
+    // Create directories
     fs::create_dir_all("data").expect("Failed to create data directory");
     fs::create_dir_all("checkpoints").expect("Failed to create checkpoints directory");
 
-    // =====================================================================
-    // Step 1: Download or load Tiny Shakespeare
-    // =====================================================================
-    println!("=== Step 1: Loading Tiny Shakespeare ===\n");
-
+    // =========================================================================
+    // Load/prepare data (silent)
+    // =========================================================================
     let text_path = Path::new("data/tinyshakespeare.txt");
     let text = if text_path.exists() {
-        println!("Loading from cached file: {:?}", text_path);
         fs::read_to_string(text_path).expect("Failed to read cached file")
     } else {
-        println!("Downloading Tiny Shakespeare from GitHub...");
         let text = download_text(TINY_SHAKESPEARE_URL);
         fs::write(text_path, &text).expect("Failed to cache text");
-        println!("Saved to: {:?}", text_path);
         text
     };
 
-    println!("Text length: {} characters", text.len());
-    println!("First 200 chars:\n{}\n", &text[..200.min(text.len())]);
-
-    // =====================================================================
-    // Step 2: Train BPE Tokenizer
-    // =====================================================================
-    println!("=== Step 2: Training BPE Tokenizer ===\n");
-
+    // Load/train tokenizer (silent)
     let tokenizer_path = Path::new("data/shakespeare_tokenizer.json");
     let tokenizer = if tokenizer_path.exists() {
-        println!("Loading cached tokenizer from: {:?}", tokenizer_path);
         Tokenizer::from_file(tokenizer_path).expect("Failed to load tokenizer")
     } else {
-        println!("Training new BPE tokenizer (vocab_size=2048)...");
         let tokenizer = train_bpe_tokenizer(&text, 2048);
         tokenizer.save(tokenizer_path, false).expect("Failed to save tokenizer");
-        println!("Saved tokenizer to: {:?}", tokenizer_path);
         tokenizer
     };
-
     let vocab_size = tokenizer.get_vocab_size(true);
-    println!("Vocabulary size: {}", vocab_size);
 
-    // Test tokenization
-    let sample = "ROMEO:\nWherefore art thou Romeo?";
-    let encoding = tokenizer.encode(sample, false).expect("Failed to encode");
-    let tokens = encoding.get_ids();
-    println!("Sample: \"{}\"", sample);
-    println!("Tokens: {:?}", tokens);
-    let decoded = tokenizer.decode(tokens, true).expect("Failed to decode");
-    println!("Decoded: \"{}\"\n", decoded);
-
-    // =====================================================================
-    // Step 3: Prepare Datasets
-    // =====================================================================
-    println!("=== Step 3: Preparing Datasets ===\n");
-
+    // Prepare datasets (silent)
     let train_path = Path::new("data/shakespeare_train.bin");
     let val_path = Path::new("data/shakespeare_val.bin");
+    let seq_len = 256;
 
-    // Check if datasets already exist
-    let datasets_exist = train_path.exists() && val_path.exists();
-
-    if !datasets_exist {
-        // Tokenize entire text
-        println!("Tokenizing entire corpus...");
+    if !train_path.exists() || !val_path.exists() {
         let encoding = tokenizer.encode(text.as_str(), false).expect("Failed to encode");
         let all_tokens: Vec<u32> = encoding.get_ids().to_vec();
-        println!("Total tokens: {}", all_tokens.len());
-
-        // Split 90/10 for train/val
         let split_idx = (all_tokens.len() as f64 * 0.9) as usize;
-        let train_tokens = &all_tokens[..split_idx];
-        let val_tokens = &all_tokens[split_idx..];
-
-        println!("Train tokens: {}", train_tokens.len());
-        println!("Val tokens: {}", val_tokens.len());
-
-        // Create binary datasets
-        TokenDataset::create(train_path, train_tokens).expect("Failed to create train dataset");
-        TokenDataset::create(val_path, val_tokens).expect("Failed to create val dataset");
-        println!("Created train dataset: {:?}", train_path);
-        println!("Created val dataset: {:?}", val_path);
-    } else {
-        println!("Using cached datasets:");
-        println!("  Train: {:?}", train_path);
-        println!("  Val: {:?}", val_path);
+        TokenDataset::create(train_path, &all_tokens[..split_idx]).expect("Failed to create train dataset");
+        TokenDataset::create(val_path, &all_tokens[split_idx..]).expect("Failed to create val dataset");
     }
-    println!();
 
-    // =====================================================================
-    // Step 4: Initialize Model
-    // =====================================================================
-    println!("=== Step 4: Initializing Model ===\n");
+    let train_dataset = TokenDataset::open(train_path, seq_len).expect("Failed to open train dataset");
+    let val_dataset = TokenDataset::open(val_path, seq_len).expect("Failed to open val dataset");
 
-    // Create model config matching tokenizer vocab size
+    // Create model
     let mut config = match model_name.as_str() {
         "tiny" => ModelConfig::tiny(),
         "small" => ModelConfig::small(),
         "medium" => ModelConfig::medium(),
         _ => ModelConfig::shakespeare(),
     };
-    config.vocab_size = vocab_size; // Match actual tokenizer vocab
-
-    println!("Model Configuration:");
-    println!("  vocab_size: {}", config.vocab_size);
-    println!("  hidden_dim: {}", config.hidden_dim);
-    println!("  num_layers: {}", config.num_layers);
-    println!("  num_heads: {}", config.num_heads);
-    println!("  intermediate_dim: {}", config.intermediate_dim);
-    println!("  max_seq_len: {}", config.max_seq_len);
-    println!("  tie_weights: {}", config.tie_weights);
-
+    config.vocab_size = vocab_size;
     let model = GPTModel::new(&config);
-    println!("\n{}", model.summary());
-
-    let expected_initial_loss = (vocab_size as f64).ln();
-    println!("Expected initial loss (random): {:.4} (ln({}))\n", expected_initial_loss, vocab_size);
-
-    // =====================================================================
-    // Step 5: Training
-    // =====================================================================
-    println!("=== Step 5: Training ===\n");
-
-    let seq_len = 256; // Sequence length for training
-
-    let train_dataset = TokenDataset::open(train_path, seq_len).expect("Failed to open train dataset");
-    let val_dataset = TokenDataset::open(val_path, seq_len).expect("Failed to open val dataset");
-
-    println!("Train sequences: {}", train_dataset.num_sequences());
-    println!("Val sequences: {}", val_dataset.num_sequences());
-    println!("Batch size: {}", batch_size);
-    println!("Sequence length: {}", seq_len);
-
-    // Check for BF16 flag via environment variable
-    let use_bf16 = std::env::var("IRONTENSOR_BF16").is_ok();
-    // Check for async GPU flag (enabled by default, disable with IRONTENSOR_SYNC_GPU=1)
-    let async_gpu = std::env::var("IRONTENSOR_SYNC_GPU").is_err();
 
     // Training configuration
     let train_config = TrainingConfig {
@@ -219,32 +112,22 @@ fn main() {
         max_grad_norm: 1.0,
         warmup_steps: 50,
         total_steps,
-        log_interval: 10,  // More frequent logging
-        save_interval: usize::MAX,  // Disable checkpoints during testing
+        log_interval: 10,
+        save_interval: usize::MAX,
         eval_interval: 50,
         checkpoint_dir: "checkpoints".to_string(),
         use_bf16,
         async_gpu,
         dropout_enabled: true,
-        accumulation_steps: 1,  // No gradient accumulation
-        early_stopping_patience: None, // Disabled
+        accumulation_steps: 1,
+        early_stopping_patience: None,
         early_stopping_min_delta: 0.0,
     };
-
-    println!("\nTraining Configuration:");
-    println!("  learning_rate: {}", train_config.learning_rate);
-    println!("  weight_decay: {}", train_config.weight_decay);
-    println!("  warmup_steps: {}", train_config.warmup_steps);
-    println!("  total_steps: {}", train_config.total_steps);
-    println!("  max_grad_norm: {}", train_config.max_grad_norm);
-    println!("  use_bf16: {}", train_config.use_bf16);
-    println!("  async_gpu: {}", train_config.async_gpu);
-    println!();
 
     // Initialize logger
     Logger::init(LogConfig {
         enabled: logging_enabled,
-        log_dir: std::env::var("IRONTENSOR_LOG_DIR").unwrap_or_else(|_| "logs".to_string()),
+        log_dir: log_dir.clone(),
         model_name: model_name.clone(),
         config: TrainConfigSnapshot {
             learning_rate: train_config.learning_rate,
@@ -258,43 +141,79 @@ fn main() {
         include_op_breakdown: std::env::var("IRONTENSOR_LOG_OPS").is_ok(),
         ..Default::default()
     });
+
+    // =========================================================================
+    // Print summary
+    // =========================================================================
+    println!(
+        r#"
+  _                 _____
+ (_)               |_   _|
+  _ _ __ ___  _ __   | | ___ _ __  ___  ___  _ __
+ | | '__/ _ \| '_ \  | |/ _ \ '_ \/ __|/ _ \| '__|
+ | | | | (_) | | | | | |  __/ | | \__ \ (_) | |
+ |_|_|  \___/|_| |_| \_/\___|_| |_|___/\___/|_|
+"#
+    );
+
+    println!("Device    {}", device_name);
+    println!();
+    println!("Environment");
+    println!("  IRONTENSOR_MODEL      {}", model_name);
+    println!("  IRONTENSOR_STEPS      {}", total_steps);
+    println!("  IRONTENSOR_BATCH      {}", batch_size);
+    println!("  IRONTENSOR_BF16       {}", if use_bf16 { "1" } else { "-" });
+    println!("  IRONTENSOR_LOG        {}", if logging_enabled { "1" } else { "-" });
+    println!("  IRONTENSOR_INFERENCE  {}", if inference_enabled { "1" } else { "0" });
+    println!();
+    println!("Data");
+    println!("  Text        {}  ({} chars)", text_path.display(), text.len());
+    println!("  Tokenizer   {}  (vocab={})", tokenizer_path.display(), vocab_size);
+    println!("  Train       {}  ({} sequences)", train_path.display(), train_dataset.num_sequences());
+    println!("  Val         {}  ({} sequences)", val_path.display(), val_dataset.num_sequences());
+    println!();
+    println!("Model         {} ({:.2}M params)", model_name, model.num_params() as f64 / 1e6);
+    println!("  hidden_dim  {}  layers={}  heads={}", config.hidden_dim, config.num_layers, config.num_heads);
+    println!("  seq_len     {}  tie_weights={}", config.max_seq_len, config.tie_weights);
+    println!();
+    println!("Training");
+    println!("  lr          {:.0e}  warmup={}  weight_decay={}", train_config.learning_rate, train_config.warmup_steps, train_config.weight_decay);
+    println!("  batch       {}  seq_len={}  async_gpu={}", batch_size, seq_len, async_gpu);
+    println!("  grad_clip   {:.1}  dropout={}", train_config.max_grad_norm, train_config.dropout_enabled);
     if logging_enabled {
-        println!("Logging enabled (will write to: {})\n",
-            Logger::log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "logs".to_string()));
+        println!();
+        println!("Logger    {}", Logger::log_path().map(|p| p.display().to_string()).unwrap_or_else(|| log_dir));
     }
+    println!();
+    println!("{}", "=".repeat(60));
+    println!();
 
-    // Create trainer
+    // =========================================================================
+    // Training
+    // =========================================================================
     let mut trainer = Trainer::new(&config, &train_config);
-
-    // Create logging callback
     let mut callback = LoggingCallback::new(batch_size, seq_len);
 
-    // Start training timer
     Logger::start_training();
     let training_start = Instant::now();
 
-    println!("Starting training...");
-    println!("{}", "-".repeat(60));
-
-    // Use Trainer::train_epoch for proper training loop
     let num_epochs = (train_config.total_steps / (train_dataset.num_sequences() / batch_size).max(1)).max(1) + 1;
     trainer.train(&train_dataset, Some(&val_dataset), batch_size, num_epochs, &mut callback);
 
-    let total_time_sec = training_start.elapsed().as_secs_f32();
-    println!("{}", "-".repeat(60));
-    println!("Training complete in {:.1}s!\n", total_time_sec);
+    let training_time = training_start.elapsed();
+    println!();
+    println!("Training complete in {:.1}s", training_time.as_secs_f32());
 
-    // Get profiler report (included in JSON log if logging enabled)
+    // Finalize training log
     let profiler_report = if logging_enabled {
         Some(Profiler::report().to_record())
     } else {
         None
     };
 
-    // Finalize training log
     if logging_enabled {
         Logger::finalize_training(
-            trainer.step,  // Actual total steps completed
+            trainer.step,
             callback.last_loss,
             callback.best_val_loss,
             trainer.epoch,
@@ -302,12 +221,14 @@ fn main() {
         );
     }
 
-    // =====================================================================
-    // Step 6: Text Generation (optional)
-    // =====================================================================
+    // =========================================================================
+    // Inference (optional)
+    // =========================================================================
     if inference_enabled {
+        println!();
+        println!("{}", "=".repeat(60));
+        println!();
         let inference_start = Instant::now();
-        println!("=== Step 6: Text Generation ===\n");
 
         let prompts = vec![
             "ROMEO:",
@@ -322,24 +243,42 @@ fn main() {
             ..Default::default()
         });
 
+        let mut total_generated_tokens = 0usize;
+
         for prompt in prompts {
-            println!("Prompt: \"{}\"", prompt);
-            let generated = generator.generate(&mut trainer.model, &tokenizer, prompt);
-            println!("Generated:\n{}\n", generated);
-            println!("{}", "-".repeat(40));
+            print!("Prompt: \"{}\"\nGenerated: ", prompt);
+            std::io::stdout().flush().unwrap();
+
+            let prompt_tokens = tokenizer.encode(prompt, false).map(|e| e.len()).unwrap_or(0);
+            let generated = generator.generate_streaming(&mut trainer.model, &tokenizer, prompt, |text| {
+                print!("{}", text);
+                std::io::stdout().flush().unwrap();
+            });
+            let total_tokens = tokenizer.encode(generated.as_str(), false).map(|e| e.len()).unwrap_or(0);
+            total_generated_tokens += total_tokens.saturating_sub(prompt_tokens);
+
+            println!("\n{}", "-".repeat(40));
         }
-        let inference_duration = inference_start.elapsed();
-        println!("Text generation completed in {:.2?}\n", inference_duration);
+
+        let inference_time = inference_start.elapsed();
+        let tokens_per_sec = total_generated_tokens as f32 / inference_time.as_secs_f32();
+        println!(
+            "Inference complete in {:.1}s ({} tokens, {:.1} tok/s)",
+            inference_time.as_secs_f32(),
+            total_generated_tokens,
+            tokens_per_sec
+        );
     }
 
-    // Shutdown logger (writes the complete log file)
+    // Shutdown logger
     Logger::shutdown();
 
     let total_duration = start_time.elapsed();
-    println!("\nDone! Total time: {:.2?}", total_duration);
+    println!();
+    println!("Done! Total time: {:.1}s", total_duration.as_secs_f32());
 }
 
-/// Callback that prints to console and logs to file.
+/// Callback for training progress.
 struct LoggingCallback {
     batch_size: usize,
     seq_len: usize,
@@ -364,9 +303,8 @@ impl TrainCallback for LoggingCallback {
     fn on_step(&mut self, metrics: &TrainMetrics) {
         self.last_loss = metrics.loss;
 
-        // Print to console
         println!(
-            "Step {:>6} | Loss: {:.4} | Grad norm: {:.4} | LR: {:.2e} | {:.0} tok/s",
+            "Step {:>5} | loss={:.4} | grad={:.4} | lr={:.2e} | {:.0} tok/s",
             metrics.step,
             metrics.loss,
             metrics.grad_norm,
@@ -374,19 +312,16 @@ impl TrainCallback for LoggingCallback {
             metrics.tokens_per_sec
         );
 
-        // Log to file
         if Logger::is_enabled() {
             let elapsed = self.step_start.elapsed().as_secs_f32();
-            let step_time_ms = elapsed * 1000.0;
-
             let record = TrainStepRecord::new(
                 metrics.step,
-                0, // epoch is tracked by trainer
+                0,
                 metrics.loss,
                 metrics.grad_norm,
                 metrics.learning_rate,
                 metrics.tokens_per_sec,
-                step_time_ms,
+                elapsed * 1000.0,
                 self.batch_size,
                 self.seq_len,
             );
@@ -397,7 +332,7 @@ impl TrainCallback for LoggingCallback {
     }
 
     fn on_eval(&mut self, step: usize, val_loss: f32) {
-        println!("Step {:>6} | Validation loss: {:.4}", step, val_loss);
+        println!("Step {:>5} | val_loss={:.4}", step, val_loss);
 
         if self.best_val_loss.is_none() || val_loss < self.best_val_loss.unwrap() {
             self.best_val_loss = Some(val_loss);
@@ -405,32 +340,27 @@ impl TrainCallback for LoggingCallback {
     }
 
     fn on_save(&mut self, step: usize, path: &str) {
-        println!("Step {:>6} | Saved checkpoint to: {}", step, path);
+        println!("Step {:>5} | checkpoint: {}", step, path);
     }
 }
 
-/// Download text from a URL (simple blocking HTTP)
+/// Download text from a URL.
 fn download_text(url: &str) -> String {
-    // Use a simple curl command for downloading
     use std::process::Command;
-
     let output = Command::new("curl")
         .args(["-s", url])
         .output()
         .expect("Failed to execute curl");
-
     String::from_utf8(output.stdout).expect("Invalid UTF-8 in response")
 }
 
-/// Train a BPE tokenizer on the given text
+/// Train a BPE tokenizer on the given text.
 fn train_bpe_tokenizer(text: &str, vocab_size: usize) -> Tokenizer {
     use tokenizers::models::TrainerWrapper;
 
-    // Create a temporary file for training
     let temp_path = std::env::temp_dir().join("bpe_train_text.txt");
     fs::write(&temp_path, text).expect("Failed to write temp file");
 
-    // Create trainer wrapped for the generic Tokenizer
     let trainer = BpeTrainerBuilder::new()
         .vocab_size(vocab_size)
         .min_frequency(2)
@@ -441,25 +371,15 @@ fn train_bpe_tokenizer(text: &str, vocab_size: usize) -> Tokenizer {
         .build();
     let mut trainer_wrapper = TrainerWrapper::BpeTrainer(trainer);
 
-    // Build the tokenizer with empty BPE model
     let mut tokenizer = Tokenizer::new(BPE::default());
-
-    // Use byte-level pre-tokenization (like GPT-2)
     tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::ByteLevel(ByteLevel::default())));
-
-    // Train
     tokenizer
         .train_from_files(&mut trainer_wrapper, vec![temp_path.to_str().unwrap().to_string()])
         .expect("Failed to train tokenizer");
-
-    // Add decoder for proper decoding
     tokenizer.with_decoder(Some(DecoderWrapper::ByteLevel(
         tokenizers::decoders::byte_level::ByteLevel::default(),
     )));
 
-    // Cleanup
     fs::remove_file(&temp_path).ok();
-
     tokenizer
 }
-

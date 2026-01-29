@@ -144,19 +144,8 @@ impl Trainer {
         num_epochs: usize,
         callback: &mut C,
     ) {
-        println!("Starting training:");
-        println!(
-            "  Model params: {:.2}M",
-            self.model.config.num_params() as f64 / 1e6
-        );
-        println!("  Batch size: {}", batch_size);
-        println!("  Sequence length: {}", train_dataset.seq_len());
-        println!("  Total steps: {}", self.config.total_steps);
-        println!("  Learning rate: {}", self.config.learning_rate);
-        println!();
-
         for epoch in 0..num_epochs {
-            println!("=== Epoch {}/{} ===", epoch + 1, num_epochs);
+            println!("Epoch {}/{}", epoch + 1, num_epochs);
 
             // Training
             self.train_epoch(train_dataset, batch_size, true, callback);
