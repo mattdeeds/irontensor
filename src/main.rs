@@ -1,11 +1,10 @@
 use irontensor::{
-    GPTModel, MetalContext, ModelConfig, Profiler, ProfilerConfig, TokenDataset,
-    TrainConfigSnapshot, Trainer, TrainingConfig,
+    GPTModel, GeneratorConfig, MetalContext, ModelConfig, Profiler, ProfilerConfig, TextGenerator,
+    TokenDataset, TrainConfigSnapshot, Trainer, TrainingConfig,
 };
-use irontensor::logging::{InferenceTimer, LogConfig, Logger, TrainStepRecord};
+use irontensor::logging::{LogConfig, Logger, TrainStepRecord};
 use irontensor::train::{TrainCallback, TrainMetrics};
 use objc2_metal::MTLDevice;
-use rand::Rng;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -298,9 +297,15 @@ fn main() {
         "JULIET:\nO Romeo,",
     ];
 
+    let generator = TextGenerator::new(GeneratorConfig {
+        temperature: 0.8,
+        max_tokens: 100,
+        ..Default::default()
+    });
+
     for prompt in prompts {
         println!("Prompt: \"{}\"", prompt);
-        let generated = generate(&trainer.model, &tokenizer, prompt, 100, 0.8);
+        let generated = generator.generate(&mut trainer.model, &tokenizer, prompt);
         println!("Generated:\n{}\n", generated);
         println!("{}", "-".repeat(40));
     }
@@ -436,101 +441,3 @@ fn train_bpe_tokenizer(text: &str, vocab_size: usize) -> Tokenizer {
     tokenizer
 }
 
-/// Generate text from a prompt with optional performance logging.
-fn generate(
-    model: &GPTModel,
-    tokenizer: &Tokenizer,
-    prompt: &str,
-    max_tokens: usize,
-    temperature: f32,
-) -> String {
-    // Encode prompt
-    let encoding = tokenizer.encode(prompt, false).expect("Failed to encode prompt");
-    let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
-    let prompt_len = tokens.len();
-
-    let max_len = model.config.max_seq_len;
-
-    // Start inference timing
-    let mut timer = InferenceTimer::new(prompt_len, temperature);
-
-    // Generate tokens one at a time
-    for i in 0..max_tokens {
-        // Truncate if necessary
-        let context_tokens = if tokens.len() > max_len {
-            &tokens[tokens.len() - max_len..]
-        } else {
-            &tokens[..]
-        };
-
-        // Forward pass
-        let logits = model.forward(context_tokens, 1, context_tokens.len(), 0);
-
-        // Get logits for last position
-        let vocab_size = model.config.vocab_size;
-        let last_pos = context_tokens.len() - 1;
-        let logits_slice = logits.as_f32_slice();
-        let last_logits = &logits_slice[last_pos * vocab_size..(last_pos + 1) * vocab_size];
-
-        // Apply temperature
-        let scaled_logits: Vec<f32> = if temperature > 0.0 {
-            last_logits.iter().map(|&x| x / temperature).collect()
-        } else {
-            last_logits.to_vec()
-        };
-
-        // Sample from distribution
-        let next_token = if temperature > 0.0 {
-            sample_from_logits(&scaled_logits)
-        } else {
-            // Greedy: argmax
-            scaled_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i as u32)
-                .unwrap()
-        };
-
-        tokens.push(next_token);
-
-        // Track inference timing
-        if i == 0 {
-            timer.mark_first_token();
-        } else {
-            timer.token_generated();
-        }
-
-        // Stop at end of text token
-        if next_token == 0 {
-            break;
-        }
-    }
-
-    // Finish timing and log (automatically logs if Logger is enabled)
-    let _ = timer.finish();
-
-    // Decode
-    tokenizer.decode(&tokens, true).expect("Failed to decode")
-}
-
-/// Sample a token from logits using softmax probabilities
-fn sample_from_logits(logits: &[f32]) -> u32 {
-    // Compute softmax
-    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_logits: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
-    let sum: f32 = exp_logits.iter().sum();
-    let probs: Vec<f32> = exp_logits.iter().map(|&x| x / sum).collect();
-
-    // Sample using thread-local RNG
-    let r: f32 = rand::rng().random();
-    let mut cumsum = 0.0;
-    for (i, &p) in probs.iter().enumerate() {
-        cumsum += p;
-        if r < cumsum {
-            return i as u32;
-        }
-    }
-
-    (probs.len() - 1) as u32
-}
