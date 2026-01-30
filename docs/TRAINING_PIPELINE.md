@@ -691,6 +691,7 @@ CommandBatch::wait_for_completion();    // Wait before reading
 - Use `tensor.view(&[...])` for reshaping during batched operations
 - Avoid `Tensor::from_f32_slice(tensor.as_f32_slice(), ...)` which requires sync
 - Profiler integration tracks sync wait time and op count per batch
+- **Async mode caveat:** After `commit_async()`, a new batch is automatically started. Before any non-batched GPU operations (like evaluation), call `CommandBatch::end_async()` to properly close the batch and wait for async work to complete. Failure to do so will cause operations to be queued but never executed, resulting in zeros being read.
 
 ---
 

@@ -108,6 +108,10 @@ impl Trainer {
     /// Returns the average loss across all batches in the dataset.
     /// Automatically disables dropout during evaluation.
     pub fn evaluate(&mut self, dataset: &TokenDataset, batch_size: usize) -> f32 {
+        // End any active command batch and wait for async work to complete
+        // This is necessary because commit_async() leaves a new batch active
+        CommandBatch::end_async();
+
         let seq_len = dataset.seq_len();
         let iter = DatasetIterator::new(dataset, batch_size, false);
 

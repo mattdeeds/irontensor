@@ -106,7 +106,7 @@ fn main() {
     // Training configuration
     let train_config = TrainingConfig {
         learning_rate: 3e-4,
-        weight_decay: 0.25,
+        weight_decay: 0.1,
         beta1: 0.9,
         beta2: 0.99,
         max_grad_norm: 1.0,
