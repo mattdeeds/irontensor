@@ -1,60 +1,19 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
+use objc2_metal::{MTLComputePipelineState, MTLSize};
 
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
-
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, dispatch_threadgroups, params_buffer, BufferBinding};
+use crate::ops::params::SoftmaxParams;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const BACKWARD_SOFTMAX_SHADER: &str = include_str!("../../shaders/backward/softmax.metal");
+const SHADER: &str = include_str!("../../shaders/backward/softmax.metal");
 const SOFTMAX_THREADS: usize = 256;
 
-#[repr(C)]
-struct SoftmaxParams {
-    batch_seq: u32,
-    dim: u32,
-}
-
-struct SoftmaxBackwardPipelines {
-    softmax_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    softmax_backward_fast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static SOFTMAX_BACKWARD_PIPELINES: OnceLock<SoftmaxBackwardPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static SoftmaxBackwardPipelines {
-    SOFTMAX_BACKWARD_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(BACKWARD_SOFTMAX_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile backward softmax shader: {e}"));
-
-        let make_pipeline = |name: &str| {
-            let func = library
-                .newFunctionWithName(&objc2_foundation::NSString::from_str(name))
-                .unwrap_or_else(|| panic!("{} function not found", name));
-            device
-                .newComputePipelineStateWithFunction_error(&func)
-                .unwrap_or_else(|e| panic!("Failed to create {} pipeline: {e}", name))
-        };
-
-        SoftmaxBackwardPipelines {
-            softmax_backward: make_pipeline("softmax_backward_f32"),
-            softmax_backward_fast: make_pipeline("softmax_backward_fast_f32"),
-        }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "backward/softmax", {
+    softmax_backward => "softmax_backward_f32",
+    softmax_backward_fast => "softmax_backward_fast_f32",
+});
 
 /// Softmax backward pass
 /// grad_x = y * (grad_y - dot(grad_y, y))
@@ -77,56 +36,58 @@ pub fn softmax_backward(grad_output: &Tensor, output: &Tensor) -> Tensor {
         return grad_input;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
-
-    let params = SoftmaxParams {
+    let params_buf = params_buffer(&SoftmaxParams {
         batch_seq: batch_seq as u32,
         dim: dim as u32,
-    };
-    let params_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&params as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<SoftmaxParams>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create params buffer");
+    });
 
     let use_fast = dim >= SOFTMAX_THREADS;
 
-    let grad_output_buf = grad_output.buffer();
-    let output_buf = output.buffer();
-    let grad_input_buf = grad_input.buffer();
-
     if use_fast {
-        let threadgroup_count = MTLSize { width: batch_seq, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: SOFTMAX_THREADS, height: 1, depth: 1 };
+        let threadgroup_count = MTLSize {
+            width: batch_seq,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup_size = MTLSize {
+            width: SOFTMAX_THREADS,
+            height: 1,
+            depth: 1,
+        };
 
-        CommandBatch::dispatch_threadgroups(
+        dispatch_threadgroups(
             &pipelines.softmax_backward_fast,
-            |encoder| unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-            },
+            [
+                BufferBinding::from(grad_output),
+                BufferBinding::from(output),
+                BufferBinding::from(&grad_input),
+                BufferBinding::from(&params_buf),
+            ],
             threadgroup_count,
             threadgroup_size,
         );
     } else {
-        let thread_width = pipelines.softmax_backward.threadExecutionWidth();
-        let grid_size = MTLSize { width: batch_seq, height: 1, depth: 1 };
-        let threadgroup_size = MTLSize { width: thread_width.min(batch_seq), height: 1, depth: 1 };
+        let thread_width = pipelines.softmax_backward.threadExecutionWidth() as usize;
+        let grid_size = MTLSize {
+            width: batch_seq,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup_size = MTLSize {
+            width: thread_width.min(batch_seq),
+            height: 1,
+            depth: 1,
+        };
 
-        CommandBatch::dispatch(
+        dispatch(
             &pipelines.softmax_backward,
-            |encoder| unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-            },
+            [
+                BufferBinding::from(grad_output),
+                BufferBinding::from(output),
+                BufferBinding::from(&grad_input),
+                BufferBinding::from(&params_buf),
+            ],
             grid_size,
             threadgroup_size,
         );
@@ -184,7 +145,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-5,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -215,7 +178,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-4,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }

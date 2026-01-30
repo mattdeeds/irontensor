@@ -1,66 +1,30 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
+use objc2_metal::MTLComputePipelineState;
 
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, slice_buffer, threadgroup_1d, BufferBinding};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const BACKWARD_ELEMENTWISE_SHADER: &str = include_str!("../../shaders/backward/elementwise.metal");
+const SHADER: &str = include_str!("../../shaders/backward/elementwise.metal");
 
-struct ElementwiseBackwardPipelines {
-    mul_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    scale_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    silu_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    gelu_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    relu_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    swiglu_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static ELEMENTWISE_BACKWARD_PIPELINES: OnceLock<ElementwiseBackwardPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static ElementwiseBackwardPipelines {
-    ELEMENTWISE_BACKWARD_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(BACKWARD_ELEMENTWISE_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile backward elementwise shader: {e}"));
-
-        let make_pipeline = |name: &str| {
-            let func = library
-                .newFunctionWithName(&objc2_foundation::NSString::from_str(name))
-                .unwrap_or_else(|| panic!("{} function not found", name));
-            device
-                .newComputePipelineStateWithFunction_error(&func)
-                .unwrap_or_else(|e| panic!("Failed to create {} pipeline: {e}", name))
-        };
-
-        ElementwiseBackwardPipelines {
-            mul_backward: make_pipeline("mul_backward_f32"),
-            scale_backward: make_pipeline("scale_backward_f32"),
-            silu_backward: make_pipeline("silu_backward_f32"),
-            gelu_backward: make_pipeline("gelu_backward_f32"),
-            relu_backward: make_pipeline("relu_backward_f32"),
-            swiglu_backward: make_pipeline("swiglu_backward_f32"),
-        }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "backward/elementwise", {
+    mul_backward => "mul_backward_f32",
+    scale_backward => "scale_backward_f32",
+    silu_backward => "silu_backward_f32",
+    gelu_backward => "gelu_backward_f32",
+    relu_backward => "relu_backward_f32",
+    swiglu_backward => "swiglu_backward_f32",
+});
 
 /// Backward pass for element-wise multiplication
 /// Returns (grad_a, grad_b)
 pub fn mul_backward(grad_output: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Tensor) {
-    let _timer = timed(OpCategory::ElementwiseBackward("mul".to_string()), grad_output.numel());
+    let _timer = timed(
+        OpCategory::ElementwiseBackward("mul".to_string()),
+        grad_output.numel(),
+    );
     assert_eq!(grad_output.precision(), Precision::FP32);
     assert_eq!(a.precision(), Precision::FP32);
     assert_eq!(b.precision(), Precision::FP32);
@@ -71,41 +35,22 @@ pub fn mul_backward(grad_output: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Te
     let grad_a = Tensor::zeros(a.shape(), Precision::FP32);
     let grad_b = Tensor::zeros(b.shape(), Precision::FP32);
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
+    let count_buf = slice_buffer(&[count as u32]);
+    let (grid, threadgroup) = threadgroup_1d(&pipelines.mul_backward, count);
 
-    let count_u32: u32 = count as u32;
-    let count_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<u32>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create count buffer");
-
-    let grad_output_buf = grad_output.buffer();
-    let a_buf = a.buffer();
-    let b_buf = b.buffer();
-    let grad_a_buf = grad_a.buffer();
-    let grad_b_buf = grad_b.buffer();
-
-    let thread_width = pipelines.mul_backward.threadExecutionWidth();
-    let grid_size = MTLSize { width: count, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-
-    CommandBatch::dispatch(
+    dispatch(
         &pipelines.mul_backward,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(grad_a_buf), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(grad_b_buf), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 5);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(grad_output),
+            BufferBinding::from(a),
+            BufferBinding::from(b),
+            BufferBinding::from(&grad_a),
+            BufferBinding::from(&grad_b),
+            BufferBinding::from(&count_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     (grad_a, grad_b)
@@ -113,51 +58,30 @@ pub fn mul_backward(grad_output: &Tensor, a: &Tensor, b: &Tensor) -> (Tensor, Te
 
 /// Backward pass for scale operation
 pub fn scale_backward(grad_output: &Tensor, scalar: f32) -> Tensor {
-    let _timer = timed(OpCategory::ElementwiseBackward("scale".to_string()), grad_output.numel());
+    let _timer = timed(
+        OpCategory::ElementwiseBackward("scale".to_string()),
+        grad_output.numel(),
+    );
     assert_eq!(grad_output.precision(), Precision::FP32);
 
     let count = grad_output.numel();
     let grad_input = Tensor::zeros(grad_output.shape(), Precision::FP32);
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
+    let scalar_buf = slice_buffer(&[scalar]);
+    let count_buf = slice_buffer(&[count as u32]);
+    let (grid, threadgroup) = threadgroup_1d(&pipelines.scale_backward, count);
 
-    let scalar_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&scalar as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<f32>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create scalar buffer");
-
-    let count_u32: u32 = count as u32;
-    let count_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<u32>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create count buffer");
-
-    let grad_output_buf = grad_output.buffer();
-    let grad_input_buf = grad_input.buffer();
-
-    let thread_width = pipelines.scale_backward.threadExecutionWidth();
-    let grid_size = MTLSize { width: count, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-
-    CommandBatch::dispatch(
+    dispatch(
         &pipelines.scale_backward,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&scalar_buffer), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(grad_output),
+            BufferBinding::from(&grad_input),
+            BufferBinding::from(&scalar_buf),
+            BufferBinding::from(&count_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     grad_input
@@ -175,36 +99,19 @@ fn dispatch_unary_backward(
     let count = input.numel();
     let grad_input = Tensor::zeros(input.shape(), Precision::FP32);
 
-    let ctx = MetalContext::global();
+    let count_buf = slice_buffer(&[count as u32]);
+    let (grid, threadgroup) = threadgroup_1d(pipeline, count);
 
-    let count_u32: u32 = count as u32;
-    let count_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<u32>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create count buffer");
-
-    let grad_output_buf = grad_output.buffer();
-    let input_buf = input.buffer();
-    let grad_input_buf = grad_input.buffer();
-
-    let thread_width = pipeline.threadExecutionWidth();
-    let grid_size = MTLSize { width: count, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-
-    CommandBatch::dispatch(
+    dispatch(
         pipeline,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(grad_output),
+            BufferBinding::from(input),
+            BufferBinding::from(&grad_input),
+            BufferBinding::from(&count_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     grad_input
@@ -212,26 +119,38 @@ fn dispatch_unary_backward(
 
 /// Backward pass for SiLU activation
 pub fn silu_backward(grad_output: &Tensor, input: &Tensor) -> Tensor {
-    let _timer = timed(OpCategory::ElementwiseBackward("silu".to_string()), grad_output.numel());
+    let _timer = timed(
+        OpCategory::ElementwiseBackward("silu".to_string()),
+        grad_output.numel(),
+    );
     dispatch_unary_backward(&get_pipelines().silu_backward, grad_output, input)
 }
 
 /// Backward pass for GELU activation
 pub fn gelu_backward(grad_output: &Tensor, input: &Tensor) -> Tensor {
-    let _timer = timed(OpCategory::ElementwiseBackward("gelu".to_string()), grad_output.numel());
+    let _timer = timed(
+        OpCategory::ElementwiseBackward("gelu".to_string()),
+        grad_output.numel(),
+    );
     dispatch_unary_backward(&get_pipelines().gelu_backward, grad_output, input)
 }
 
 /// Backward pass for ReLU activation
 pub fn relu_backward(grad_output: &Tensor, input: &Tensor) -> Tensor {
-    let _timer = timed(OpCategory::ElementwiseBackward("relu".to_string()), grad_output.numel());
+    let _timer = timed(
+        OpCategory::ElementwiseBackward("relu".to_string()),
+        grad_output.numel(),
+    );
     dispatch_unary_backward(&get_pipelines().relu_backward, grad_output, input)
 }
 
 /// Backward pass for SwiGLU
 /// Returns (grad_gate, grad_up)
 pub fn swiglu_backward(grad_output: &Tensor, gate: &Tensor, up: &Tensor) -> (Tensor, Tensor) {
-    let _timer = timed(OpCategory::ElementwiseBackward("swiglu".to_string()), grad_output.numel());
+    let _timer = timed(
+        OpCategory::ElementwiseBackward("swiglu".to_string()),
+        grad_output.numel(),
+    );
     assert_eq!(grad_output.precision(), Precision::FP32);
     assert_eq!(gate.precision(), Precision::FP32);
     assert_eq!(up.precision(), Precision::FP32);
@@ -242,41 +161,22 @@ pub fn swiglu_backward(grad_output: &Tensor, gate: &Tensor, up: &Tensor) -> (Ten
     let grad_gate = Tensor::zeros(gate.shape(), Precision::FP32);
     let grad_up = Tensor::zeros(up.shape(), Precision::FP32);
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
+    let count_buf = slice_buffer(&[count as u32]);
+    let (grid, threadgroup) = threadgroup_1d(&pipelines.swiglu_backward, count);
 
-    let count_u32: u32 = count as u32;
-    let count_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<u32>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create count buffer");
-
-    let grad_output_buf = grad_output.buffer();
-    let gate_buf = gate.buffer();
-    let up_buf = up.buffer();
-    let grad_gate_buf = grad_gate.buffer();
-    let grad_up_buf = grad_up.buffer();
-
-    let thread_width = pipelines.swiglu_backward.threadExecutionWidth();
-    let grid_size = MTLSize { width: count, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: thread_width.min(count), height: 1, depth: 1 };
-
-    CommandBatch::dispatch(
+    dispatch(
         &pipelines.swiglu_backward,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(gate_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(up_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(grad_gate_buf), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(grad_up_buf), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 5);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(grad_output),
+            BufferBinding::from(gate),
+            BufferBinding::from(up),
+            BufferBinding::from(&grad_gate),
+            BufferBinding::from(&grad_up),
+            BufferBinding::from(&count_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     (grad_gate, grad_up)
@@ -285,7 +185,6 @@ pub fn swiglu_backward(grad_output: &Tensor, gate: &Tensor, up: &Tensor) -> (Ten
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn numerical_gradient<F>(f: F, x: &[f32], eps: f32) -> Vec<f32>
     where
@@ -327,7 +226,9 @@ mod tests {
             assert!(
                 (result[i] - numerical).abs() < 1e-3,
                 "SiLU backward mismatch at {}: analytical={}, numerical={}",
-                i, result[i], numerical
+                i,
+                result[i],
+                numerical
             );
         }
     }

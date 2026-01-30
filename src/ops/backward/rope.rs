@@ -1,58 +1,15 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
-
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, params_buffer, threadgroup_3d, BufferBinding};
+use crate::ops::params::RoPEParams;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const BACKWARD_ROPE_SHADER: &str = include_str!("../../shaders/backward/rope.metal");
+const SHADER: &str = include_str!("../../shaders/backward/rope.metal");
 
-#[repr(C)]
-struct RoPEParams {
-    batch_size: u32,
-    seq_len: u32,
-    num_heads: u32,
-    head_dim: u32,
-    base: f32,
-    position_offset: u32,
-}
-
-struct RoPEBackwardPipelines {
-    rope_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static ROPE_BACKWARD_PIPELINES: OnceLock<RoPEBackwardPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static RoPEBackwardPipelines {
-    ROPE_BACKWARD_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(BACKWARD_ROPE_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile backward rope shader: {e}"));
-
-        let func = library
-            .newFunctionWithName(&objc2_foundation::NSString::from_str("rope_backward_f32"))
-            .expect("rope_backward_f32 function not found");
-
-        let rope_backward = device
-            .newComputePipelineStateWithFunction_error(&func)
-            .expect("Failed to create rope_backward pipeline");
-
-        RoPEBackwardPipelines { rope_backward }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "backward/rope", {
+    rope_backward => "rope_backward_f32",
+});
 
 /// RoPE backward pass
 /// The backward of rotation is the inverse rotation (transpose)
@@ -76,51 +33,32 @@ pub fn rope_backward(grad_output: &Tensor, base: f32, position_offset: usize) ->
         return grad_input;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
-
-    let params = RoPEParams {
+    let params_buf = params_buffer(&RoPEParams {
         batch_size: batch_size as u32,
         seq_len: seq_len as u32,
         num_heads: num_heads as u32,
         head_dim: head_dim as u32,
         base,
         position_offset: position_offset as u32,
-    };
-    let params_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&params as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<RoPEParams>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create params buffer");
+    });
 
-    let grad_output_buf = grad_output.buffer();
-    let grad_input_buf = grad_input.buffer();
-
-    let grid_size = MTLSize {
-        width: head_dim / 2,
-        height: seq_len,
-        depth: batch_size * num_heads,
-    };
-    let thread_width = pipelines.rope_backward.threadExecutionWidth();
-    let max_threads = pipelines.rope_backward.maxTotalThreadsPerThreadgroup();
-    let threadgroup_size = MTLSize {
-        width: thread_width.min(head_dim / 2),
-        height: (max_threads / thread_width).min(seq_len).max(1),
-        depth: 1,
-    };
-
-    CommandBatch::dispatch(
+    let (grid, threadgroup) = threadgroup_3d(
         &pipelines.rope_backward,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(grad_input_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-        },
-        grid_size,
-        threadgroup_size,
+        head_dim / 2,
+        seq_len,
+        batch_size * num_heads,
+    );
+
+    dispatch(
+        &pipelines.rope_backward,
+        [
+            BufferBinding::from(grad_output),
+            BufferBinding::from(&grad_input),
+            BufferBinding::from(&params_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     grad_input
@@ -184,17 +122,28 @@ mod tests {
             .map(|i| i as f32 + 1.0)
             .collect();
 
-        let grad_out = Tensor::from_f32_slice(&grad_out_data, &[batch, seq_len, num_heads, head_dim]);
+        let grad_out =
+            Tensor::from_f32_slice(&grad_out_data, &[batch, seq_len, num_heads, head_dim]);
         let grad_input = rope_backward(&grad_out, 10000.0, 0);
 
         let result = grad_input.as_f32_slice();
-        let expected = reference_rope_backward(&grad_out_data, batch, seq_len, num_heads, head_dim, 10000.0, 0);
+        let expected = reference_rope_backward(
+            &grad_out_data,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+            10000.0,
+            0,
+        );
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (r - e).abs() < 1e-5,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -218,7 +167,8 @@ mod tests {
 
         // Backward with identity gradient
         let grad_out = output.as_f32_slice().to_vec();
-        let grad_out_tensor = Tensor::from_f32_slice(&grad_out, &[batch, seq_len, num_heads, head_dim]);
+        let grad_out_tensor =
+            Tensor::from_f32_slice(&grad_out, &[batch, seq_len, num_heads, head_dim]);
         let recovered = rope_backward(&grad_out_tensor, 10000.0, 0);
 
         // Should recover original input
@@ -227,7 +177,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-4,
                 "Roundtrip mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }

@@ -1,54 +1,15 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
-
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, params_buffer, slice_buffer, threadgroup_2d, BufferBinding};
+use crate::ops::params::EmbeddingParams;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const EMBEDDING_SHADER: &str = include_str!("../shaders/embedding.metal");
+const SHADER: &str = include_str!("../shaders/embedding.metal");
 
-#[repr(C)]
-struct EmbeddingParams {
-    num_indices: u32,
-    embed_dim: u32,
-}
-
-struct EmbeddingPipelines {
-    embedding: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static EMBEDDING_PIPELINES: OnceLock<EmbeddingPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static EmbeddingPipelines {
-    EMBEDDING_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(EMBEDDING_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile embedding shader: {e}"));
-
-        let func = library
-            .newFunctionWithName(&objc2_foundation::NSString::from_str("embedding_f32"))
-            .expect("embedding_f32 function not found");
-
-        let embedding = device
-            .newComputePipelineStateWithFunction_error(&func)
-            .expect("Failed to create embedding pipeline");
-
-        EmbeddingPipelines { embedding }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "embedding", {
+    embedding => "embedding_f32",
+});
 
 /// Embedding lookup: output[i] = weights[indices[i]]
 ///
@@ -66,10 +27,13 @@ pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
     } else {
         weights.clone()
     };
-    let weights = &weights;
 
     let weights_shape = weights.shape();
-    assert_eq!(weights_shape.len(), 2, "Weights must be 2D [vocab_size, embed_dim]");
+    assert_eq!(
+        weights_shape.len(),
+        2,
+        "Weights must be 2D [vocab_size, embed_dim]"
+    );
 
     let vocab_size = weights_shape[0];
     let embed_dim = weights_shape[1];
@@ -79,7 +43,9 @@ pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
         assert!(
             (idx as usize) < vocab_size,
             "Index {} at position {} is out of bounds for vocab_size {}",
-            idx, i, vocab_size
+            idx,
+            i,
+            vocab_size
         );
     }
 
@@ -90,58 +56,25 @@ pub fn embedding(weights: &Tensor, indices: &[u32]) -> Tensor {
         return output;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
-
-    // Create buffer for indices
-    let indices_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(indices.as_ptr() as *mut _).unwrap(),
-            std::mem::size_of_val(indices),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create indices buffer");
-
-    let params = EmbeddingParams {
+    let indices_buf = slice_buffer(indices);
+    let params_buf = params_buffer(&EmbeddingParams {
         num_indices: num_indices as u32,
         embed_dim: embed_dim as u32,
-    };
-    let params_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&params as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<EmbeddingParams>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create params buffer");
+    });
 
-    let weights_buf = weights.buffer();
-    let output_buf = output.buffer();
+    let (grid, threadgroup) = threadgroup_2d(&pipelines.embedding, embed_dim, num_indices);
 
-    let grid_size = MTLSize {
-        width: embed_dim,
-        height: num_indices,
-        depth: 1,
-    };
-    let thread_width = pipelines.embedding.threadExecutionWidth();
-    let max_threads = pipelines.embedding.maxTotalThreadsPerThreadgroup();
-    let threadgroup_size = MTLSize {
-        width: thread_width.min(embed_dim),
-        height: (max_threads / thread_width).min(num_indices),
-        depth: 1,
-    };
-
-    CommandBatch::dispatch(
+    dispatch(
         &pipelines.embedding,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(weights_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(&indices_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(&weights),
+            BufferBinding::from(&indices_buf),
+            BufferBinding::from(&output),
+            BufferBinding::from(&params_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     output
@@ -155,9 +88,9 @@ mod tests {
     fn test_embedding_simple() {
         // weights: 3 tokens, 4 dimensions each
         let weights_data = vec![
-            1.0, 2.0, 3.0, 4.0,     // token 0
-            5.0, 6.0, 7.0, 8.0,     // token 1
-            9.0, 10.0, 11.0, 12.0,  // token 2
+            1.0, 2.0, 3.0, 4.0, // token 0
+            5.0, 6.0, 7.0, 8.0, // token 1
+            9.0, 10.0, 11.0, 12.0, // token 2
         ];
         let weights = Tensor::from_f32_slice(&weights_data, &[3, 4]);
 
@@ -178,8 +111,8 @@ mod tests {
     #[test]
     fn test_embedding_repeated_indices() {
         let weights_data = vec![
-            1.0, 2.0,  // token 0
-            3.0, 4.0,  // token 1
+            1.0, 2.0, // token 0
+            3.0, 4.0, // token 1
         ];
         let weights = Tensor::from_f32_slice(&weights_data, &[2, 2]);
 
@@ -222,7 +155,10 @@ mod tests {
                 assert!(
                     (actual - expected).abs() < 1e-5,
                     "Mismatch at seq_pos={}, dim={}: expected {}, got {}",
-                    seq_pos, dim, expected, actual
+                    seq_pos,
+                    dim,
+                    expected,
+                    actual
                 );
             }
         }

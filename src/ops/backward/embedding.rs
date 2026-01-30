@@ -1,54 +1,15 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
-
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, params_buffer, slice_buffer, threadgroup_2d, BufferBinding};
+use crate::ops::params::EmbeddingParams;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const BACKWARD_EMBEDDING_SHADER: &str = include_str!("../../shaders/backward/embedding.metal");
+const SHADER: &str = include_str!("../../shaders/backward/embedding.metal");
 
-#[repr(C)]
-struct EmbeddingParams {
-    num_indices: u32,
-    embed_dim: u32,
-}
-
-struct EmbeddingBackwardPipelines {
-    embedding_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static EMBEDDING_BACKWARD_PIPELINES: OnceLock<EmbeddingBackwardPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static EmbeddingBackwardPipelines {
-    EMBEDDING_BACKWARD_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(BACKWARD_EMBEDDING_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile backward embedding shader: {e}"));
-
-        let func = library
-            .newFunctionWithName(&objc2_foundation::NSString::from_str("embedding_backward_f32"))
-            .expect("embedding_backward_f32 function not found");
-
-        let embedding_backward = device
-            .newComputePipelineStateWithFunction_error(&func)
-            .expect("Failed to create embedding_backward pipeline");
-
-        EmbeddingBackwardPipelines { embedding_backward }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "backward/embedding", {
+    embedding_backward => "embedding_backward_f32",
+});
 
 /// Embedding backward pass
 /// Accumulates gradients into grad_weights at positions specified by indices
@@ -57,11 +18,7 @@ fn get_pipelines() -> &'static EmbeddingBackwardPipelines {
 /// indices: [num_indices]
 /// vocab_size: size of vocabulary
 /// Returns: grad_weights [vocab_size, embed_dim]
-pub fn embedding_backward(
-    grad_output: &Tensor,
-    indices: &[u32],
-    vocab_size: usize,
-) -> Tensor {
+pub fn embedding_backward(grad_output: &Tensor, indices: &[u32], vocab_size: usize) -> Tensor {
     let _timer = timed(OpCategory::EmbeddingBackward, grad_output.numel());
     assert_eq!(grad_output.precision(), Precision::FP32);
 
@@ -80,58 +37,25 @@ pub fn embedding_backward(
         return grad_weights;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
-
-    // Create indices buffer
-    let indices_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(indices.as_ptr() as *mut _).unwrap(),
-            std::mem::size_of_val(indices),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create indices buffer");
-
-    let params = EmbeddingParams {
+    let indices_buf = slice_buffer(indices);
+    let params_buf = params_buffer(&EmbeddingParams {
         num_indices: num_indices as u32,
         embed_dim: embed_dim as u32,
-    };
-    let params_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&params as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<EmbeddingParams>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create params buffer");
+    });
 
-    let grad_output_buf = grad_output.buffer();
-    let grad_weights_buf = grad_weights.buffer();
+    let (grid, threadgroup) = threadgroup_2d(&pipelines.embedding_backward, embed_dim, num_indices);
 
-    let grid_size = MTLSize {
-        width: embed_dim,
-        height: num_indices,
-        depth: 1,
-    };
-    let thread_width = pipelines.embedding_backward.threadExecutionWidth();
-    let max_threads = pipelines.embedding_backward.maxTotalThreadsPerThreadgroup();
-    let threadgroup_size = MTLSize {
-        width: thread_width.min(embed_dim),
-        height: (max_threads / thread_width).min(num_indices).max(1),
-        depth: 1,
-    };
-
-    CommandBatch::dispatch(
+    dispatch(
         &pipelines.embedding_backward,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(&indices_buffer), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(grad_weights_buf), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(grad_output),
+            BufferBinding::from(&indices_buf),
+            BufferBinding::from(&grad_weights),
+            BufferBinding::from(&params_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     grad_weights
@@ -140,7 +64,6 @@ pub fn embedding_backward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[test]
     fn test_embedding_backward_simple() {
@@ -149,13 +72,13 @@ mod tests {
 
         // grad_output for 3 tokens
         let grad_out_data = vec![
-            1.0, 2.0, 3.0, 4.0,  // token at pos 0
-            5.0, 6.0, 7.0, 8.0,  // token at pos 1
-            9.0, 10.0, 11.0, 12.0,  // token at pos 2
+            1.0, 2.0, 3.0, 4.0, // token at pos 0
+            5.0, 6.0, 7.0, 8.0, // token at pos 1
+            9.0, 10.0, 11.0, 12.0, // token at pos 2
         ];
         let grad_out = Tensor::from_f32_slice(&grad_out_data, &[3, embed_dim]);
 
-        let indices = vec![0u32, 2, 0];  // token 0 appears twice
+        let indices = vec![0u32, 2, 0]; // token 0 appears twice
 
         let grad_weights = embedding_backward(&grad_out, &indices, vocab_size);
 
@@ -206,7 +129,9 @@ mod tests {
             assert!(
                 (result[i] - expected[i]).abs() < 1e-4,
                 "Mismatch at {}: expected {}, got {}",
-                i, expected[i], result[i]
+                i,
+                expected[i],
+                result[i]
             );
         }
     }

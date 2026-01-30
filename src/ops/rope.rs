@@ -1,58 +1,15 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
-
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, params_buffer, threadgroup_3d, BufferBinding};
+use crate::ops::params::RoPEParams;
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const ROPE_SHADER: &str = include_str!("../shaders/rope.metal");
+const SHADER: &str = include_str!("../shaders/rope.metal");
 
-#[repr(C)]
-struct RoPEParams {
-    batch_size: u32,
-    seq_len: u32,
-    num_heads: u32,
-    head_dim: u32,
-    base: f32,
-    position_offset: u32,
-}
-
-struct RoPEPipelines {
-    rope: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static ROPE_PIPELINES: OnceLock<RoPEPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static RoPEPipelines {
-    ROPE_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(ROPE_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile RoPE shader: {e}"));
-
-        let func = library
-            .newFunctionWithName(&objc2_foundation::NSString::from_str("rope_f32"))
-            .expect("rope_f32 function not found");
-
-        let rope = device
-            .newComputePipelineStateWithFunction_error(&func)
-            .expect("Failed to create RoPE pipeline");
-
-        RoPEPipelines { rope }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "rope", {
+    rope => "rope_f32",
+});
 
 /// Apply RoPE (Rotary Position Embedding) to input tensor
 ///
@@ -67,14 +24,22 @@ pub fn rope(input: &Tensor, base: f32, position_offset: usize) -> Tensor {
     assert_eq!(input.precision(), Precision::FP32);
 
     let shape = input.shape();
-    assert_eq!(shape.len(), 4, "Input must be 4D [batch, seq_len, num_heads, head_dim]");
+    assert_eq!(
+        shape.len(),
+        4,
+        "Input must be 4D [batch, seq_len, num_heads, head_dim]"
+    );
 
     let batch_size = shape[0];
     let seq_len = shape[1];
     let num_heads = shape[2];
     let head_dim = shape[3];
 
-    assert!(head_dim.is_multiple_of(2), "head_dim must be even, got {}", head_dim);
+    assert!(
+        head_dim.is_multiple_of(2),
+        "head_dim must be even, got {}",
+        head_dim
+    );
 
     let output = Tensor::zeros(shape, Precision::FP32);
 
@@ -82,51 +47,28 @@ pub fn rope(input: &Tensor, base: f32, position_offset: usize) -> Tensor {
         return output;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
-
-    let params = RoPEParams {
+    let params_buf = params_buffer(&RoPEParams {
         batch_size: batch_size as u32,
         seq_len: seq_len as u32,
         num_heads: num_heads as u32,
         head_dim: head_dim as u32,
         base,
         position_offset: position_offset as u32,
-    };
-    let params_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&params as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<RoPEParams>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create params buffer");
+    });
 
-    let input_buf = input.buffer();
-    let output_buf = output.buffer();
+    let (grid, threadgroup) =
+        threadgroup_3d(&pipelines.rope, head_dim / 2, seq_len, batch_size * num_heads);
 
-    let grid_size = MTLSize {
-        width: head_dim / 2,
-        height: seq_len,
-        depth: batch_size * num_heads,
-    };
-    let thread_width = pipelines.rope.threadExecutionWidth();
-    let max_threads = pipelines.rope.maxTotalThreadsPerThreadgroup();
-    let threadgroup_size = MTLSize {
-        width: thread_width.min(head_dim / 2),
-        height: (max_threads / thread_width).min(seq_len).max(1),
-        depth: 1,
-    };
-
-    CommandBatch::dispatch(
+    dispatch(
         &pipelines.rope,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 2);
-        },
-        grid_size,
-        threadgroup_size,
+        [
+            BufferBinding::from(input),
+            BufferBinding::from(&output),
+            BufferBinding::from(&params_buf),
+        ],
+        grid,
+        threadgroup,
     );
 
     output
@@ -203,7 +145,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-5,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -231,7 +175,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-5,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -257,7 +203,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-4,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -278,13 +226,23 @@ mod tests {
         let output = rope(&input, 10000.0, position_offset);
 
         let result = output.as_f32_slice();
-        let expected = reference_rope(&input_data, batch, seq_len, num_heads, head_dim, 10000.0, position_offset);
+        let expected = reference_rope(
+            &input_data,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+            10000.0,
+            position_offset,
+        );
 
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (r - e).abs() < 1e-4,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }

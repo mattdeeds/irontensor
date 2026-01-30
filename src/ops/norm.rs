@@ -1,62 +1,20 @@
-use std::ptr::NonNull;
-use std::sync::OnceLock;
+use objc2_metal::{MTLComputePipelineState, MTLSize};
 
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
-
-use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch, dispatch_threadgroups, params_buffer, BufferBinding};
+use crate::ops::params::RMSNormParams;
 use crate::error::{TensorError, TensorResult};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const NORM_SHADER: &str = include_str!("../shaders/norm.metal");
+const SHADER: &str = include_str!("../shaders/norm.metal");
 const RMSNORM_THREADS: usize = 256;
 
-#[repr(C)]
-struct RMSNormParams {
-    batch_seq: u32,
-    hidden_dim: u32,
-    eps: f32,
-}
-
-struct NormPipelines {
-    rmsnorm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    rmsnorm_fast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static NORM_PIPELINES: OnceLock<NormPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static NormPipelines {
-    NORM_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(NORM_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile norm shader: {e}"));
-
-        let make_pipeline = |name: &str| {
-            let func = library
-                .newFunctionWithName(&objc2_foundation::NSString::from_str(name))
-                .unwrap_or_else(|| panic!("{} function not found", name));
-            device
-                .newComputePipelineStateWithFunction_error(&func)
-                .unwrap_or_else(|e| panic!("Failed to create {} pipeline: {e}", name))
-        };
-
-        NormPipelines {
-            rmsnorm: make_pipeline("rmsnorm_f32"),
-            rmsnorm_fast: make_pipeline("rmsnorm_fast_f32"),
-        }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "norm", {
+    rmsnorm => "rmsnorm_f32",
+    rmsnorm_fast => "rmsnorm_fast_f32",
+});
 
 /// RMSNorm: output = (x / sqrt(mean(x^2) + eps)) * gamma
 ///
@@ -77,7 +35,11 @@ pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> TensorResult<Tensor>
         return Err(TensorError::PrecisionMismatch {
             operation: "rmsnorm",
             expected: "FP32",
-            got: if input.precision() == Precision::BF16 { "BF16" } else { "unknown" },
+            got: if input.precision() == Precision::BF16 {
+                "BF16"
+            } else {
+                "unknown"
+            },
         });
     }
 
@@ -110,29 +72,15 @@ pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> TensorResult<Tensor>
 
     let output = Tensor::zeros(shape, Precision::FP32);
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
-
-    let params = RMSNormParams {
+    let params_buf = params_buffer(&RMSNormParams {
         batch_seq: batch_seq as u32,
         hidden_dim: hidden_dim as u32,
         eps,
-    };
-    let params_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&params as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<RMSNormParams>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create params buffer");
+    });
 
     // Use fast kernel for larger hidden dimensions
     let use_fast = hidden_dim >= RMSNORM_THREADS;
-
-    let input_buf = input.buffer();
-    let gamma_buf = gamma.buffer();
-    let output_buf = output.buffer();
 
     if use_fast {
         let threadgroup_count = MTLSize {
@@ -146,38 +94,38 @@ pub fn rmsnorm(input: &Tensor, gamma: &Tensor, eps: f32) -> TensorResult<Tensor>
             depth: 1,
         };
 
-        CommandBatch::dispatch_threadgroups(
+        dispatch_threadgroups(
             &pipelines.rmsnorm_fast,
-            |encoder| unsafe {
-                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-            },
+            [
+                BufferBinding::from(input),
+                BufferBinding::from(gamma),
+                BufferBinding::from(&output),
+                BufferBinding::from(&params_buf),
+            ],
             threadgroup_count,
             threadgroup_size,
         );
     } else {
+        let max_threads = pipelines.rmsnorm.threadExecutionWidth() as usize;
         let grid_size = MTLSize {
             width: batch_seq,
             height: 1,
             depth: 1,
         };
-        let max_threads = pipelines.rmsnorm.threadExecutionWidth();
         let threadgroup_size = MTLSize {
             width: max_threads.min(batch_seq),
             height: 1,
             depth: 1,
         };
 
-        CommandBatch::dispatch(
+        dispatch(
             &pipelines.rmsnorm,
-            |encoder| unsafe {
-                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(gamma_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(output_buf), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(&params_buffer), 0, 3);
-            },
+            [
+                BufferBinding::from(input),
+                BufferBinding::from(gamma),
+                BufferBinding::from(&output),
+                BufferBinding::from(&params_buf),
+            ],
             grid_size,
             threadgroup_size,
         );
@@ -232,7 +180,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-5,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -259,7 +209,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-4,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }
@@ -273,7 +225,9 @@ mod tests {
         let input_data: Vec<f32> = (0..(batch * seq_len * hidden_dim))
             .map(|i| ((i % 100) as f32 - 50.0) * 0.01)
             .collect();
-        let gamma_data: Vec<f32> = (0..hidden_dim).map(|i| 1.0 + (i as f32).sin() * 0.1).collect();
+        let gamma_data: Vec<f32> = (0..hidden_dim)
+            .map(|i| 1.0 + (i as f32).sin() * 0.1)
+            .collect();
         let eps = 1e-5;
 
         let input = Tensor::from_f32_slice(&input_data, &[batch, seq_len, hidden_dim]);
@@ -288,7 +242,9 @@ mod tests {
             assert!(
                 (r - e).abs() < 1e-3,
                 "Mismatch at {}: expected {}, got {}",
-                i, e, r
+                i,
+                e,
+                r
             );
         }
     }

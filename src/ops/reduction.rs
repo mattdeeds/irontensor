@@ -15,55 +15,21 @@
 //! - Single large tensor reductions where dispatch overhead is amortized
 //! - Reference implementation for future optimization attempts
 
-use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::ns_string;
-use objc2_metal::{
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
-};
+use objc2_metal::MTLSize;
 
 use crate::command_batch::CommandBatch;
-use crate::device::MetalContext;
+use crate::define_pipelines;
+use crate::ops::kernel::{dispatch_threadgroups, slice_buffer, BufferBinding};
 use crate::precision::Precision;
 use crate::profile::{timed, OpCategory};
 use crate::tensor::Tensor;
 
-const REDUCTION_SHADER: &str = include_str!("../shaders/reduction.metal");
+const SHADER: &str = include_str!("../shaders/reduction.metal");
 const THREADGROUP_SIZE: usize = 256;
 
-struct ReductionPipelines {
-    sum_squares: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-}
-
-static REDUCTION_PIPELINES: OnceLock<ReductionPipelines> = OnceLock::new();
-
-fn get_pipelines() -> &'static ReductionPipelines {
-    REDUCTION_PIPELINES.get_or_init(|| {
-        let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        let library = device
-            .newLibraryWithSource_options_error(ns_string!(REDUCTION_SHADER), None)
-            .unwrap_or_else(|e| panic!("Failed to compile reduction shader: {e}"));
-
-        let make_pipeline = |name: &str| {
-            let func = library
-                .newFunctionWithName(&objc2_foundation::NSString::from_str(name))
-                .unwrap_or_else(|| panic!("{} function not found", name));
-            device
-                .newComputePipelineStateWithFunction_error(&func)
-                .unwrap_or_else(|e| panic!("Failed to create {} pipeline: {e}", name))
-        };
-
-        ReductionPipelines {
-            sum_squares: make_pipeline("sum_squares_f32"),
-        }
-    })
-}
+define_pipelines!(Pipelines, SHADER, "reduction", {
+    sum_squares => "sum_squares_f32",
+});
 
 /// Compute the sum of squares of all elements in a tensor (GPU-accelerated).
 ///
@@ -76,47 +42,34 @@ pub fn sum_squares_gpu(input: &Tensor) -> f32 {
         return 0.0;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
 
     // Calculate number of threadgroups needed
-    let num_threadgroups = count.div_ceil(THREADGROUP_SIZE);
-    let num_threadgroups = num_threadgroups.max(1);
+    let num_threadgroups = count.div_ceil(THREADGROUP_SIZE).max(1);
 
     // Create buffer for partial sums (one per threadgroup)
     let partial_sums = Tensor::zeros(&[num_threadgroups], Precision::FP32);
-
-    let count_u32 = count as u32;
-    let count_buffer = unsafe {
-        ctx.device().newBufferWithBytes_length_options(
-            NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-            std::mem::size_of::<u32>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }
-    .expect("Failed to create count buffer");
-
-    let input_buf = input.buffer();
-    let partial_buf = partial_sums.buffer();
+    let count_buf = slice_buffer(&[count as u32]);
 
     let threadgroup_size = MTLSize {
         width: THREADGROUP_SIZE,
         height: 1,
         depth: 1,
     };
+    let threadgroup_count = MTLSize {
+        width: num_threadgroups,
+        height: 1,
+        depth: 1,
+    };
 
-    CommandBatch::dispatch_threadgroups(
+    dispatch_threadgroups(
         &pipelines.sum_squares,
-        |encoder| unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(partial_buf), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-        },
-        MTLSize {
-            width: num_threadgroups,
-            height: 1,
-            depth: 1,
-        },
+        [
+            BufferBinding::from(input),
+            BufferBinding::from(&partial_sums),
+            BufferBinding::from(&count_buf),
+        ],
+        threadgroup_count,
         threadgroup_size,
     );
 
@@ -124,8 +77,7 @@ pub fn sum_squares_gpu(input: &Tensor) -> f32 {
     CommandBatch::sync();
 
     // Sum partial results on CPU (small number, typically < 1000)
-    let partial_data = partial_sums.as_f32_slice();
-    partial_data.iter().sum()
+    partial_sums.as_f32_slice().iter().sum()
 }
 
 /// Compute the L2 norm of a tensor: sqrt(sum(x^2))
@@ -149,12 +101,17 @@ pub fn total_l2_norm_gpu(tensors: &[&Tensor]) -> f32 {
         return 0.0;
     }
 
-    let ctx = MetalContext::global();
     let pipelines = get_pipelines();
 
     // Pre-allocate partial sum buffers for all tensors
     // We'll dispatch all kernels first, then sync once and read all results
     let mut partial_buffers: Vec<Tensor> = Vec::with_capacity(tensors.len());
+
+    let threadgroup_size = MTLSize {
+        width: THREADGROUP_SIZE,
+        height: 1,
+        depth: 1,
+    };
 
     // Phase 1: Dispatch all GPU kernels without syncing
     for input in tensors {
@@ -163,42 +120,24 @@ pub fn total_l2_norm_gpu(tensors: &[&Tensor]) -> f32 {
             continue;
         }
 
-        let num_threadgroups = count.div_ceil(THREADGROUP_SIZE);
-        let num_threadgroups = num_threadgroups.max(1);
-
+        let num_threadgroups = count.div_ceil(THREADGROUP_SIZE).max(1);
         let partial_sums = Tensor::zeros(&[num_threadgroups], Precision::FP32);
+        let count_buf = slice_buffer(&[count as u32]);
 
-        let count_u32 = count as u32;
-        let count_buffer = unsafe {
-            ctx.device().newBufferWithBytes_length_options(
-                NonNull::new(&count_u32 as *const _ as *mut _).unwrap(),
-                std::mem::size_of::<u32>(),
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .expect("Failed to create count buffer");
-
-        let input_buf = input.buffer();
-        let partial_buf = partial_sums.buffer();
-
-        let threadgroup_size = MTLSize {
-            width: THREADGROUP_SIZE,
+        let threadgroup_count = MTLSize {
+            width: num_threadgroups,
             height: 1,
             depth: 1,
         };
 
-        CommandBatch::dispatch_threadgroups(
+        dispatch_threadgroups(
             &pipelines.sum_squares,
-            |encoder| unsafe {
-                encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(partial_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 2);
-            },
-            MTLSize {
-                width: num_threadgroups,
-                height: 1,
-                depth: 1,
-            },
+            [
+                BufferBinding::from(*input),
+                BufferBinding::from(&partial_sums),
+                BufferBinding::from(&count_buf),
+            ],
+            threadgroup_count,
             threadgroup_size,
         );
 
@@ -212,8 +151,7 @@ pub fn total_l2_norm_gpu(tensors: &[&Tensor]) -> f32 {
     // Phase 3: Read all partial sums and compute final result on CPU
     let mut total_sum_sq = 0.0f32;
     for partial_sums in &partial_buffers {
-        let partial_data = partial_sums.as_f32_slice();
-        total_sum_sq += partial_data.iter().sum::<f32>();
+        total_sum_sq += partial_sums.as_f32_slice().iter().sum::<f32>();
     }
 
     total_sum_sq.sqrt()
