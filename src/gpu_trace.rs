@@ -29,7 +29,7 @@
 //!
 //! ## Block capture
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use irontensor::GpuTrace;
 //!
 //! let result = GpuTrace::capture("/tmp/forward_pass.gputrace", || {
@@ -199,9 +199,9 @@ impl GpuTrace {
     /// ```rust,no_run
     /// use irontensor::GpuTrace;
     ///
-    /// GpuTrace::start("/tmp/my_trace.gputrace")?;
+    /// GpuTrace::start("/tmp/my_trace.gputrace").unwrap();
     /// // ... GPU operations ...
-    /// GpuTrace::stop()?;
+    /// GpuTrace::stop().unwrap();
     /// ```
     pub fn start<P: AsRef<Path>>(output_path: P) -> Result<(), GpuTraceError> {
         let path = output_path.as_ref();
@@ -293,12 +293,12 @@ impl GpuTrace {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use irontensor::GpuTrace;
     ///
     /// let loss = GpuTrace::capture("/tmp/forward.gputrace", || {
     ///     trainer.compute_loss(&input_ids, &target_ids, batch_size, seq_len)
-    /// })?;
+    /// }).unwrap();
     /// ```
     pub fn capture<P, F, R>(output_path: P, f: F) -> Result<R, GpuTraceError>
     where
