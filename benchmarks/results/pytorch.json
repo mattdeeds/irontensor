@@ -1,0 +1,49 @@
+{
+  "framework": "pytorch",
+  "model": "tiny",
+  "model_config": {
+    "vocab_size": 32000,
+    "hidden_dim": 256,
+    "num_layers": 4,
+    "num_heads": 4,
+    "num_kv_heads": 4,
+    "intermediate_dim": 512,
+    "max_seq_len": 512
+  },
+  "model_params": 10815744,
+  "device": "mps",
+  "precision": "fp32",
+  "training": {
+    "avg_step_time_ms": 195.8631482743658,
+    "median_step_time_ms": 183.47754201386124,
+    "min_step_time_ms": 167.81537502538413,
+    "max_step_time_ms": 283.04358304012567,
+    "avg_tokens_per_sec": 20912.56081650596,
+    "final_loss": 52.65162658691406,
+    "initial_loss": 248.2779998779297,
+    "peak_memory_bytes": 3839967232,
+    "current_memory_bytes": 656564480,
+    "timed_steps": 50,
+    "warmup_steps": 5,
+    "batch_size": 16,
+    "seq_len": 256
+  },
+  "inference": [
+    {
+      "prompt_length": 5,
+      "generated_tokens": 100,
+      "ttft_ms": 39.85050006303936,
+      "total_time_ms": 2011.9822500273585,
+      "tokens_per_sec": 49.7022277401504,
+      "inter_token_latency_ms": 19.917170042078002
+    },
+    {
+      "prompt_length": 20,
+      "generated_tokens": 100,
+      "ttft_ms": 7.266583968885243,
+      "total_time_ms": 965.2392088901252,
+      "tokens_per_sec": 103.60126182087488,
+      "inter_token_latency_ms": 9.673470125599492
+    }
+  ]
+}

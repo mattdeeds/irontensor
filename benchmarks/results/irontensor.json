@@ -1,0 +1,49 @@
+{
+  "device": "Apple M3 Pro",
+  "framework": "irontensor",
+  "inference": [
+    {
+      "generated_tokens": 100,
+      "inter_token_latency_ms": 54.14057449517884,
+      "prompt_length": 5,
+      "tokens_per_sec": 18.478013744006862,
+      "total_time_ms": 5411.837083,
+      "ttft_ms": 51.92020797729492
+    },
+    {
+      "generated_tokens": 100,
+      "inter_token_latency_ms": 52.762703297932944,
+      "prompt_length": 20,
+      "tokens_per_sec": 18.939425325752197,
+      "total_time_ms": 5279.99125,
+      "ttft_ms": 56.48362350463867
+    }
+  ],
+  "model": "tiny",
+  "model_config": {
+    "hidden_dim": 256,
+    "intermediate_dim": 512,
+    "max_seq_len": 512,
+    "num_heads": 4,
+    "num_kv_heads": 4,
+    "num_layers": 4,
+    "vocab_size": 32000
+  },
+  "model_params": 10815744,
+  "precision": "fp32",
+  "training": {
+    "avg_step_time_ms": 481.1327140799999,
+    "avg_tokens_per_sec": 8513.243602302506,
+    "batch_size": 16,
+    "current_memory_bytes": 87244800,
+    "final_loss": 10.414731979370117,
+    "initial_loss": 10.377752304077148,
+    "max_step_time_ms": 566.148542,
+    "median_step_time_ms": 472.634458,
+    "min_step_time_ms": 433.262166,
+    "peak_memory_bytes": 87244800,
+    "seq_len": 256,
+    "timed_steps": 50,
+    "warmup_steps": 5
+  }
+}
